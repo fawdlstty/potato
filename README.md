@@ -2,6 +2,19 @@
 
 A very simple and high performance http library.
 
+# Usage
+
+Run command:
+
+```sh
+cargo new hello_potato --bin
+cd hello_potato
+cargo add potato
+cargo add tokio --features full
+```
+
+Paste code:
+
 ```rust
 use potato::{http_get, server::HttpServer, HttpResponse, RequestContext};
 
