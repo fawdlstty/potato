@@ -1,8 +1,3 @@
-# potato
-
-A very simple and high performance http library.
-
-```rust
 use potato::{http_get, server::HttpServer, HttpResponse, RequestContext};
 
 #[http_get("/hello")]
@@ -15,4 +10,3 @@ async fn main() {
     let mut server = HttpServer::new("0.0.0.0:8080");
     _ = server.run().await;
 }
-```

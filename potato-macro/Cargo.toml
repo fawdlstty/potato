@@ -1,0 +1,14 @@
+[package]
+name = "potato-macro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inventory = "0.3.15"
+proc-macro2 = "1.0.92"
+quote = "1.0.37"
+rand = "0.8.5"
+syn = { version = "2.0.90", features = ["full"] }
+
+[lib]
+proc-macro = true
