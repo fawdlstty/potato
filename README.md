@@ -18,6 +18,11 @@ Paste code:
 ```rust
 use potato::{http_get, server::HttpServer, HttpResponse, RequestContext};
 
+async fn prefix_handler(_ctx: &mut RequestContext) -> Option<HttpResponse> {
+    match _ctx.
+    Some(HttpResponse::html("hello world"))
+}
+
 #[http_get("/hello")]
 async fn hello(_ctx: RequestContext) -> HttpResponse {
     HttpResponse::html("hello world")
@@ -29,3 +34,12 @@ async fn main() {
     _ = server.run().await;
 }
 ```
+
+# TODO
+
+- middleware
+- complete url parse
+- compress
+- cookie
+- chunked
+- CORS

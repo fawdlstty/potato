@@ -8,6 +8,7 @@ use chrono::Utc;
 use http::Uri;
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
+use utils::{bytes::VecU8Ext, string::StringExt};
 
 type HttpHandler =
     fn(RequestContext) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + 'static>>;
@@ -40,6 +41,12 @@ pub enum HttpMethod {
     HEAD,
 }
 
+#[derive(Eq, PartialEq)]
+pub enum CompressMode {
+    None,
+    Gzip,
+}
+
 pub struct RequestContext {
     pub addr: SocketAddr,
     pub req: HttpRequest,
@@ -65,13 +72,29 @@ impl HttpRequest {
             payload: vec![],
         }
     }
+
+    pub fn get_header(&self, key: &str) -> Option<String> {
+        self.headers.get(&key.http_standardization()).cloned()
+    }
+
+    pub fn get_header_accept_encoding(&self) -> CompressMode {
+        if let Some(encodings) = self.get_header("Accept-Encoding") {
+            for encoding in encodings.split(',') {
+                let encoding = encoding.trim();
+                if encoding == "gzip" {
+                    return CompressMode::Gzip;
+                }
+            }
+        }
+        CompressMode::None
+    }
 }
 
 pub struct HttpResponse {
     pub version: String,
     pub http_code: u16,
     pub headers: HashMap<String, String>,
-    pub payload: String,
+    pub payload: Vec<u8>,
 }
 unsafe impl Send for HttpResponse {}
 impl HttpResponse {
@@ -90,10 +113,9 @@ macro_rules! make_resp_by_text {
                 headers: [
                     ("Server".to_string(), "Potato 0.1.0".to_string()),
                     ("Content-Type".to_string(), $cnt_type.to_string()),
-                    ("Content-Length".to_string(), format!("{}", payload.len())),
                 ]
                 .into(),
-                payload,
+                payload: payload.as_bytes().to_vec(),
             }
         }
     };
@@ -111,16 +133,36 @@ impl HttpResponse {
         ret
     }
 
-    pub fn as_bytes(&self) -> Vec<u8> {
+    pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {
+        #[allow(unused_assignments)]
+        let mut payload_tmp = vec![];
+        let payload_ref = match cmode {
+            CompressMode::None => &self.payload,
+            CompressMode::Gzip => match self.payload.compress() {
+                Ok(data) => {
+                    payload_tmp = data;
+                    &payload_tmp
+                }
+                Err(_) => {
+                    cmode = CompressMode::None;
+                    &self.payload
+                }
+            },
+        };
+        //
         let mut ret = "".to_string();
         ret.push_str(&format!("{} {} {}\r\n", self.version, self.http_code, "OK"));
         ret.push_str(&format!("Date: {}\r\n", Utc::now().to_rfc2822()));
-        ret.push_str(&format!("Content-Length: {}\r\n", self.payload.len()));
+        ret.push_str(&format!("Content-Length: {}\r\n", payload_ref.len()));
+        if cmode == CompressMode::Gzip {
+            ret.push_str("Content-Encoding: gzip\r\n");
+        }
         for (key, value) in self.headers.iter() {
             ret.push_str(&format!("{}: {}\r\n", key, value));
         }
         ret.push_str("\r\n");
-        ret.push_str(&self.payload);
-        ret.as_bytes().to_vec()
+        let mut ret: Vec<u8> = ret.as_bytes().to_vec();
+        ret.extend(payload_ref);
+        ret
     }
 }

@@ -39,6 +39,7 @@ impl HttpServer {
                         Ok(req) => req,
                         Err(_) => break,
                     };
+                    let cmode = req.get_header_accept_encoding();
                     let ctx = RequestContext { addr, req };
 
                     // call process pipes
@@ -66,7 +67,7 @@ impl HttpServer {
                     } else {
                         HttpResponse::not_found()
                     };
-                    if let Err(_) = socket.write_all(&res.as_bytes()).await {
+                    if let Err(_) = socket.write_all(&res.as_bytes(cmode)).await {
                         break;
                     }
                 }

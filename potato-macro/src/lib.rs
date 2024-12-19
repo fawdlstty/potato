@@ -10,26 +10,6 @@ fn random_ident() -> Ident {
     Ident::new(&value, Span::call_site())
 }
 
-// #[proc_macro_attribute]
-// pub fn http_get(attr: TokenStream, input: TokenStream) -> TokenStream {
-//     let route_path = parse_macro_input!(attr as LitStr);
-//     let root_fn = parse_macro_input!(input as ItemFn);
-//     let fn_name = root_fn.sig.ident.clone();
-//     let wrap_func_name = random_ident();
-//     quote! {
-//         #root_fn
-
-//         fn #wrap_func_name(_ctx: potato::RequestContext) ->
-//             std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'static>> {
-//             Box::pin(#fn_name(_ctx))
-//         }
-
-//         potato::inventory::submit!{potato::RequestHandlerFlag::new(
-//             potato::HttpMethod::GET, #route_path, #wrap_func_name
-//         )}
-//     }.into()
-// }
-
 macro_rules! define_handler_macro {
     ($fn_name:ident, $method:ident) => {
         #[proc_macro_attribute]
@@ -41,6 +21,7 @@ macro_rules! define_handler_macro {
             quote! {
                 #root_fn
 
+                #[doc(hidden)]
                 fn #wrap_func_name(_ctx: potato::RequestContext) ->
                     std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'static>> {
                     Box::pin(#fn_name(_ctx))
