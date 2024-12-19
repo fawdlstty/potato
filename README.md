@@ -38,6 +38,7 @@ async fn main() {
 # TODO
 
 - file
+- server session
 - middleware
 - http client
 - cookie
