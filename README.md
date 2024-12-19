@@ -37,9 +37,9 @@ async fn main() {
 
 # TODO
 
+- file
 - middleware
-- complete url parse
-- compress
+- http client
 - cookie
 - chunked
 - CORS
