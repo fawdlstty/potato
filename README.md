@@ -16,10 +16,10 @@ cargo add tokio --features full
 Paste code:
 
 ```rust
-use potato::{http_get, server::HttpServer, HttpResponse, RequestContext};
+use potato::{http_get, server::HttpServer, HttpResponse, HttpRequest};
 
 #[http_get("/hello")]
-async fn hello(_ctx: RequestContext) -> HttpResponse {
+async fn hello(_ctx: HttpRequest) -> HttpResponse {
     HttpResponse::html("hello world")
 }
 
@@ -32,6 +32,7 @@ async fn main() {
 
 # TODO
 
+- websocket
 - file
 - server session
 - middleware

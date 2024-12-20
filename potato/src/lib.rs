@@ -8,10 +8,13 @@ use chrono::Utc;
 use http::Uri;
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
-use utils::{bytes::VecU8Ext, string::StringExt};
+use tokio::{io::AsyncWriteExt, net::TcpStream};
+use utils::{bytes::VecU8Ext, string::StringExt, tcp_stream::TcpStreamExt};
 
-type HttpHandler =
-    fn(RequestContext) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + 'static>>;
+type HttpHandler = fn(
+    HttpRequest,
+    &mut HttpConnection,
+) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + 'static>>;
 
 pub struct RequestHandlerFlag {
     pub method: HttpMethod,
@@ -47,13 +50,24 @@ pub enum CompressMode {
     Gzip,
 }
 
-pub struct RequestContext {
-    pub addr: SocketAddr,
-    pub req: HttpRequest,
+pub struct HttpConnection {
+    stream: TcpStream,
+    upgrade_ws: bool,
 }
-unsafe impl Send for RequestContext {}
+
+impl HttpConnection {
+    pub async fn read_request(&mut self, client_addr: SocketAddr) -> anyhow::Result<HttpRequest> {
+        self.stream.read_request(client_addr).await
+    }
+
+    pub async fn write_binary(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        self.stream.write_all(data).await?;
+        Ok(())
+    }
+}
 
 pub struct HttpRequest {
+    pub client_addr: SocketAddr,
     pub method: HttpMethod,
     pub uri: http::Uri,
     pub version: String,
@@ -63,8 +77,9 @@ pub struct HttpRequest {
 unsafe impl Send for HttpRequest {}
 
 impl HttpRequest {
-    pub fn new() -> Self {
+    pub fn new(client_addr: SocketAddr) -> Self {
         Self {
+            client_addr,
             method: HttpMethod::GET,
             uri: Uri::default(),
             version: "HTTP/1.1".to_string(),
@@ -131,6 +146,10 @@ impl HttpResponse {
         let mut ret = Self::html("404 not found");
         ret.http_code = 404;
         ret
+    }
+
+    pub fn empty() -> Self {
+        Self::html("")
     }
 
     pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {

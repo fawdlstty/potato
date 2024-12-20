@@ -18,6 +18,7 @@ chrono = "0.4.39"
 flate2 = "1.0.35"
 http = "1.2.0"
 inventory = "0.3.15"
-potato-macro = "0.1.2"
+lazy_static = "1.5.0"
+potato-macro = { path = "../potato-macro" }           #"0.1.2"
 strum = { version = "0.26.3", features = ["derive"] }
 tokio = { version = "1.42.0", features = ["full"] }
