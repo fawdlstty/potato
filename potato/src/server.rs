@@ -1,11 +1,11 @@
-use crate::{HttpConnection, RequestHandlerFlag};
+use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpResponse};
+use crate::{RequestHandlerFlag, WebsocketContext};
 use lazy_static::lazy_static;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 
 lazy_static! {
     pub static ref HANDLERS: HashMap<&'static str, HashMap<HttpMethod, &'static RequestHandlerFlag>> = {
@@ -35,23 +35,26 @@ impl HttpServer {
 
         loop {
             // accept connection
-            let (stream, client_addr) = listener.accept().await?;
+            let (mut stream, client_addr) = listener.accept().await?;
             _ = tokio::task::spawn(async move {
-                let mut conn = HttpConnection {
-                    stream,
-                    upgrade_ws: false,
-                };
                 loop {
-                    let req = match conn.read_request(client_addr).await {
+                    let req = match stream.read_request().await {
                         Ok(req) => req,
                         Err(_) => break,
                     };
                     let cmode = req.get_header_accept_encoding();
 
                     // call process pipes
+                    let mut upgrade_ws = false;
                     let res = if let Some(path_handlers) = HANDLERS.get(req.uri.path()) {
                         if let Some(&handler) = path_handlers.get(&req.method) {
-                            (handler.handler)(req, &mut conn).await
+                            let mut wsctx = WebsocketContext {
+                                stream,
+                                upgrade_ws: false,
+                            };
+                            let ret = (handler.handler)(req, client_addr, &mut wsctx).await;
+                            (stream, upgrade_ws) = (wsctx.stream, wsctx.upgrade_ws);
+                            ret
                         } else if req.method == HttpMethod::HEAD {
                             HttpResponse::html("")
                         } else if req.method == HttpMethod::OPTIONS {
@@ -73,10 +76,10 @@ impl HttpServer {
                     } else {
                         HttpResponse::not_found()
                     };
-                    if conn.upgrade_ws {
+                    if upgrade_ws {
                         break;
                     }
-                    if let Err(_) = conn.write_binary(&res.as_bytes(cmode)).await {
+                    if let Err(_) = stream.write_all(&res.as_bytes(cmode)).await {
                         break;
                     }
                 }

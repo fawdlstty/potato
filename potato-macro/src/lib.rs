@@ -41,11 +41,20 @@ pub fn http_get(attr: TokenStream, input: TokenStream) -> TokenStream {
     let root_fn = parse_macro_input!(input as ItemFn);
     let fn_name = root_fn.sig.ident.clone();
     let wrap_func_name = random_ident();
-    let mut arg_types = vec![];
+    let mut args = vec![];
     for arg in root_fn.sig.inputs.iter() {
         if let FnArg::Typed(arg) = arg {
             let arg_type = arg.ty.as_ref().to_token_stream().to_string();
-            arg_types.push(arg_type);
+            args.push(match &arg_type[..] {
+                "HttpRequest" => quote! { req },
+                "potato :: HttpRequest" => quote! { req },
+                "SocketAddr" => quote! { client },
+                "net :: SocketAddr" => quote! { client },
+                "std :: net :: SocketAddr" => quote! { client },
+                "& mut WebsocketContext" => quote! { wsctx },
+                "& mut potato :: WebsocketContext" => quote! { wsctx },
+                _ => panic!("unsupported: {}", arg_type),
+            });
         } else {
             panic!("unsupported: {}", arg.to_token_stream().to_string());
         }
@@ -54,9 +63,10 @@ pub fn http_get(attr: TokenStream, input: TokenStream) -> TokenStream {
         #root_fn
 
         #[doc(hidden)]
-        fn #wrap_func_name(req: potato::HttpRequest, conn: &mut potato::HttpConnection) ->
-            std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'static>> {
-            Box::pin(#fn_name(req))
+        fn #wrap_func_name<'a>(
+            req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &'a mut potato::WebsocketContext
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'a>> {
+            Box::pin(#fn_name(#(#args),*))
         }
 
         potato::inventory::submit!{potato::RequestHandlerFlag::new(
@@ -77,7 +87,7 @@ macro_rules! define_handler_macro {
                 #root_fn
 
                 #[doc(hidden)]
-                fn #wrap_func_name(req: potato::HttpRequest, conn: &mut potato::HttpConnection) ->
+                fn #wrap_func_name(req: potato::HttpRequest, wsctx: &mut potato::WebsocketContext) ->
                     std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'static>> {
                     Box::pin(#fn_name(req))
                 }

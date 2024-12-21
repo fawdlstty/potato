@@ -2,13 +2,12 @@
 use crate::{HttpMethod, HttpRequest};
 use core::str;
 use http::Uri;
-use std::net::SocketAddr;
 use tokio::{io::AsyncReadExt, net::TcpStream};
 
 pub trait TcpStreamExt {
     async fn read_until(&mut self, c: u8) -> Vec<u8>;
     async fn read_line(&mut self) -> String;
-    async fn read_request(&mut self, client_addr: SocketAddr) -> anyhow::Result<HttpRequest>;
+    async fn read_request(&mut self) -> anyhow::Result<HttpRequest>;
 }
 
 impl TcpStreamExt for TcpStream {
@@ -31,8 +30,8 @@ impl TcpStreamExt for TcpStream {
         line
     }
 
-    async fn read_request(&mut self, client_addr: SocketAddr) -> anyhow::Result<HttpRequest> {
-        let mut req = HttpRequest::new(client_addr);
+    async fn read_request(&mut self) -> anyhow::Result<HttpRequest> {
+        let mut req = HttpRequest::new();
         let line = self.read_line().await;
         let items = line.split(' ').collect::<Vec<&str>>();
         if items.len() != 3 {

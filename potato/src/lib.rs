@@ -6,15 +6,19 @@ pub use potato_macro::*;
 
 use chrono::Utc;
 use http::Uri;
+use sha1::{Digest, Sha1};
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
-use tokio::{io::AsyncWriteExt, net::TcpStream};
-use utils::{bytes::VecU8Ext, string::StringExt, tcp_stream::TcpStreamExt};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use utils::bytes::VecU8Ext;
+use utils::string::StringExt;
 
 type HttpHandler = fn(
     HttpRequest,
-    &mut HttpConnection,
-) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + 'static>>;
+    SocketAddr,
+    &mut WebsocketContext,
+) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>;
 
 pub struct RequestHandlerFlag {
     pub method: HttpMethod,
@@ -50,24 +54,29 @@ pub enum CompressMode {
     Gzip,
 }
 
-pub struct HttpConnection {
+pub struct WebsocketContext {
     stream: TcpStream,
     upgrade_ws: bool,
 }
 
-impl HttpConnection {
-    pub async fn read_request(&mut self, client_addr: SocketAddr) -> anyhow::Result<HttpRequest> {
-        self.stream.read_request(client_addr).await
-    }
-
-    pub async fn write_binary(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        self.stream.write_all(data).await?;
+impl WebsocketContext {
+    pub async fn upgrade_websocket(&mut self, req: &HttpRequest) -> anyhow::Result<()> {
+        if !req.is_websocket() {
+            return Err(anyhow::Error::msg("is not a websocket request"));
+        }
+        self.upgrade_ws = true;
+        let ws_key = req
+            .get_header("Sec-WebSocket-Key")
+            .unwrap_or("".to_string());
+        let res = HttpResponse::from_websocket(&ws_key);
+        self.stream
+            .write_all(&res.as_bytes(CompressMode::None))
+            .await?;
         Ok(())
     }
 }
 
 pub struct HttpRequest {
-    pub client_addr: SocketAddr,
     pub method: HttpMethod,
     pub uri: http::Uri,
     pub version: String,
@@ -77,9 +86,8 @@ pub struct HttpRequest {
 unsafe impl Send for HttpRequest {}
 
 impl HttpRequest {
-    pub fn new(client_addr: SocketAddr) -> Self {
+    pub fn new() -> Self {
         Self {
-            client_addr,
             method: HttpMethod::GET,
             uri: Uri::default(),
             version: "HTTP/1.1".to_string(),
@@ -103,6 +111,37 @@ impl HttpRequest {
         }
         CompressMode::None
     }
+
+    pub fn is_websocket(&self) -> bool {
+        if self.method != HttpMethod::GET {
+            return false;
+        }
+        if self
+            .get_header("Connection")
+            .map_or(false, |val| val.to_lowercase() != "upgrade")
+        {
+            return false;
+        }
+        if self
+            .get_header("Upgrade")
+            .map_or(false, |val| val.to_lowercase() != "websocket")
+        {
+            return false;
+        }
+        if self
+            .get_header("Sec-WebSocket-Version")
+            .map_or(false, |val| val != "13")
+        {
+            return false;
+        }
+        if self
+            .get_header("Sec-WebSocket-Key")
+            .map_or(false, |val| val.len() > 0)
+        {
+            return false;
+        }
+        true
+    }
 }
 
 pub struct HttpResponse {
@@ -112,11 +151,6 @@ pub struct HttpResponse {
     pub payload: Vec<u8>,
 }
 unsafe impl Send for HttpResponse {}
-impl HttpResponse {
-    pub fn add_header(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.headers.insert(key.into(), value.into());
-    }
-}
 
 macro_rules! make_resp_by_text {
     ($fn_name:ident, $cnt_type:expr) => {
@@ -126,6 +160,7 @@ macro_rules! make_resp_by_text {
                 version: "HTTP/1.1".to_string(),
                 http_code: 200,
                 headers: [
+                    ("Date".to_string(), Utc::now().to_rfc2822()),
                     ("Server".to_string(), "Potato 0.1.0".to_string()),
                     ("Content-Type".to_string(), $cnt_type.to_string()),
                 ]
@@ -142,6 +177,10 @@ impl HttpResponse {
     make_resp_by_text!(json, "application/json");
     make_resp_by_text!(xml, "application/xml");
 
+    pub fn add_header(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.headers.insert(key.into(), value.into());
+    }
+
     pub fn not_found() -> Self {
         let mut ret = Self::html("404 not found");
         ret.http_code = 404;
@@ -150,6 +189,31 @@ impl HttpResponse {
 
     pub fn empty() -> Self {
         Self::html("")
+    }
+
+    pub fn from_websocket(ws_key: &str) -> Self {
+        let ws_accept = {
+            let ws_key = format!("{ws_key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+            let mut hasher = Sha1::new();
+            hasher.update(ws_key.as_bytes());
+            let result = hasher.finalize();
+            //
+            #[allow(deprecated)]
+            base64::encode(result)
+        };
+        Self {
+            version: "HTTP/1.1".to_string(),
+            http_code: 101,
+            headers: [
+                ("Date".to_string(), Utc::now().to_rfc2822()),
+                ("Server".to_string(), "Potato 0.1.0".to_string()),
+                ("Connection".to_string(), "Upgrade".to_string()),
+                ("Upgrade".to_string(), "websocket".to_string()),
+                ("Sec-WebSocket-Accept".to_string(), ws_accept),
+            ]
+            .into(),
+            payload: vec![],
+        }
     }
 
     pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {
@@ -170,11 +234,20 @@ impl HttpResponse {
         };
         //
         let mut ret = "".to_string();
-        ret.push_str(&format!("{} {} {}\r\n", self.version, self.http_code, "OK"));
-        ret.push_str(&format!("Date: {}\r\n", Utc::now().to_rfc2822()));
-        ret.push_str(&format!("Content-Length: {}\r\n", payload_ref.len()));
-        if cmode == CompressMode::Gzip {
-            ret.push_str("Content-Encoding: gzip\r\n");
+        let status_str = http::StatusCode::from_u16(self.http_code)
+            .map(|c| c.canonical_reason())
+            .ok()
+            .flatten()
+            .unwrap_or("UNKNOWN");
+        ret.push_str(&format!(
+            "{} {} {}\r\n",
+            self.version, self.http_code, status_str
+        ));
+        if self.http_code != 101 {
+            ret.push_str(&format!("Content-Length: {}\r\n", payload_ref.len()));
+            if cmode == CompressMode::Gzip {
+                ret.push_str("Content-Encoding: gzip\r\n");
+            }
         }
         for (key, value) in self.headers.iter() {
             ret.push_str(&format!("{}: {}\r\n", key, value));
