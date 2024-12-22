@@ -1,5 +1,3 @@
-use std::any::Any;
-
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::{quote, ToTokens};
@@ -35,8 +33,8 @@ fn random_ident() -> Ident {
 //     },
 // }
 
-#[proc_macro_attribute]
-pub fn http_get(attr: TokenStream, input: TokenStream) -> TokenStream {
+fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> TokenStream {
+    let req_name = Ident::new(req_name, Span::call_site());
     let route_path = parse_macro_input!(attr as LitStr);
     let root_fn = parse_macro_input!(input as ItemFn);
     let fn_name = root_fn.sig.ident.clone();
@@ -59,50 +57,78 @@ pub fn http_get(attr: TokenStream, input: TokenStream) -> TokenStream {
             panic!("unsupported: {}", arg.to_token_stream().to_string());
         }
     }
-    quote! {
-        #root_fn
-
-        #[doc(hidden)]
-        fn #wrap_func_name<'a>(
-            req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &'a mut potato::WebsocketContext
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'a>> {
-            Box::pin(#fn_name(#(#args),*))
-        }
-
-        potato::inventory::submit!{potato::RequestHandlerFlag::new(
-            potato::HttpMethod::GET, #route_path, #wrap_func_name
-        )}
-    }.into()
-}
-
-macro_rules! define_handler_macro {
-    ($fn_name:ident, $method:ident) => {
-        #[proc_macro_attribute]
-        pub fn $fn_name(attr: TokenStream, input: TokenStream) -> TokenStream {
-            let route_path = parse_macro_input!(attr as LitStr);
-            let root_fn = parse_macro_input!(input as ItemFn);
-            let fn_name = root_fn.sig.ident.clone();
-            let wrap_func_name = random_ident();
+    let ret_type = root_fn.sig.output.to_token_stream().to_string();
+    match ret_type.contains(":: Result <") {
+        true => {
+            let wrap_func_name2 = random_ident();
             quote! {
                 #root_fn
 
                 #[doc(hidden)]
-                fn #wrap_func_name(req: potato::HttpRequest, wsctx: &mut potato::WebsocketContext) ->
-                    std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'static>> {
-                    Box::pin(#fn_name(req))
+                async fn #wrap_func_name2(
+                    req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &mut potato::WebsocketContext
+                ) -> potato::HttpResponse {
+                    match #fn_name(#(#args),*).await {
+                        Ok(ret) => ret,
+                        Err(err) => HttpResponse::error(format!("{err:?}")),
+                    }
+                }
+
+                #[doc(hidden)]
+                fn #wrap_func_name<'a>(
+                    req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &'a mut potato::WebsocketContext
+                ) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'a>> {
+                    Box::pin(#wrap_func_name2(req, client, wsctx))
                 }
 
                 potato::inventory::submit!{potato::RequestHandlerFlag::new(
-                    potato::HttpMethod::$method, #route_path, #wrap_func_name
+                    potato::HttpMethod::GET, #route_path, #wrap_func_name
                 )}
             }.into()
-        }
-    };
+        },
+        false => quote! {
+            #root_fn
+
+            #[doc(hidden)]
+            fn #wrap_func_name<'a>(
+                req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &'a mut potato::WebsocketContext
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'a>> {
+                Box::pin(#fn_name(#(#args),*))
+            }
+
+            potato::inventory::submit!{potato::RequestHandlerFlag::new(
+                potato::HttpMethod::#req_name, #route_path, #wrap_func_name
+            )}
+        }.into()
+    }
 }
 
-//define_handler_macro!(http_get, GET);
-define_handler_macro!(http_post, POST);
-define_handler_macro!(http_put, PUT);
-define_handler_macro!(http_delete, DELETE);
-define_handler_macro!(http_options, OPTIONS);
-define_handler_macro!(http_head, HEAD);
+#[proc_macro_attribute]
+pub fn http_get(attr: TokenStream, input: TokenStream) -> TokenStream {
+    http_handler_macro(attr, input, "GET")
+}
+
+#[proc_macro_attribute]
+pub fn http_post(attr: TokenStream, input: TokenStream) -> TokenStream {
+    http_handler_macro(attr, input, "POST")
+}
+
+#[proc_macro_attribute]
+pub fn http_put(attr: TokenStream, input: TokenStream) -> TokenStream {
+    http_handler_macro(attr, input, "PUT")
+}
+
+#[proc_macro_attribute]
+pub fn http_delete(attr: TokenStream, input: TokenStream) -> TokenStream {
+    http_handler_macro(attr, input, "DELETE")
+}
+
+#[proc_macro_attribute]
+pub fn http_options(attr: TokenStream, input: TokenStream) -> TokenStream {
+    http_handler_macro(attr, input, "OPTIONS")
+}
+
+#[proc_macro_attribute]
+pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
+    http_handler_macro(attr, input, "HEAD")
+}

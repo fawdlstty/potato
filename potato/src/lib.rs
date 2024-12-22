@@ -4,12 +4,13 @@ pub mod utils;
 pub use inventory;
 pub use potato_macro::*;
 
+use async_recursion::async_recursion;
 use chrono::Utc;
 use http::Uri;
 use sha1::{Digest, Sha1};
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use utils::bytes::VecU8Ext;
 use utils::string::StringExt;
@@ -60,20 +61,129 @@ pub struct WebsocketContext {
 }
 
 impl WebsocketContext {
-    pub async fn upgrade_websocket(&mut self, req: &HttpRequest) -> anyhow::Result<()> {
+    pub async fn upgrade_websocket(
+        &mut self,
+        req: &HttpRequest,
+    ) -> anyhow::Result<WebsocketConnection> {
         if !req.is_websocket() {
             return Err(anyhow::Error::msg("is not a websocket request"));
         }
-        self.upgrade_ws = true;
         let ws_key = req
             .get_header("Sec-WebSocket-Key")
             .unwrap_or("".to_string());
+        // let ws_ext = req.get_header("Sec-WebSocket-Extensions").unwrap_or("".to_string());
         let res = HttpResponse::from_websocket(&ws_key);
         self.stream
             .write_all(&res.as_bytes(CompressMode::None))
             .await?;
+        self.upgrade_ws = true;
+        Ok(WebsocketConnection {
+            stream: &mut self.stream,
+        })
+    }
+}
+
+pub struct WebsocketConnection<'a> {
+    stream: &'a mut TcpStream,
+}
+
+impl WebsocketConnection<'_> {
+    #[async_recursion]
+    pub async fn read_frame(&mut self) -> anyhow::Result<WebsocketFrame> {
+        let buf = {
+            let mut buf = [0u8; 2];
+            self.stream.read_exact(&mut buf).await?;
+            buf
+        };
+        let fin = buf[0] & 0b1000_0000 != 0;
+        let opcode = buf[0] & 0b0000_1111;
+        let payload_len = {
+            let payload_len = buf[1] & 0b0111_1111;
+            match payload_len {
+                126 => {
+                    let mut buf = [0u8; 2];
+                    self.stream.read_exact(&mut buf).await?;
+                    u16::from_be_bytes(buf) as usize
+                }
+                127 => {
+                    let mut buf = [0u8; 8];
+                    self.stream.read_exact(&mut buf).await?;
+                    u64::from_be_bytes(buf) as usize
+                }
+                _ => payload_len as usize,
+            }
+        };
+        let omask_key = match buf[1] & 0b1000_0000 != 0 {
+            true => {
+                let mut mask_key = [0u8; 4];
+                self.stream.read_exact(&mut mask_key).await?;
+                Some(mask_key)
+            }
+            false => None,
+        };
+        let mut payload = vec![0u8; payload_len];
+        self.stream.read_exact(&mut payload).await?;
+        if let Some(mask_key) = omask_key {
+            for i in 0..payload.len() {
+                payload[i] ^= mask_key[i % 4];
+            }
+        }
+        if !fin || opcode == 0x0 {
+            let next_frame = self.read_frame().await?;
+            Ok(match next_frame {
+                WebsocketFrame::Text(text) => {
+                    WebsocketFrame::Text(format!("{}{}", String::from_utf8(payload)?, text))
+                }
+                WebsocketFrame::Binary(bin) => WebsocketFrame::Binary([payload, bin].concat()),
+                _ => next_frame,
+            })
+        } else {
+            match opcode {
+                0x1 => {
+                    let payload = String::from_utf8(payload).unwrap_or("".to_string());
+                    Ok(WebsocketFrame::Text(payload))
+                }
+                0x2 => Ok(WebsocketFrame::Binary(payload)),
+                0x8 => Ok(WebsocketFrame::Close),
+                0x9 => Ok(WebsocketFrame::Ping),
+                0xA => Ok(WebsocketFrame::Pong),
+                _ => Err(anyhow::Error::msg("unsupported opcode")),
+            }
+        }
+    }
+
+    pub async fn write_frame(&mut self, frame: WebsocketFrame) -> anyhow::Result<()> {
+        let (fin, opcode, payload) = match frame {
+            WebsocketFrame::Close => (true, 0x8, vec![]),
+            WebsocketFrame::Ping => (true, 0x9, vec![]),
+            WebsocketFrame::Pong => (true, 0xA, vec![]),
+            WebsocketFrame::Binary(bin) => (true, 0x2, bin),
+            WebsocketFrame::Text(text) => (true, 0x1, text.as_bytes().to_vec()),
+        };
+        let payload_len = payload.len();
+        let mut buf = vec![];
+        buf.push((fin as u8) << 7 | opcode);
+        if payload_len < 126 {
+            buf.push(payload_len as u8);
+        } else if payload_len < 65536 {
+            buf.push(126);
+            buf.extend((payload_len as u16).to_be_bytes().iter());
+        } else {
+            buf.push(127);
+            buf.extend((payload_len as u64).to_be_bytes().iter());
+        }
+        self.stream.write_all(&buf).await?;
+        self.stream.write_all(&payload).await?;
         Ok(())
     }
+}
+
+pub enum WebsocketFrame {
+    Close,
+    Ping,
+    Pong,
+    Binary(Vec<u8>),
+    Text(String),
 }
 
 pub struct HttpRequest {
@@ -187,19 +297,23 @@ impl HttpResponse {
         ret
     }
 
+    pub fn error(payload: impl Into<String>) -> Self {
+        let mut ret = Self::html(payload);
+        ret.http_code = 500;
+        ret
+    }
+
     pub fn empty() -> Self {
         Self::html("")
     }
 
     pub fn from_websocket(ws_key: &str) -> Self {
+        #[allow(deprecated)]
         let ws_accept = {
-            let ws_key = format!("{ws_key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-            let mut hasher = Sha1::new();
-            hasher.update(ws_key.as_bytes());
-            let result = hasher.finalize();
-            //
-            #[allow(deprecated)]
-            base64::encode(result)
+            let mut sha1 = Sha1::default();
+            sha1.update(ws_key);
+            sha1.update(&b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"[..]);
+            base64::encode(&sha1.finalize())
         };
         Self {
             version: "HTTP/1.1".to_string(),
@@ -243,14 +357,14 @@ impl HttpResponse {
             "{} {} {}\r\n",
             self.version, self.http_code, status_str
         ));
+        for (key, value) in self.headers.iter() {
+            ret.push_str(&format!("{}: {}\r\n", key, value));
+        }
         if self.http_code != 101 {
             ret.push_str(&format!("Content-Length: {}\r\n", payload_ref.len()));
             if cmode == CompressMode::Gzip {
                 ret.push_str("Content-Encoding: gzip\r\n");
             }
-        }
-        for (key, value) in self.headers.iter() {
-            ret.push_str(&format!("{}: {}\r\n", key, value));
         }
         ret.push_str("\r\n");
         let mut ret: Vec<u8> = ret.as_bytes().to_vec();
