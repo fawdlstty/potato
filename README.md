@@ -64,29 +64,20 @@ async fn hello() -> HttpResponse {
 
 #[http_get("/")]
 async fn index() -> HttpResponse {
-    HttpResponse::html(
-        r#"<!DOCTYPE html>
-<html>
-    <head>
-        <title>Websocket Test</title>
-    </head>
-    <body>
-        <h1>Websocket Test</h1>
-        <div id="status">
-            <p><em>Connecting...</em></p>
-        </div>
-        <script>
-            const status = document.getElementById('status');
-            const ws = new WebSocket(`ws://${location.host}/ws`);
-
-            ws.onopen = function() {
-                status.innerHTML = '<p><em>Connected!</em></p>';
-            };
-        </script>
-    </body>
-</html>
-"#,
-    )
+    HttpResponse::html(r#"<!DOCTYPE html><html>
+        <head><title>Websocket Test</title></head>
+        <body>
+            <h1>Websocket Test</h1>
+            <div id="status"><p><em>Connecting...</em></p></div>
+            <script>
+                const status = document.getElementById('status');
+                const ws = new WebSocket(`ws://${location.host}/ws`);
+                ws.onopen = function() {
+                    status.innerHTML = '<p><em>Connected!</em></p>';
+                };
+            </script>
+        </body>
+    </html>"#)
 }
 
 #[http_get("/ws")]
