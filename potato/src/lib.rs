@@ -89,7 +89,7 @@ pub struct WebsocketConnection<'a> {
 
 impl WebsocketConnection<'_> {
     #[async_recursion]
-    pub async fn read_frame(&mut self) -> anyhow::Result<WebsocketFrame> {
+    pub async fn read_frame(&mut self) -> anyhow::Result<WsFrame> {
         let buf = {
             let mut buf = [0u8; 2];
             self.stream.read_exact(&mut buf).await?;
@@ -131,34 +131,34 @@ impl WebsocketConnection<'_> {
         if !fin || opcode == 0x0 {
             let next_frame = self.read_frame().await?;
             Ok(match next_frame {
-                WebsocketFrame::Text(text) => {
-                    WebsocketFrame::Text(format!("{}{}", String::from_utf8(payload)?, text))
+                WsFrame::Text(text) => {
+                    WsFrame::Text(format!("{}{}", String::from_utf8(payload)?, text))
                 }
-                WebsocketFrame::Binary(bin) => WebsocketFrame::Binary([payload, bin].concat()),
+                WsFrame::Binary(bin) => WsFrame::Binary([payload, bin].concat()),
                 _ => next_frame,
             })
         } else {
             match opcode {
                 0x1 => {
                     let payload = String::from_utf8(payload).unwrap_or("".to_string());
-                    Ok(WebsocketFrame::Text(payload))
+                    Ok(WsFrame::Text(payload))
                 }
-                0x2 => Ok(WebsocketFrame::Binary(payload)),
-                0x8 => Ok(WebsocketFrame::Close),
-                0x9 => Ok(WebsocketFrame::Ping),
-                0xA => Ok(WebsocketFrame::Pong),
+                0x2 => Ok(WsFrame::Binary(payload)),
+                0x8 => Ok(WsFrame::Close),
+                0x9 => Ok(WsFrame::Ping),
+                0xA => Ok(WsFrame::Pong),
                 _ => Err(anyhow::Error::msg("unsupported opcode")),
             }
         }
     }
 
-    pub async fn write_frame(&mut self, frame: WebsocketFrame) -> anyhow::Result<()> {
+    pub async fn write_frame(&mut self, frame: WsFrame) -> anyhow::Result<()> {
         let (fin, opcode, payload) = match frame {
-            WebsocketFrame::Close => (true, 0x8, vec![]),
-            WebsocketFrame::Ping => (true, 0x9, vec![]),
-            WebsocketFrame::Pong => (true, 0xA, vec![]),
-            WebsocketFrame::Binary(bin) => (true, 0x2, bin),
-            WebsocketFrame::Text(text) => (true, 0x1, text.as_bytes().to_vec()),
+            WsFrame::Close => (true, 0x8, vec![]),
+            WsFrame::Ping => (true, 0x9, vec![]),
+            WsFrame::Pong => (true, 0xA, vec![]),
+            WsFrame::Binary(bin) => (true, 0x2, bin),
+            WsFrame::Text(text) => (true, 0x1, text.as_bytes().to_vec()),
         };
         let payload_len = payload.len();
         let mut buf = vec![];
@@ -178,7 +178,7 @@ impl WebsocketConnection<'_> {
     }
 }
 
-pub enum WebsocketFrame {
+pub enum WsFrame {
     Close,
     Ping,
     Pong,
@@ -204,6 +204,11 @@ impl HttpRequest {
             headers: HashMap::new(),
             payload: vec![],
         }
+    }
+
+    pub fn set_header(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.headers
+            .insert(key.into().http_standardization(), value.into());
     }
 
     pub fn get_header(&self, key: &str) -> Option<String> {
@@ -246,7 +251,7 @@ impl HttpRequest {
         }
         if self
             .get_header("Sec-WebSocket-Key")
-            .map_or(false, |val| val.len() > 0)
+            .map_or(false, |val| val.len() == 0)
         {
             return false;
         }

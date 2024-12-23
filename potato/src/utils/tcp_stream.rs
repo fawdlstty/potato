@@ -51,8 +51,7 @@ impl TcpStreamExt for TcpStream {
         loop {
             let line = self.read_line().await;
             if let Some((key, value)) = line.split_once(':') {
-                req.headers
-                    .insert(key.trim().to_string(), value.trim().to_string());
+                req.set_header(key.trim(), value.trim());
             } else {
                 break;
             }

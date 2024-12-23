@@ -42,65 +42,72 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let mut args = vec![];
     for arg in root_fn.sig.inputs.iter() {
         if let FnArg::Typed(arg) = arg {
-            let arg_type = arg.ty.as_ref().to_token_stream().to_string();
+            let arg_type = arg
+                .ty
+                .as_ref()
+                .to_token_stream()
+                .to_string()
+                .type_simplify();
             args.push(match &arg_type[..] {
                 "HttpRequest" => quote! { req },
-                "potato :: HttpRequest" => quote! { req },
                 "SocketAddr" => quote! { client },
-                "net :: SocketAddr" => quote! { client },
-                "std :: net :: SocketAddr" => quote! { client },
                 "& mut WebsocketContext" => quote! { wsctx },
-                "& mut potato :: WebsocketContext" => quote! { wsctx },
-                _ => panic!("unsupported: {}", arg_type),
+                _ => panic!("unsupported arg type: {}", arg_type),
             });
         } else {
             panic!("unsupported: {}", arg.to_token_stream().to_string());
         }
     }
-    let ret_type = root_fn.sig.output.to_token_stream().to_string();
-    match ret_type.contains(":: Result <") {
-        true => {
-            let wrap_func_name2 = random_ident();
-            quote! {
-                #root_fn
-
-                #[doc(hidden)]
-                async fn #wrap_func_name2(
-                    req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &mut potato::WebsocketContext
-                ) -> potato::HttpResponse {
-                    match #fn_name(#(#args),*).await {
-                        Ok(ret) => ret,
-                        Err(err) => HttpResponse::error(format!("{err:?}")),
-                    }
-                }
-
-                #[doc(hidden)]
-                fn #wrap_func_name<'a>(
-                    req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &'a mut potato::WebsocketContext
-                ) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'a>> {
-                    Box::pin(#wrap_func_name2(req, client, wsctx))
-                }
-
-                potato::inventory::submit!{potato::RequestHandlerFlag::new(
-                    potato::HttpMethod::GET, #route_path, #wrap_func_name
-                )}
-            }.into()
-        },
-        false => quote! {
-            #root_fn
-
-            #[doc(hidden)]
-            fn #wrap_func_name<'a>(
-                req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &'a mut potato::WebsocketContext
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'a>> {
-                Box::pin(#fn_name(#(#args),*))
+    let wrap_func_name2 = random_ident();
+    let ret_type = root_fn
+        .sig
+        .output
+        .to_token_stream()
+        .to_string()
+        .type_simplify();
+    let wrap_func_body = match &ret_type[..] {
+        "Result < () >" => quote! {
+            match #fn_name(#(#args),*).await {
+                Ok(ret) => HttpResponse::empty(),
+                Err(err) => HttpResponse::error(format!("{err:?}")),
             }
+        },
+        "Result < HttpResponse >" => quote! {
+            match #fn_name(#(#args),*).await {
+                Ok(ret) => ret,
+                Err(err) => HttpResponse::error(format!("{err:?}")),
+            }
+        },
+        "()" => quote! {
+            #fn_name(#(#args),*).await;
+            HttpResponse::empty()
+        },
+        "HttpResponse" => quote! {
+            #fn_name(#(#args),*).await
+        },
+        _ => panic!("unsupported ret type: {}", ret_type),
+    };
+    quote! {
+        #root_fn
 
-            potato::inventory::submit!{potato::RequestHandlerFlag::new(
-                potato::HttpMethod::#req_name, #route_path, #wrap_func_name
-            )}
-        }.into()
-    }
+        #[doc(hidden)]
+        async fn #wrap_func_name2(
+            req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &mut potato::WebsocketContext
+        ) -> potato::HttpResponse {
+            #wrap_func_body
+        }
+
+        #[doc(hidden)]
+        fn #wrap_func_name<'a>(
+            req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &'a mut potato::WebsocketContext
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'a>> {
+            Box::pin(#wrap_func_name2(req, client, wsctx))
+        }
+
+        potato::inventory::submit!{potato::RequestHandlerFlag::new(
+            potato::HttpMethod::#req_name, #route_path, #wrap_func_name
+        )}
+    }.into()
 }
 
 #[proc_macro_attribute]
@@ -131,4 +138,18 @@ pub fn http_options(attr: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "HEAD")
+}
+
+trait StringExt {
+    fn type_simplify(&self) -> String;
+}
+
+impl StringExt for String {
+    fn type_simplify(&self) -> String {
+        self.replace("potato :: ", "")
+            .replace("std :: ", "")
+            .replace("net :: ", "")
+            .replace("anyhow :: ", "")
+            .replace("-> ", "")
+    }
 }
