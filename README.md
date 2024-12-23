@@ -57,11 +57,6 @@ HTTP请求处理函数返回类型支持以下几种格式：
 示例Websocket：
 
 ```rust
-#[http_get("/hello")]
-async fn hello() -> HttpResponse {
-    HttpResponse::html("hello world")
-}
-
 #[http_get("/")]
 async fn index() -> HttpResponse {
     HttpResponse::html(r#"<!DOCTYPE html><html>
