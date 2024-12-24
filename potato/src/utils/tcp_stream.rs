@@ -1,8 +1,6 @@
 #![allow(async_fn_in_trait)]
 use crate::{HttpMethod, HttpRequest};
 use core::str;
-use http::Uri;
-use std::ops::Index;
 use tokio::{io::AsyncReadExt, net::TcpStream};
 
 pub trait TcpStreamExt {
