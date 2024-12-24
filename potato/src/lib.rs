@@ -1,12 +1,13 @@
+pub mod client;
 pub mod server;
 pub mod utils;
 
+pub use client::*;
 pub use inventory;
 pub use potato_macro::*;
 
 use async_recursion::async_recursion;
 use chrono::Utc;
-use http::Uri;
 use sha1::{Digest, Sha1};
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
@@ -188,7 +189,8 @@ pub enum WsFrame {
 
 pub struct HttpRequest {
     pub method: HttpMethod,
-    pub uri: http::Uri,
+    pub url_path: String,
+    pub url_query: HashMap<String, String>,
     pub version: String,
     pub headers: HashMap<String, String>,
     pub payload: Vec<u8>,
@@ -199,7 +201,8 @@ impl HttpRequest {
     pub fn new() -> Self {
         Self {
             method: HttpMethod::GET,
-            uri: Uri::default(),
+            url_path: "/".to_string(),
+            url_query: HashMap::new(),
             version: "HTTP/1.1".to_string(),
             headers: HashMap::new(),
             payload: vec![],

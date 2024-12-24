@@ -1,8 +1,19 @@
+use lazy_static::lazy_static;
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::{quote, ToTokens};
 use rand::Rng;
+use std::collections::HashSet;
 use syn::{parse_macro_input, FnArg, ItemFn, LitStr};
+
+lazy_static! {
+    static ref ARG_TYPES: HashSet<&'static str> = [
+        "String", "bool", "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "f32",
+        "f64", "isize",
+    ]
+    .into_iter()
+    .collect();
+}
 
 fn random_ident() -> Ident {
     let mut rng = rand::thread_rng();

@@ -46,7 +46,7 @@ impl HttpServer {
 
                     // call process pipes
                     let mut upgrade_ws = false;
-                    let res = if let Some(path_handlers) = HANDLERS.get(req.uri.path()) {
+                    let res = if let Some(path_handlers) = HANDLERS.get(&req.url_path[..]) {
                         if let Some(&handler) = path_handlers.get(&req.method) {
                             let mut wsctx = WebsocketContext {
                                 stream,

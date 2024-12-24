@@ -2,6 +2,7 @@
 use crate::{HttpMethod, HttpRequest};
 use core::str;
 use http::Uri;
+use std::ops::Index;
 use tokio::{io::AsyncReadExt, net::TcpStream};
 
 pub trait TcpStreamExt {
@@ -46,7 +47,19 @@ impl TcpStreamExt for TcpStream {
             "HEAD" => HttpMethod::HEAD,
             _ => return Err(anyhow::Error::msg("Unresolvable method")),
         };
-        req.uri = items[1].parse::<Uri>()?;
+        let url = items[1];
+        match url.find('?') {
+            Some(p) => {
+                req.url_path = url[..p].to_string();
+                req.url_query = url[p + 1..]
+                    .split('&')
+                    .into_iter()
+                    .map(|s| s.split_once('=').unwrap_or((s, "")))
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect();
+            }
+            None => req.url_path = url.to_string(),
+        }
         req.version = items[2].to_string();
         loop {
             let line = self.read_line().await;
