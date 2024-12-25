@@ -69,11 +69,9 @@ impl WebsocketContext {
         if !req.is_websocket() {
             return Err(anyhow::Error::msg("is not a websocket request"));
         }
-        let ws_key = req
-            .get_header("Sec-WebSocket-Key")
-            .unwrap_or("".to_string());
+        let ws_key = req.get_header("Sec-WebSocket-Key").unwrap();
         // let ws_ext = req.get_header("Sec-WebSocket-Extensions").unwrap_or("".to_string());
-        let res = HttpResponse::from_websocket(&ws_key);
+        let res = HttpResponse::from_websocket(ws_key);
         self.stream
             .write_all(&res.as_bytes(CompressMode::None))
             .await?;
@@ -187,13 +185,20 @@ pub enum WsFrame {
     Text(String),
 }
 
+pub struct PostFile {
+    pub filename: String,
+    pub data: Vec<u8>,
+}
+
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub url_path: String,
     pub url_query: HashMap<String, String>,
     pub version: String,
     pub headers: HashMap<String, String>,
-    pub payload: Vec<u8>,
+    pub body: Vec<u8>,
+    pub body_pairs: HashMap<String, String>,
+    pub body_files: HashMap<String, PostFile>,
 }
 unsafe impl Send for HttpRequest {}
 
@@ -205,7 +210,9 @@ impl HttpRequest {
             url_query: HashMap::new(),
             version: "HTTP/1.1".to_string(),
             headers: HashMap::new(),
-            payload: vec![],
+            body: vec![],
+            body_pairs: HashMap::new(),
+            body_files: HashMap::new(),
         }
     }
 
@@ -214,8 +221,10 @@ impl HttpRequest {
             .insert(key.into().http_standardization(), value.into());
     }
 
-    pub fn get_header(&self, key: &str) -> Option<String> {
-        self.headers.get(&key.http_standardization()).cloned()
+    pub fn get_header(&self, key: &str) -> Option<&str> {
+        self.headers
+            .get(&key.http_standardization())
+            .map(|a| &a[..])
     }
 
     pub fn get_header_accept_encoding(&self) -> CompressMode {

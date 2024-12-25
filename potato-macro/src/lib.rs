@@ -59,11 +59,28 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 .to_token_stream()
                 .to_string()
                 .type_simplify();
+            let arg_name_str = arg.pat.to_token_stream().to_string();
+            let arg_name = Ident::new(&arg_name_str, Span::call_site());
             args.push(match &arg_type[..] {
                 "HttpRequest" => quote! { req },
                 "SocketAddr" => quote! { client },
                 "& mut WebsocketContext" => quote! { wsctx },
-                _ => panic!("unsupported arg type: {}", arg_type),
+                "PostFile" => quote! {
+                    match req.body_files.get(#arg_name_str).cloned() {
+                        Some(file) => file,
+                        None => return HttpResponse::error(format!("lose file: #arg_name")),
+                    }
+                },
+                arg_type if ARG_TYPES.contains(arg_type) => quote! {
+                    match req.body_pairs.get(#arg_name_str).cloned() {
+                        Some(val) => val,
+                        None => match req.url_query.get(#arg_name_str).cloned() {
+                            Some(val) => val,
+                            None => return HttpResponse::error(format!("lose file: #arg_name")),
+                        },
+                    }
+                },
+                _ => panic!("unsupported arg type: [{}]", arg_type),
             });
         } else {
             panic!("unsupported: {}", arg.to_token_stream().to_string());
