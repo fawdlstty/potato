@@ -6,7 +6,6 @@ pub use client::*;
 pub use inventory;
 pub use potato_macro::*;
 
-use async_recursion::async_recursion;
 use chrono::Utc;
 use sha1::{Digest, Sha1};
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
@@ -87,14 +86,13 @@ pub struct WebsocketConnection<'a> {
 }
 
 impl WebsocketConnection<'_> {
-    #[async_recursion]
-    pub async fn read_frame(&mut self) -> anyhow::Result<WsFrame> {
+    pub async fn read_frame_impl(&mut self) -> anyhow::Result<WsFrameImpl> {
         let buf = {
             let mut buf = [0u8; 2];
             self.stream.read_exact(&mut buf).await?;
             buf
         };
-        let fin = buf[0] & 0b1000_0000 != 0;
+        //let fin = buf[0] & 0b1000_0000 != 0;
         let opcode = buf[0] & 0b0000_1111;
         let payload_len = {
             let payload_len = buf[1] & 0b0111_1111;
@@ -127,37 +125,46 @@ impl WebsocketConnection<'_> {
                 payload[i] ^= mask_key[i % 4];
             }
         }
-        if !fin || opcode == 0x0 {
-            let next_frame = self.read_frame().await?;
-            Ok(match next_frame {
-                WsFrame::Text(text) => {
-                    WsFrame::Text(format!("{}{}", String::from_utf8(payload)?, text))
+        match opcode {
+            0x0 => Ok(WsFrameImpl::PartData(payload)),
+            0x1 => Ok(WsFrameImpl::Text(payload)),
+            0x2 => Ok(WsFrameImpl::Binary(payload)),
+            0x8 => Ok(WsFrameImpl::Close),
+            0x9 => Ok(WsFrameImpl::Ping),
+            0xA => Ok(WsFrameImpl::Pong),
+            _ => Err(anyhow::Error::msg("unsupported opcode")),
+        }
+    }
+
+    pub async fn read_frame(&mut self) -> anyhow::Result<WsFrame> {
+        let mut tmp = vec![];
+        loop {
+            match self.read_frame_impl().await? {
+                WsFrameImpl::Close => return Err(anyhow::Error::msg("close frame")),
+                WsFrameImpl::Ping => self.write_frame_impl(WsFrameImpl::Pong).await?,
+                WsFrameImpl::Pong => (),
+                WsFrameImpl::Binary(data) => {
+                    tmp.extend(data);
+                    return Ok(WsFrame::Binary(tmp));
                 }
-                WsFrame::Binary(bin) => WsFrame::Binary([payload, bin].concat()),
-                _ => next_frame,
-            })
-        } else {
-            match opcode {
-                0x1 => {
-                    let payload = String::from_utf8(payload).unwrap_or("".to_string());
-                    Ok(WsFrame::Text(payload))
+                WsFrameImpl::Text(data) => {
+                    tmp.extend(data);
+                    let ret_str = String::from_utf8(tmp).unwrap_or("".to_string());
+                    return Ok(WsFrame::Text(ret_str));
                 }
-                0x2 => Ok(WsFrame::Binary(payload)),
-                0x8 => Ok(WsFrame::Close),
-                0x9 => Ok(WsFrame::Ping),
-                0xA => Ok(WsFrame::Pong),
-                _ => Err(anyhow::Error::msg("unsupported opcode")),
+                WsFrameImpl::PartData(data) => tmp.extend(data),
             }
         }
     }
 
-    pub async fn write_frame(&mut self, frame: WsFrame) -> anyhow::Result<()> {
+    pub async fn write_frame_impl(&mut self, frame: WsFrameImpl) -> anyhow::Result<()> {
         let (fin, opcode, payload) = match frame {
-            WsFrame::Close => (true, 0x8, vec![]),
-            WsFrame::Ping => (true, 0x9, vec![]),
-            WsFrame::Pong => (true, 0xA, vec![]),
-            WsFrame::Binary(bin) => (true, 0x2, bin),
-            WsFrame::Text(text) => (true, 0x1, text.as_bytes().to_vec()),
+            WsFrameImpl::Close => (true, 0x8, vec![]),
+            WsFrameImpl::Ping => (true, 0x9, vec![]),
+            WsFrameImpl::Pong => (true, 0xA, vec![]),
+            WsFrameImpl::Binary(data) => (true, 0x2, data),
+            WsFrameImpl::Text(data) => (true, 0x1, data),
+            WsFrameImpl::PartData(data) => (false, 0x0, data),
         };
         let payload_len = payload.len();
         let mut buf = vec![];
@@ -175,14 +182,33 @@ impl WebsocketConnection<'_> {
         self.stream.write_all(&payload).await?;
         Ok(())
     }
+
+    pub async fn write_ping(&mut self) -> anyhow::Result<()> {
+        self.write_frame_impl(WsFrameImpl::Ping).await
+    }
+
+    pub async fn write_binary(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
+        self.write_frame_impl(WsFrameImpl::Binary(data)).await
+    }
+
+    pub async fn write_text(&mut self, data: &str) -> anyhow::Result<()> {
+        self.write_frame_impl(WsFrameImpl::Text(data.as_bytes().to_vec()))
+            .await
+    }
 }
 
 pub enum WsFrame {
+    Binary(Vec<u8>),
+    Text(String),
+}
+
+pub enum WsFrameImpl {
     Close,
     Ping,
     Pong,
     Binary(Vec<u8>),
-    Text(String),
+    Text(Vec<u8>),
+    PartData(Vec<u8>),
 }
 
 pub struct PostFile {

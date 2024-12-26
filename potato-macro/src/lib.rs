@@ -53,34 +53,44 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let mut args = vec![];
     for arg in root_fn.sig.inputs.iter() {
         if let FnArg::Typed(arg) = arg {
-            let arg_type = arg
+            let arg_type_str = arg
                 .ty
                 .as_ref()
                 .to_token_stream()
                 .to_string()
                 .type_simplify();
             let arg_name_str = arg.pat.to_token_stream().to_string();
-            let arg_name = Ident::new(&arg_name_str, Span::call_site());
-            args.push(match &arg_type[..] {
+            args.push(match &arg_type_str[..] {
                 "HttpRequest" => quote! { req },
                 "SocketAddr" => quote! { client },
                 "& mut WebsocketContext" => quote! { wsctx },
                 "PostFile" => quote! {
                     match req.body_files.get(#arg_name_str).cloned() {
                         Some(file) => file,
-                        None => return HttpResponse::error(format!("lose file: #arg_name")),
+                        None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
                     }
                 },
-                arg_type if ARG_TYPES.contains(arg_type) => quote! {
-                    match req.body_pairs.get(#arg_name_str).cloned() {
-                        Some(val) => val,
-                        None => match req.url_query.get(#arg_name_str).cloned() {
+                arg_type_str if ARG_TYPES.contains(arg_type_str) => {
+                    let mut arg_value = quote! {
+                        match req.body_pairs.get(#arg_name_str).cloned() {
                             Some(val) => val,
-                            None => return HttpResponse::error(format!("lose file: #arg_name")),
-                        },
+                            None => match req.url_query.get(#arg_name_str).cloned() {
+                                Some(val) => val,
+                                None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
+                            },
+                        }
+                    };
+                    if arg_type_str != "String" {
+                        arg_value = quote! {
+                            match #arg_value.parse() {
+                                Ok(val) => val,
+                                Err(err) => return HttpResponse::error(format!("arg[{}] is not {} type", #arg_name_str, #arg_type_str)),
+                            }
+                        }
                     }
+                    arg_value
                 },
-                _ => panic!("unsupported arg type: [{}]", arg_type),
+                _ => panic!("unsupported arg type: [{}]", arg_type_str),
             });
         } else {
             panic!("unsupported: {}", arg.to_token_stream().to_string());
@@ -115,6 +125,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         },
         _ => panic!("unsupported ret type: {}", ret_type),
     };
+    //let mut content =
     quote! {
         #root_fn
 
@@ -136,6 +147,9 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             potato::HttpMethod::#req_name, #route_path, #wrap_func_name
         )}
     }.into()
+    //}.to_string();
+    //panic!("{}", content);
+    //todo!()
 }
 
 #[proc_macro_attribute]

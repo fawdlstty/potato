@@ -16,6 +16,7 @@ cargo add tokio --features full
 ```rust
 use potato::*;
 
+// http://127.0.0.1:8080/hello
 #[http_get("/hello")]
 async fn hello() -> HttpResponse {
     HttpResponse::html("hello world")
@@ -30,7 +31,17 @@ async fn main() {
 
 如上所示，定义一个HTTP请求处理函数非常简洁。通过将 `http_get` 替换为 `http_post`、`http_put`、`http_delete`、`http_options`、`http_head` 可创建对应请求的处理函数。
 
-HTTP请求处理函数可包含以下类型参数：
+HTTP请求处理函数可直接指定String、i32等类型的参数，可简化从body或url query提取的步骤，简化开发。示例：
+
+```rust
+// http://127.0.0.1:8080/hello?name=miku
+#[http_get("/hello")]
+async fn hello(name: String) -> HttpResponse {
+    HttpResponse::html("hello world, {}!")
+}
+```
+
+HTTP请求处理函数还可包含以下类型参数：
 
 - `req: potato::HttpRequest` **请求结构体**
 - `client: std::net::SocketAddr` **客户端IP**
@@ -39,6 +50,7 @@ HTTP请求处理函数可包含以下类型参数：
 示例参数完全体：
 
 ```rust
+// http://127.0.0.1:8080
 #[http_get("/hello")]
 async fn hello(req: HttpRequest, client: std::net::SocketAddr, wsctx: &mut WebsocketContext) -> HttpResponse {
     todo!()
@@ -57,6 +69,7 @@ HTTP请求处理函数返回类型支持以下几种格式：
 示例Websocket：
 
 ```rust
+// http://127.0.0.1:8080
 #[http_get("/")]
 async fn index() -> HttpResponse {
     HttpResponse::html(r#"<!DOCTYPE html><html>
@@ -75,20 +88,17 @@ async fn index() -> HttpResponse {
     </html>"#)
 }
 
+// ws://127.0.0.1:8080/ws
 #[http_get("/ws")]
 async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Result<()> {
     let mut ws = wsctx.upgrade_websocket(&req).await?;
+    ws.write_text("hello websocket").await?;
     loop {
-        let frame = ws.read_frame().await?;
-        match frame {
-            WsFrame::Text(text) => ws.write_frame(WsFrame::Text(text)).await?,
-            WsFrame::Binary(bin) => ws.write_frame(WsFrame::Binary(bin)).await?,
-            WsFrame::Ping => ws.write_frame(WsFrame::Pong).await?,
-            WsFrame::Close => break,
-            WsFrame::Pong => (),
+        match ws.read_frame().await? {
+            WsFrame::Text(text) => ws.write_text(&text).await?,
+            WsFrame::Binary(bin) => ws.write_binary(bin).await?,
         }
     }
-    Ok(())
 }
 
 #[tokio::main]
@@ -101,6 +111,8 @@ async fn main() {
 <!--
 # TODO
 
+- openapi
+- doc
 - file
 - server session
 - middleware
