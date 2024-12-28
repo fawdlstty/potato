@@ -22,6 +22,16 @@ fn random_ident() -> Ident {
 }
 
 // ItemFn {
+//     attrs: [
+//         Attribute { meta: Meta::NameValue {
+//             path: Path { segments: [ PathSegment { ident: Ident { ident: "doc" } }] },
+//             value: Expr::Lit { attrs: [], lit: Lit::Str { token: " AAAAAAAA test api: hello" } }
+//         } },
+//         Attribute { meta: Meta::NameValue {
+//             path: Path { segments: [PathSegment { ident: Ident { ident: "doc" } }] },
+//             value: Expr::Lit { attrs: [], lit: Lit::Str { token: " desp: XXXXXXXXX" } }
+//         } }
+//     ],
 //     sig: Signature {
 //         ident: Ident { ident: "hello", span: #0 bytes(312..317) },
 //         inputs: [FnArg::Typed(
@@ -48,6 +58,27 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let req_name = Ident::new(req_name, Span::call_site());
     let route_path = parse_macro_input!(attr as LitStr);
     let root_fn = parse_macro_input!(input as ItemFn);
+    let doc = {
+        let mut docs = vec![];
+        for attr in root_fn.attrs.iter() {
+            if let Ok(attr) = attr.meta.require_name_value() {
+                if attr.path.get_ident().map(|p| p.to_string()) == Some("doc".to_string()) {
+                    let mut doc = attr.value.to_token_stream().to_string();
+                    if doc.starts_with('\"') {
+                        doc.remove(0);
+                        doc.pop();
+                    }
+                    docs.push(doc);
+                }
+            }
+        }
+        if docs.iter().all(|d| d.starts_with(' ')) {
+            for doc in docs.iter_mut() {
+                doc.remove(0);
+            }
+        }
+        docs.join("\n")
+    };
     let fn_name = root_fn.sig.ident.clone();
     let wrap_func_name = random_ident();
     let mut args = vec![];
@@ -144,12 +175,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
 
         potato::inventory::submit!{potato::RequestHandlerFlag::new(
-            potato::HttpMethod::#req_name, #route_path, #wrap_func_name
+            potato::HttpMethod::#req_name, #route_path, #wrap_func_name, #doc
         )}
     }.into()
-    //}.to_string();
-    //panic!("{}", content);
-    //todo!()
+    // }.to_string();
+    // panic!("{}", content);
+    // todo!()
 }
 
 #[proc_macro_attribute]

@@ -25,14 +25,21 @@ pub struct RequestHandlerFlag {
     pub method: HttpMethod,
     pub path: &'static str,
     pub handler: HttpHandler,
+    pub doc: &'static str,
 }
 
 impl RequestHandlerFlag {
-    pub const fn new(method: HttpMethod, path: &'static str, handler: HttpHandler) -> Self {
+    pub const fn new(
+        method: HttpMethod,
+        path: &'static str,
+        handler: HttpHandler,
+        doc: &'static str,
+    ) -> Self {
         RequestHandlerFlag {
             method,
             path,
             handler,
+            doc,
         }
     }
 }
