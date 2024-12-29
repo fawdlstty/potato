@@ -8,6 +8,8 @@ pub use potato_macro::*;
 
 use chrono::Utc;
 use sha1::{Digest, Sha1};
+use std::fs::File;
+use std::io::Read;
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -355,6 +357,29 @@ impl HttpResponse {
 
     pub fn empty() -> Self {
         Self::html("")
+    }
+
+    pub fn from_file(path: &str) -> Self {
+        let mut buffer = vec![];
+        if let Ok(mut file) = File::open(path) {
+            _ = file.read_to_end(&mut buffer);
+        }
+        Self::from_mem_file(path, buffer)
+    }
+
+    pub fn from_mem_file(path: &str, data: Vec<u8>) -> Self {
+        let mut ret = Self::empty();
+        let mime_type = match path.split('.').last() {
+            Some("html") => "text/html",
+            Some("js") => "application/javascript",
+            Some("css") => "text/css",
+            Some("json") => "application/json",
+            Some("xml") => "application/xml",
+            _ => "application/octet-stream",
+        };
+        ret.add_header("Content-Type", mime_type);
+        ret.payload = data;
+        ret
     }
 
     pub fn from_websocket(ws_key: &str) -> Self {

@@ -114,9 +114,10 @@ async fn main() {
 <!--
 # TODO
 
+- static path security
+- file for download
 - openapi
 - doc
-- file
 - server session
 - middleware
 - http client

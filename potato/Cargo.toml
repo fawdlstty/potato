@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.83"
 license = "MIT"
@@ -20,7 +20,7 @@ flate2 = "1.0.35"
 http = "1.2.0"
 inventory = "0.3.15"
 lazy_static = "1.5.0"
-potato-macro = "0.1.5"                                # { path = "../potato-macro" }
+potato-macro = "0.1.6"                                # { path = "../potato-macro" }
 sha1 = "0.10.6"
 strum = { version = "0.26.3", features = ["derive"] }
 tokio = { version = "1.42.0", features = ["full"] }

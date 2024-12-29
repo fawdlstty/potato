@@ -60,6 +60,7 @@ impl TcpStreamExt for TcpStream {
             }
             None => req.url_path = url.to_string(),
         }
+        req.url_path = (&req.url_path[..]).url_decode();
         req.version = items[2].to_string();
         loop {
             let line = self.read_line().await;
