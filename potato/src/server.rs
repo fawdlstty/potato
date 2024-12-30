@@ -7,10 +7,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::server::TlsStream;
 use tokio_rustls::{rustls, TlsAcceptor};
 
 lazy_static! {
@@ -43,17 +42,18 @@ impl HttpServer {
         self.static_paths.push((loc_path.into(), url_path.into()));
     }
 
-    pub async fn run_http1(&mut self) -> anyhow::Result<()> {
+    pub async fn serve_http(&mut self) -> anyhow::Result<()> {
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;
 
         loop {
             // accept connection
-            let (mut stream, client_addr) = listener.accept().await?;
+            let (stream, client_addr) = listener.accept().await?;
+            let mut stream: Box<dyn TcpStreamExt> = Box::new(stream);
             let static_paths = self.static_paths.clone();
             _ = tokio::task::spawn(async move {
                 loop {
-                    let req = match HttpRequest::from_stream::<TcpStream>(&mut stream).await {
+                    let req = match HttpRequest::from_stream(&mut stream).await {
                         Ok(req) => req,
                         Err(_) => break,
                     };
@@ -72,12 +72,10 @@ impl HttpServer {
         }
     }
 
-    pub async fn run_https1(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
+    pub async fn serve_https(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;
 
-        //let cert_file = &mut BufReader::new(File::open("cert.pem")?);
-        //let key_file = &mut BufReader::new(File::open("key.pem")?);
         let certs = CertificateDer::pem_file_iter(cert_file)?.collect::<Result<Vec<_>, _>>()?;
         let key = PrivateKeyDer::from_pem_file(key_file)?;
         let config = rustls::ServerConfig::builder()
@@ -90,17 +88,17 @@ impl HttpServer {
             let (stream, client_addr) = listener.accept().await?;
             let static_paths = self.static_paths.clone();
             let acceptor = acceptor.clone();
-            let mut stream = match acceptor.accept(stream).await {
+            let stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
                 Err(_) => continue,
             };
+            let mut stream: Box<dyn TcpStreamExt> = Box::new(stream);
             _ = tokio::task::spawn(async move {
                 loop {
-                    let req =
-                        match HttpRequest::from_stream::<TlsStream<TcpStream>>(&mut stream).await {
-                            Ok(req) => req,
-                            Err(_) => break,
-                        };
+                    let req = match HttpRequest::from_stream(&mut stream).await {
+                        Ok(req) => req,
+                        Err(_) => break,
+                    };
                     let cmode = req.get_header_accept_encoding();
                     let (res, upgrade_ws);
                     (res, upgrade_ws, stream) =
@@ -116,12 +114,12 @@ impl HttpServer {
         }
     }
 
-    async fn process_request<T: TcpStreamExt>(
+    async fn process_request(
         req: HttpRequest,
         client_addr: SocketAddr,
         static_paths: &Vec<(String, String)>,
-        mut stream: T,
-    ) -> (HttpResponse, bool, T) {
+        mut stream: Box<dyn TcpStreamExt>,
+    ) -> (HttpResponse, bool, Box<dyn TcpStreamExt>) {
         // call process pipes
         let mut upgrade_ws = false;
         let mut res = None;
@@ -134,7 +132,7 @@ impl HttpServer {
         };
         if let Some(handler_ref) = handler_ref {
             let mut wsctx = WebsocketContext {
-                stream: Box::new(stream),
+                stream,
                 upgrade_ws: false,
             };
             res = Some(handler_ref(req, client_addr, &mut wsctx).await);

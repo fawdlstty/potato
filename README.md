@@ -53,7 +53,7 @@ HTTP请求处理函数还可包含以下类型参数：
 示例参数完全体：
 
 ```rust
-// http://127.0.0.1:8080
+// http://127.0.0.1:8080/hello
 #[http_get("/hello")]
 async fn hello(req: HttpRequest, client: std::net::SocketAddr, wsctx: &mut WebsocketContext) -> HttpResponse {
     todo!()
@@ -107,7 +107,8 @@ async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Re
 #[tokio::main]
 async fn main() {
     let mut server = HttpServer::new("0.0.0.0:8080");
-    _ = server.run().await;
+    _ = server.serve_http().await;
+    // _ = server.serve_https("cert.pem", "key.pem").await;
 }
 ```
 

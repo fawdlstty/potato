@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::Read;
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utils::bytes::VecU8Ext;
 use utils::string::{StrExt, StringExt};
 use utils::tcp_stream::TcpStreamExt;
@@ -91,7 +91,7 @@ impl WebsocketContext {
 }
 
 pub struct WebsocketConnection<'a> {
-    stream: &'a mut TcpStreamExt,
+    stream: &'a mut Box<dyn TcpStreamExt>,
 }
 
 impl<'a> WebsocketConnection<'_> {
@@ -305,7 +305,7 @@ impl HttpRequest {
         true
     }
 
-    pub async fn from_stream<T: TcpStreamExt>(stream: &mut T) -> anyhow::Result<Self> {
+    pub async fn from_stream(stream: &mut Box<dyn TcpStreamExt>) -> anyhow::Result<Self> {
         let mut req = HttpRequest::new();
         let line = stream.read_line().await;
         let items = line.split(' ').collect::<Vec<&str>>();

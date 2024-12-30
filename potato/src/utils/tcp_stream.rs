@@ -1,9 +1,11 @@
 #![allow(async_fn_in_trait)]
+use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 
-pub trait TcpStreamExt: AsyncRead + AsyncWrite + Unpin {
+#[async_trait]
+pub trait TcpStreamExt: AsyncRead + AsyncWrite + Unpin + Send {
     async fn read_until(&mut self, uc: u8) -> Vec<u8> {
         let mut buf = vec![];
         while let Ok(c) = self.read_u8().await {

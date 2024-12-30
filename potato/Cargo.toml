@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.83"
 license = "MIT"
@@ -14,6 +14,7 @@ readme = "../README.md"
 
 [dependencies]
 anyhow = "1.0.94"
+async-trait = "0.1.83"
 base64 = "0.22.1"
 chrono = "0.4.39"
 flate2 = "1.0.35"
