@@ -19,7 +19,7 @@ cargo add tokio --features full
 ```rust
 use potato::*;
 
-// http://127.0.0.1:8080/hello
+// http://127.0.0.1:80/hello
 #[http_get("/hello")]
 async fn hello() -> HttpResponse {
     HttpResponse::html("hello world")
@@ -28,7 +28,7 @@ async fn hello() -> HttpResponse {
 #[tokio::main]
 async fn main() {
     let mut server = HttpServer::new("0.0.0.0:80"); // 0.0.0.0:443
-    _ = server.run().await;
+    _ = server.serve_http().await;
     // _ = server.serve_https("cert.pem", "key.pem").await;
 }
 ```
