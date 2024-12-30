@@ -27,8 +27,9 @@ async fn hello() -> HttpResponse {
 
 #[tokio::main]
 async fn main() {
-    let mut server = HttpServer::new("0.0.0.0:8080");
+    let mut server = HttpServer::new("0.0.0.0:80"); // 0.0.0.0:443
     _ = server.run().await;
+    // _ = server.serve_https("cert.pem", "key.pem").await;
 }
 ```
 
@@ -108,7 +109,6 @@ async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Re
 async fn main() {
     let mut server = HttpServer::new("0.0.0.0:8080");
     _ = server.serve_http().await;
-    // _ = server.serve_https("cert.pem", "key.pem").await;
 }
 ```
 
