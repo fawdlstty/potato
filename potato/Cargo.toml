@@ -24,3 +24,4 @@ potato-macro = "0.1.6"                                # { path = "../potato-macr
 sha1 = "0.10.6"
 strum = { version = "0.26.3", features = ["derive"] }
 tokio = { version = "1.42.0", features = ["full"] }
+tokio-rustls = "0.26.1"
