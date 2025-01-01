@@ -5,6 +5,7 @@ pub mod utils;
 pub use client::*;
 pub use inventory;
 pub use potato_macro::*;
+pub use server::*;
 
 use chrono::Utc;
 use sha1::{Digest, Sha1};

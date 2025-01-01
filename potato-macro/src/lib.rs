@@ -21,42 +21,12 @@ fn random_ident() -> Ident {
     Ident::new(&value, Span::call_site())
 }
 
-// ItemFn {
-//     attrs: [
-//         Attribute { meta: Meta::NameValue {
-//             path: Path { segments: [ PathSegment { ident: Ident { ident: "doc" } }] },
-//             value: Expr::Lit { attrs: [], lit: Lit::Str { token: " AAAAAAAA test api: hello" } }
-//         } },
-//         Attribute { meta: Meta::NameValue {
-//             path: Path { segments: [PathSegment { ident: Ident { ident: "doc" } }] },
-//             value: Expr::Lit { attrs: [], lit: Lit::Str { token: " desp: XXXXXXXXX" } }
-//         } }
-//     ],
-//     sig: Signature {
-//         ident: Ident { ident: "hello", span: #0 bytes(312..317) },
-//         inputs: [FnArg::Typed(
-//             PatType {
-//                 pat: Pat::Ident { ident: Ident { ident: "req", span: #0 bytes(318..321) }, },
-//                 ty: Type::Path { path: Path { segments: [
-//                     PathSegment {
-//                         ident: Ident { ident: "HttpRequest", span: #0 bytes(323..334) },
-//                         arguments: PathArguments::None
-//                     }
-//                 ] } }
-//             }
-//         )],
-//         output: ReturnType::Type( Type::Path { path: Path { segments: [
-//             PathSegment {
-//                 ident: Ident { ident: "HttpResponse", span: #0 bytes(339..351) },
-//                 arguments: PathArguments::None
-//             }
-//         ] } } )
-//     },
-// }
-
 fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> TokenStream {
     let req_name = Ident::new(req_name, Span::call_site());
     let route_path = parse_macro_input!(attr as LitStr);
+    if !route_path.value().starts_with('/') {
+        panic!("route path must start with '/'");
+    }
     let root_fn = parse_macro_input!(input as ItemFn);
     let doc = {
         let mut docs = vec![];
@@ -211,6 +181,21 @@ pub fn http_options(attr: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "HEAD")
+}
+
+#[proc_macro]
+pub fn declare_doc_path(route_path: TokenStream) -> TokenStream {
+    let route_path = parse_macro_input!(route_path as LitStr).value();
+    if !route_path.starts_with('/') {
+        panic!("route path must start with '/'");
+    }
+    if !route_path.ends_with('/') {
+        panic!("route path must ends with '/'");
+    }
+    quote! {
+        //
+    }
+    .into()
 }
 
 trait StringExt {

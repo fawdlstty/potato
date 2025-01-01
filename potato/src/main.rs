@@ -1,4 +1,4 @@
-use potato::{http_get, server::HttpServer, HttpRequest, HttpResponse, WebsocketContext, WsFrame};
+use potato::*;
 
 // async fn common_handler(req: HttpRequest) -> Option<HttpResponse> {
 //     match req.uri.query().unwrap_or("").len() > 3 {
@@ -51,7 +51,7 @@ async fn main() {
     let mut server = HttpServer::new("0.0.0.0:8080");
     server.set_static_path("E:\\", "/");
     _ = server.serve_http().await;
-    _ = server.serve_https("cert.pem", "key.pem").await;
+    // _ = server.serve_https("cert.pem", "key.pem").await;
 }
 
 // cargo run -p potato

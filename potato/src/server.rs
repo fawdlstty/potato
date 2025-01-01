@@ -28,6 +28,7 @@ lazy_static! {
 pub struct HttpServer {
     pub addr: String,
     pub static_paths: Vec<(String, String)>,
+    pub doc_path: Option<String>,
 }
 
 impl HttpServer {
@@ -35,11 +36,17 @@ impl HttpServer {
         HttpServer {
             addr: addr.into(),
             static_paths: vec![],
+            doc_path: None,
         }
     }
 
     pub fn set_static_path(&mut self, loc_path: impl Into<String>, url_path: impl Into<String>) {
         self.static_paths.push((loc_path.into(), url_path.into()));
+    }
+
+    pub fn set_doc_path(&mut self, path: impl Into<String>) {
+        self.doc_path = Some(path.into());
+        panic!("CARGO_PKG_NAME: {}", env!("CARGO_PKG_NAME"));
     }
 
     pub async fn serve_http(&mut self) -> anyhow::Result<()> {
@@ -51,6 +58,7 @@ impl HttpServer {
             let (stream, client_addr) = listener.accept().await?;
             let mut stream: Box<dyn TcpStreamExt> = Box::new(stream);
             let static_paths = self.static_paths.clone();
+            let doc_path = self.doc_path.clone();
             _ = tokio::task::spawn(async move {
                 loop {
                     let req = match HttpRequest::from_stream(&mut stream).await {
@@ -60,7 +68,8 @@ impl HttpServer {
                     let cmode = req.get_header_accept_encoding();
                     let (res, upgrade_ws);
                     (res, upgrade_ws, stream) =
-                        Self::process_request(req, client_addr, &static_paths, stream).await;
+                        Self::process_request(req, client_addr, &static_paths, stream, &doc_path)
+                            .await;
                     if upgrade_ws {
                         break;
                     }
@@ -93,6 +102,7 @@ impl HttpServer {
                 Err(_) => continue,
             };
             let mut stream: Box<dyn TcpStreamExt> = Box::new(stream);
+            let doc_path = self.doc_path.clone();
             _ = tokio::task::spawn(async move {
                 loop {
                     let req = match HttpRequest::from_stream(&mut stream).await {
@@ -102,7 +112,8 @@ impl HttpServer {
                     let cmode = req.get_header_accept_encoding();
                     let (res, upgrade_ws);
                     (res, upgrade_ws, stream) =
-                        Self::process_request(req, client_addr, &static_paths, stream).await;
+                        Self::process_request(req, client_addr, &static_paths, stream, &doc_path)
+                            .await;
                     if upgrade_ws {
                         break;
                     }
@@ -119,6 +130,7 @@ impl HttpServer {
         client_addr: SocketAddr,
         static_paths: &Vec<(String, String)>,
         mut stream: Box<dyn TcpStreamExt>,
+        doc_path: &Option<String>,
     ) -> (HttpResponse, bool, Box<dyn TcpStreamExt>) {
         // call process pipes
         let mut upgrade_ws = false;
@@ -153,6 +165,15 @@ impl HttpServer {
                             .join(", ")
                     });
                     res = Some(res2);
+                }
+            }
+            //
+            if res.is_none() {
+                if let Some(doc_path) = doc_path {
+                    if req.url_path.starts_with(doc_path) {
+                        // TODO
+                        res = Some(HttpResponse::html("current not support doc :("));
+                    }
                 }
             }
             //
