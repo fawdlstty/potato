@@ -3,6 +3,7 @@ use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::{quote, ToTokens};
 use rand::Rng;
+use serde_json::json;
 use std::collections::HashSet;
 use syn::{parse_macro_input, FnArg, ItemFn, LitStr};
 
@@ -28,7 +29,21 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         panic!("route path must start with '/'");
     }
     let root_fn = parse_macro_input!(input as ItemFn);
-    let doc = {
+    let doc_show = {
+        let mut doc_show = true;
+        for attr in root_fn.attrs.iter() {
+            if attr.meta.path().get_ident().map(|p| p.to_string()) == Some("doc".to_string()) {
+                if let Ok(meta_list) = attr.meta.require_list() {
+                    if meta_list.tokens.to_string() == "hidden" {
+                        doc_show = false;
+                        break;
+                    }
+                }
+            }
+        }
+        doc_show
+    };
+    let doc_summary = {
         let mut docs = vec![];
         for attr in root_fn.attrs.iter() {
             if let Ok(attr) = attr.meta.require_name_value() {
@@ -49,9 +64,11 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
         docs.join("\n")
     };
+    let doc_desp = "";
     let fn_name = root_fn.sig.ident.clone();
     let wrap_func_name = random_ident();
     let mut args = vec![];
+    let mut doc_args = vec![];
     for arg in root_fn.sig.inputs.iter() {
         if let FnArg::Typed(arg) = arg {
             let arg_type_str = arg
@@ -72,6 +89,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     }
                 },
                 arg_type_str if ARG_TYPES.contains(arg_type_str) => {
+                    doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                     let mut arg_value = quote! {
                         match req.body_pairs.get(#arg_name_str).cloned() {
                             Some(val) => val,
@@ -126,6 +144,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         },
         _ => panic!("unsupported ret type: {}", ret_type),
     };
+    let doc_args = serde_json::to_string(&doc_args).unwrap();
     //let mut content =
     quote! {
         #root_fn
@@ -145,7 +164,10 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
 
         potato::inventory::submit!{potato::RequestHandlerFlag::new(
-            potato::HttpMethod::#req_name, #route_path, #wrap_func_name, #doc
+            potato::HttpMethod::#req_name,
+            #route_path,
+            #wrap_func_name,
+            potato::RequestHandlerFlagDoc::new(#doc_show, #doc_summary, #doc_desp, #doc_args)
         )}
     }.into()
     // }.to_string();
@@ -184,16 +206,141 @@ pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
-pub fn declare_doc_path(route_path: TokenStream) -> TokenStream {
-    let route_path = parse_macro_input!(route_path as LitStr).value();
-    if !route_path.starts_with('/') {
+pub fn declare_doc_path(input: TokenStream) -> TokenStream {
+    let doc = parse_macro_input!(input as LitStr).value();
+    if !doc.starts_with('/') {
         panic!("route path must start with '/'");
     }
-    if !route_path.ends_with('/') {
+    if !doc.ends_with('/') {
         panic!("route path must ends with '/'");
     }
+    let doc_index_htm = format!("{doc}index.htm");
+    let doc_index_html = format!("{doc}index.html");
+    let doc_index_css = format!("{doc}index.css");
+    let doc_swagger_ui_css = format!("{doc}swagger-ui.css");
+    let doc_swagger_ui_bundle_js = format!("{doc}swagger-ui-bundle.js");
+    let doc_swagger_ui_standalone_preset_js = format!("{doc}swagger-ui-standalone-preset.js");
+    let doc_swagger_initializer_js = format!("{doc}swagger-initializer.js");
+    //let doc_favicon_32x32_png = format!("{doc}favicon-32x32.png");
+    //let doc_favicon_16x16_png = format!("{doc}favicon-16x16.png");
+    let doc_index_json = format!("{doc}index.json");
+
     quote! {
-        //
+        #[doc(hidden)]
+        #[http_get(#doc)]
+        #[http_get(#doc_index_htm)]
+        #[http_get(#doc_index_html)]
+        async fn doc_index() -> HttpResponse {
+            HttpResponse::html(potato::DocResource::load_str("index.html"))
+        }
+
+        #[doc(hidden)]
+        #[http_get(#doc_index_css)]
+        async fn doc_index_css() -> HttpResponse {
+            HttpResponse::css(potato::DocResource::load_str("index.css"))
+        }
+
+        #[doc(hidden)]
+        #[http_get(#doc_swagger_ui_css)]
+        async fn doc_swagger_ui_css() -> HttpResponse {
+            HttpResponse::css(potato::DocResource::load_str("swagger-ui.css"))
+        }
+
+        #[doc(hidden)]
+        #[http_get(#doc_swagger_ui_bundle_js)]
+        async fn doc_swagger_ui_bundle_js() -> HttpResponse {
+            HttpResponse::js(potato::DocResource::load_str("swagger-ui-bundle.js"))
+        }
+
+        #[doc(hidden)]
+        #[http_get(#doc_swagger_ui_standalone_preset_js)]
+        async fn doc_swagger_ui_standalone_preset_js() -> HttpResponse {
+            HttpResponse::js(potato::DocResource::load_str("swagger-ui-standalone-preset.js"))
+        }
+
+        #[doc(hidden)]
+        #[http_get(#doc_swagger_initializer_js)]
+        async fn doc_swagger_initializer_js() -> HttpResponse {
+            HttpResponse::js(potato::DocResource::load_str("swagger-initializer.js"))
+        }
+
+        // #[doc(hidden)]
+        // #[http_get(#doc_favicon_32x32_png)]
+        // async fn doc_favicon_32x32_png() -> HttpResponse {
+        //     HttpResponse::png(include_bytes!("../swagger_res/favicon-32x32.png"))
+        // }
+
+        // #[doc(hidden)]
+        // #[http_get(#doc_favicon_16x16_png)]
+        // async fn doc_favicon_16x16_png() -> HttpResponse {
+        //     HttpResponse::png(include_bytes!("../swagger_res/favicon-16x16.png"))
+        // }
+
+        #[doc(hidden)]
+        #[http_get(#doc_index_json)]
+        async fn doc_doc_json() -> HttpResponse {
+            let mut paths = std::collections::HashMap::new();
+            for flag in inventory::iter::<RequestHandlerFlag> {
+                if !flag.doc.show {
+                    continue;
+                }
+                let cur_path = paths.entry(flag.path).or_insert_with(std::collections::HashMap::new);
+                let mut parameters = vec![];
+                if let Ok(args) = potato::serde_json::from_str::<potato::serde_json::Value>(flag.doc.args) {
+                    if let Some(args) = args.as_array() {
+                        for arg in args.iter() {
+                            let arg_name = arg["name"].as_str().unwrap_or("");
+                            let arg_type = {
+                                let arg_type = arg["type"].as_str().unwrap_or("");
+                                match arg_type.starts_with('i') || arg_type.starts_with('u') {
+                                    true => "number",
+                                    false => "string"
+                                }
+                            };
+                            let arg_in = match flag.method == potato::HttpMethod::GET{
+                                true => "query",
+                                false => "body",
+                            };
+                            parameters.push(potato::serde_json::json!({
+                                "name": arg_name,
+                                "in": arg_in,
+                                "description": "",
+                                "required": true,
+                                "schema": { "type": arg_type },
+                            }));
+                        }
+                    }
+                }
+                
+                cur_path.insert(
+                    flag.method.to_string().to_lowercase(),
+                    potato::serde_json::json!({
+                        "summary": flag.doc.summary,
+                        "description": flag.doc.desp,
+                        "parameters": parameters,
+                        "responses": {
+                            "200": { "description": "OK" },
+                            "500": { "description": "Internal Error" },
+                        },
+                    }),
+                );
+            }
+            let json = potato::serde_json::json!({
+                "openapi": "3.1.0",
+                "info": {
+                    "title": env!("CARGO_PKG_NAME"),
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "description": env!("CARGO_PKG_DESCRIPTION"),
+                    "contact": {
+                        "name": env!("CARGO_PKG_AUTHORS"),
+                        "url": env!("CARGO_PKG_HOMEPAGE"),
+                        "email": env!("CARGO_PKG_REPOSITORY"),
+                    },
+                },
+                "paths": paths
+            });
+            HttpResponse::json(potato::serde_json::to_string(&json).unwrap_or("{}".to_string()))
+        }
     }
     .into()
 }

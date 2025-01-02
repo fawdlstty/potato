@@ -4,7 +4,9 @@ pub mod utils;
 
 pub use client::*;
 pub use inventory;
+use lazy_static::lazy_static;
 pub use potato_macro::*;
+pub use serde_json;
 pub use server::*;
 
 use chrono::Utc;
@@ -24,11 +26,34 @@ type HttpHandler = fn(
     &mut WebsocketContext,
 ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>;
 
+pub struct RequestHandlerFlagDoc {
+    pub show: bool,
+    pub summary: &'static str,
+    pub desp: &'static str,
+    pub args: &'static str,
+}
+
+impl RequestHandlerFlagDoc {
+    pub const fn new(
+        show: bool,
+        summary: &'static str,
+        desp: &'static str,
+        args: &'static str,
+    ) -> Self {
+        RequestHandlerFlagDoc {
+            show,
+            summary,
+            desp,
+            args,
+        }
+    }
+}
+
 pub struct RequestHandlerFlag {
     pub method: HttpMethod,
     pub path: &'static str,
     pub handler: HttpHandler,
-    pub doc: &'static str,
+    pub doc: RequestHandlerFlagDoc,
 }
 
 impl RequestHandlerFlag {
@@ -36,7 +61,7 @@ impl RequestHandlerFlag {
         method: HttpMethod,
         path: &'static str,
         handler: HttpHandler,
-        doc: &'static str,
+        doc: RequestHandlerFlagDoc,
     ) -> Self {
         RequestHandlerFlag {
             method,
@@ -49,7 +74,7 @@ impl RequestHandlerFlag {
 
 inventory::collect!(RequestHandlerFlag);
 
-#[derive(Clone, Copy, Display, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Display, Eq, Hash, PartialEq)]
 pub enum HttpMethod {
     GET,
     POST,
@@ -96,7 +121,7 @@ pub struct WebsocketConnection<'a> {
 }
 
 impl<'a> WebsocketConnection<'_> {
-    pub async fn read_frame_impl(&mut self) -> anyhow::Result<WsFrameImpl> {
+    pub async fn recv_frame_impl(&mut self) -> anyhow::Result<WsFrameImpl> {
         let buf = {
             let mut buf = [0u8; 2];
             self.stream.read_exact(&mut buf).await?;
@@ -146,10 +171,10 @@ impl<'a> WebsocketConnection<'_> {
         }
     }
 
-    pub async fn read_frame(&mut self) -> anyhow::Result<WsFrame> {
+    pub async fn recv_frame(&mut self) -> anyhow::Result<WsFrame> {
         let mut tmp = vec![];
         loop {
-            match self.read_frame_impl().await? {
+            match self.recv_frame_impl().await? {
                 WsFrameImpl::Close => return Err(anyhow::Error::msg("close frame")),
                 WsFrameImpl::Ping => self.write_frame_impl(WsFrameImpl::Pong).await?,
                 WsFrameImpl::Pong => (),
@@ -193,15 +218,15 @@ impl<'a> WebsocketConnection<'_> {
         Ok(())
     }
 
-    pub async fn write_ping(&mut self) -> anyhow::Result<()> {
+    pub async fn send_ping(&mut self) -> anyhow::Result<()> {
         self.write_frame_impl(WsFrameImpl::Ping).await
     }
 
-    pub async fn write_binary(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
+    pub async fn send_binary(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
         self.write_frame_impl(WsFrameImpl::Binary(data)).await
     }
 
-    pub async fn write_text(&mut self, data: &str) -> anyhow::Result<()> {
+    pub async fn send_text(&mut self, data: &str) -> anyhow::Result<()> {
         self.write_frame_impl(WsFrameImpl::Text(data.as_bytes().to_vec()))
             .await
     }
@@ -433,11 +458,32 @@ macro_rules! make_resp_by_text {
     };
 }
 
+macro_rules! make_resp_by_binary {
+    ($fn_name:ident, $cnt_type:expr) => {
+        pub fn $fn_name(payload: &[u8]) -> Self {
+            Self {
+                version: "HTTP/1.1".to_string(),
+                http_code: 200,
+                headers: [
+                    ("Date".to_string(), Utc::now().to_rfc2822()),
+                    ("Server".to_string(), "Potato 0.1.0".to_string()),
+                    ("Content-Type".to_string(), $cnt_type.to_string()),
+                ]
+                .into(),
+                payload: payload.to_vec(),
+            }
+        }
+    };
+}
+
 impl HttpResponse {
     make_resp_by_text!(html, "text/html");
+    make_resp_by_text!(css, "text/css");
+    make_resp_by_text!(js, "text/javascript");
     make_resp_by_text!(text, "text/plain");
     make_resp_by_text!(json, "application/json");
     make_resp_by_text!(xml, "application/xml");
+    make_resp_by_binary!(png, "image/png");
 
     pub fn add_header(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.headers.insert(key.into(), value.into());
@@ -545,5 +591,49 @@ impl HttpResponse {
         let mut ret: Vec<u8> = ret.as_bytes().to_vec();
         ret.extend(payload_ref);
         ret
+    }
+}
+
+lazy_static! {
+    pub static ref DOC_RES: HashMap<&'static str, &'static str> = {
+        [
+            ("index.html", include_str!("../swagger_res/index.html")),
+            ("index.css", include_str!("../swagger_res/index.css")),
+            (
+                "swagger-ui.css",
+                include_str!("../swagger_res/swagger-ui.css"),
+            ),
+            (
+                "swagger-ui-bundle.js",
+                include_str!("../swagger_res/swagger-ui-bundle.js"),
+            ),
+            (
+                "swagger-ui-standalone-preset.js",
+                include_str!("../swagger_res/swagger-ui-standalone-preset.js"),
+            ),
+            (
+                "swagger-initializer.js",
+                r#"window.onload = function() {
+   window.ui = SwaggerUIBundle({
+       url: "./index.json",
+       dom_id: '#swagger-ui',
+       deepLinking: true,
+       presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+       plugins: [SwaggerUIBundle.plugins.DownloadUrl],
+       layout: "StandaloneLayout"
+   });
+ };"#,
+            ),
+        ]
+        .into_iter()
+        .collect()
+    };
+}
+
+pub struct DocResource {}
+
+impl DocResource {
+    pub fn load_str(file: &str) -> &'static str {
+        DOC_RES.get(file).map(|v| &**v).unwrap_or("")
     }
 }

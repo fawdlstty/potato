@@ -25,6 +25,9 @@ async fn hello() -> HttpResponse {
     HttpResponse::html("hello world")
 }
 
+// OpenAPI doc at http://127.0.0.1:80/doc/
+declare_doc_path!("/doc/");
+
 #[tokio::main]
 async fn main() {
     let mut server = HttpServer::new("0.0.0.0:80"); // 0.0.0.0:443
@@ -96,11 +99,11 @@ async fn index() -> HttpResponse {
 #[http_get("/ws")]
 async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Result<()> {
     let mut ws = wsctx.upgrade_websocket(&req).await?;
-    ws.write_text("hello websocket").await?;
+    ws.send_ping().await?;
     loop {
-        match ws.read_frame().await? {
-            WsFrame::Text(text) => ws.write_text(&text).await?,
-            WsFrame::Binary(bin) => ws.write_binary(bin).await?,
+        match ws.recv_frame().await? {
+            WsFrame::Text(text) => ws.send_text(&text).await?,
+            WsFrame::Binary(bin) => ws.send_binary(bin).await?,
         }
     }
 }

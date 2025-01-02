@@ -7,8 +7,8 @@ use potato::*;
 //     }
 // }
 
-/// AAAAAAAAAAAAAAAA
-/// BBBBBBBBBBBBBBBB
+// AAAAAAAAAAAAAAAA
+// BBBBBBBBBBBBBBBB
 #[http_get("/hello")]
 async fn hello(name: i32) -> HttpResponse {
     HttpResponse::html(format!("hello world, {name}!"))
@@ -37,19 +37,21 @@ async fn index() -> HttpResponse {
 #[http_get("/ws")]
 async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Result<()> {
     let mut ws = wsctx.upgrade_websocket(&req).await?;
-    ws.write_text("hello websocket").await?;
+    ws.send_ping().await?;
     loop {
-        match ws.read_frame().await? {
-            WsFrame::Text(text) => ws.write_text(&text).await?,
-            WsFrame::Binary(bin) => ws.write_binary(bin).await?,
+        match ws.recv_frame().await? {
+            WsFrame::Text(text) => ws.send_text(&text).await?,
+            WsFrame::Binary(bin) => ws.send_binary(bin).await?,
         }
     }
 }
 
+declare_doc_path!("/doc/");
+
 #[tokio::main]
 async fn main() {
     let mut server = HttpServer::new("0.0.0.0:8080");
-    server.set_static_path("E:\\", "/");
+    //server.set_static_path("E:\\", "/");
     _ = server.serve_http().await;
     // _ = server.serve_https("cert.pem", "key.pem").await;
 }
