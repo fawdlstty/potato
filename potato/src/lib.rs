@@ -6,6 +6,7 @@ pub use client::*;
 pub use inventory;
 use lazy_static::lazy_static;
 pub use potato_macro::*;
+pub use regex;
 pub use serde_json;
 pub use server::*;
 
@@ -246,11 +247,13 @@ pub enum WsFrameImpl {
     PartData(Vec<u8>),
 }
 
+#[derive(Debug)]
 pub struct PostFile {
     pub filename: String,
     pub data: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub url_path: String,
@@ -370,52 +373,72 @@ impl HttpRequest {
                 break;
             }
         }
+        if let Some(cnt_len) = req.get_header("Content-Length") {
+            if let Ok(cnt_len) = cnt_len.parse::<usize>() {
+                if cnt_len > 0 {
+                    let mut body = vec![0u8; cnt_len];
+                    stream.read_exact(&mut body).await?;
+                    req.body = body;
+                }
+            }
+        }
         if let Some(cnt_type) = req.get_header("Content-Type") {
-            if cnt_type == "application/x-www-form-urlencoded" {
-                let body_str = String::from_utf8(req.body).unwrap_or("".to_string());
-                req.body = vec![];
-                body_str.split('&').for_each(|s| {
-                    if let Some((a, b)) = s.split_once('=') {
-                        req.body_pairs.insert(a.url_decode(), b.url_decode());
+            if cnt_type == "application/json" {
+                if let Ok(body_str) = std::str::from_utf8(&req.body) {
+                    if let Ok(root) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                        if let serde_json::Value::Object(obj) = root {
+                            for (k, v) in obj {
+                                req.body_pairs.insert(k, v.to_string());
+                            }
+                        }
                     }
-                });
+                }
+            } else if cnt_type == "application/x-www-form-urlencoded" {
+                if let Ok(body_str) = std::str::from_utf8(&req.body) {
+                    body_str.split('&').for_each(|s| {
+                        if let Some((a, b)) = s.split_once('=') {
+                            req.body_pairs.insert(a.url_decode(), b.url_decode());
+                        }
+                    });
+                }
             } else if cnt_type.starts_with("multipart/form-data") {
                 let boundary = cnt_type.split_once("boundary=").unwrap_or(("", "")).1;
-                let body_str = unsafe { String::from_utf8_unchecked(req.body.clone()) };
-                for mut s in body_str.split(format!("--{boundary}\r\n").as_str()) {
-                    if s.starts_with("\r\n") {
-                        s = &s[2..];
-                    }
-                    if s.ends_with("\r\n") {
-                        s = &s[..s.len() - 2];
-                    }
-                    if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
-                        let keys: Vec<&str> = key_str
-                            .split_inclusive(|p| [';', '\n'].contains(&p))
-                            .map(|p| p.trim())
-                            .filter(|p| !p.is_empty())
-                            .collect();
-                        for key in keys.into_iter() {
-                            let mut name = None;
-                            let mut filename = None;
-                            if let Some((k, v)) = key.split_once('=') {
-                                if k == "name" {
-                                    name = Some(v.to_string());
-                                } else if k == "filename" {
-                                    filename = Some(v.to_string());
+                if let Ok(body_str) = std::str::from_utf8(&req.body) {
+                    for mut s in body_str.split(format!("--{boundary}\r\n").as_str()) {
+                        if s.starts_with("\r\n") {
+                            s = &s[2..];
+                        }
+                        if s.ends_with("\r\n") {
+                            s = &s[..s.len() - 2];
+                        }
+                        if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
+                            let keys: Vec<&str> = key_str
+                                .split_inclusive(|p| [';', '\n'].contains(&p))
+                                .map(|p| p.trim())
+                                .filter(|p| !p.is_empty())
+                                .collect();
+                            for key in keys.into_iter() {
+                                let mut name = None;
+                                let mut filename = None;
+                                if let Some((k, v)) = key.split_once('=') {
+                                    if k == "name" {
+                                        name = Some(v.to_string());
+                                    } else if k == "filename" {
+                                        filename = Some(v.to_string());
+                                    }
                                 }
-                            }
-                            if let Some(name) = name {
-                                if let Some(filename) = filename {
-                                    req.body_files.insert(
-                                        name,
-                                        PostFile {
-                                            filename,
-                                            data: content.as_bytes().to_vec(),
-                                        },
-                                    );
-                                } else {
-                                    req.body_pairs.insert(name, content.to_string());
+                                if let Some(name) = name {
+                                    if let Some(filename) = filename {
+                                        req.body_files.insert(
+                                            name,
+                                            PostFile {
+                                                filename,
+                                                data: content.as_bytes().to_vec(),
+                                            },
+                                        );
+                                    } else {
+                                        req.body_pairs.insert(name, content.to_string());
+                                    }
                                 }
                             }
                         }

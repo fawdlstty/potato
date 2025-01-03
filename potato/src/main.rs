@@ -10,8 +10,13 @@ use potato::*;
 // AAAAAAAAAAAAAAAA
 // BBBBBBBBBBBBBBBB
 #[http_get("/hello")]
-async fn hello(name: i32) -> HttpResponse {
+async fn hello(name: String) -> HttpResponse {
     HttpResponse::html(format!("hello world, {name}!"))
+}
+
+#[http_post("/test")]
+async fn test(name: String) -> HttpResponse {
+    HttpResponse::html("hello")
 }
 
 #[http_get("/")]

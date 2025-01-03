@@ -279,65 +279,99 @@ pub fn declare_doc_path(input: TokenStream) -> TokenStream {
         #[doc(hidden)]
         #[http_get(#doc_index_json)]
         async fn doc_doc_json() -> HttpResponse {
-            let mut paths = std::collections::HashMap::new();
-            for flag in inventory::iter::<RequestHandlerFlag> {
-                if !flag.doc.show {
-                    continue;
-                }
-                let cur_path = paths.entry(flag.path).or_insert_with(std::collections::HashMap::new);
-                let mut parameters = vec![];
-                if let Ok(args) = potato::serde_json::from_str::<potato::serde_json::Value>(flag.doc.args) {
-                    if let Some(args) = args.as_array() {
-                        for arg in args.iter() {
-                            let arg_name = arg["name"].as_str().unwrap_or("");
-                            let arg_type = {
-                                let arg_type = arg["type"].as_str().unwrap_or("");
-                                match arg_type.starts_with('i') || arg_type.starts_with('u') {
-                                    true => "number",
-                                    false => "string"
-                                }
-                            };
-                            let arg_in = match flag.method == potato::HttpMethod::GET{
-                                true => "query",
-                                false => "body",
-                            };
-                            parameters.push(potato::serde_json::json!({
-                                "name": arg_name,
-                                "in": arg_in,
-                                "description": "",
-                                "required": true,
-                                "schema": { "type": arg_type },
-                            }));
-                        }
+            let contact = {
+                let re = potato::regex::Regex::new(r"([[:word:]]+)\s*<([^>]+)>").unwrap();
+                match re.captures(env!("CARGO_PKG_AUTHORS")) {
+                    Some(caps) => {
+                        let name = caps.get(1).map_or("", |m| m.as_str());
+                        let email = caps.get(2).map_or("", |m| m.as_str());
+                        potato::serde_json::json!({ "name": name, "email": email })
                     }
+                    None => potato::serde_json::json!({}),
                 }
-                
-                cur_path.insert(
-                    flag.method.to_string().to_lowercase(),
-                    potato::serde_json::json!({
+            };
+            let paths = {
+                let mut paths = std::collections::HashMap::new();
+                for flag in inventory::iter::<RequestHandlerFlag> {
+                    if !flag.doc.show {
+                        continue;
+                    }
+                    let mut root_cur_path = potato::serde_json::json!({
                         "summary": flag.doc.summary,
                         "description": flag.doc.desp,
-                        "parameters": parameters,
                         "responses": {
                             "200": { "description": "OK" },
                             "500": { "description": "Internal Error" },
                         },
-                    }),
-                );
-            }
+                    });
+                    let mut arg_pairs = {
+                        let mut arg_pairs = vec![];
+                        if let Ok(args) = potato::serde_json::from_str::<potato::serde_json::Value>(flag.doc.args) {
+                            if let Some(args) = args.as_array() {
+                                for arg in args.iter() {
+                                    let arg_name = arg["name"].as_str().unwrap_or("");
+                                    let arg_type = {
+                                        let arg_type = arg["type"].as_str().unwrap_or("");
+                                        match arg_type.starts_with('i') || arg_type.starts_with('u') {
+                                            true => "number",
+                                            false => "string"
+                                        }
+                                    };
+                                    arg_pairs.push((arg_name.to_string(), arg_type.to_string()));
+                                }
+                            }
+                        }
+                        arg_pairs
+                    };
+                    if !arg_pairs.is_empty() {
+                        if flag.method == potato::HttpMethod::GET {
+                            let mut parameters = vec![];
+                            for (arg_name, arg_type) in arg_pairs.iter() {
+                                parameters.push(potato::serde_json::json!({
+                                    "name": arg_name, "in": "query", "description": "",
+                                    "required": true, "schema": { "type": arg_type },
+                                }));
+                            }
+                            root_cur_path["parameters"] = potato::serde_json::Value::Array(parameters);
+                        } else {
+                            let mut properties = potato::serde_json::json!({});
+                            let mut required = vec![];
+                            for (arg_name, arg_type) in arg_pairs.iter() {
+                                properties[arg_name] = potato::serde_json::json!({ "type": arg_type });
+                                required.push(arg_name);
+                            }
+                            root_cur_path["requestBody"]["content"]["application/x-www-form-urlencoded"]
+                                ["schema"] = potato::serde_json::json!({ "type": "object",
+                                "properties": properties, "required": required });
+                        }
+                    }
+                    // root_cur_path["security"] = potato::serde_json::json!({
+                    //     "bearerAuth": []
+                    // });
+                    paths.entry(flag.path).or_insert_with(std::collections::HashMap::new)
+                        .insert(flag.method.to_string().to_lowercase(), root_cur_path);
+                }
+                paths
+            };
             let json = potato::serde_json::json!({
                 "openapi": "3.1.0",
                 "info": {
                     "title": env!("CARGO_PKG_NAME"),
                     "version": env!("CARGO_PKG_VERSION"),
                     "description": env!("CARGO_PKG_DESCRIPTION"),
-                    "contact": {
-                        "name": env!("CARGO_PKG_AUTHORS"),
-                        "url": env!("CARGO_PKG_HOMEPAGE"),
-                        "email": env!("CARGO_PKG_REPOSITORY"),
-                    },
+                    "contact": contact,
                 },
-                "paths": paths
+                "paths": paths,
+                // "components": {
+                //     "securitySchemes": {
+                //         "bearerAuth": {
+                //             "description": "Bearer token using a JWT",
+                //             "type": "http",
+                //             "scheme": "Bearer",
+                //             "bearerFormat": "JWT",
+                //         },
+                //     },
+                // }
             });
             HttpResponse::json(potato::serde_json::to_string(&json).unwrap_or("{}".to_string()))
         }
