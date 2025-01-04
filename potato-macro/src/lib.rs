@@ -125,7 +125,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let wrap_func_body = match &ret_type[..] {
         "Result < () >" => quote! {
             match #fn_name(#(#args),*).await {
-                Ok(ret) => HttpResponse::empty(),
+                Ok(ret) => HttpResponse::text("ok"),
                 Err(err) => HttpResponse::error(format!("{err:?}")),
             }
         },
@@ -137,7 +137,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         },
         "()" => quote! {
             #fn_name(#(#args),*).await;
-            HttpResponse::empty()
+            HttpResponse::text("ok")
         },
         "HttpResponse" => quote! {
             #fn_name(#(#args),*).await
@@ -394,10 +394,15 @@ trait StringExt {
 
 impl StringExt for String {
     fn type_simplify(&self) -> String {
-        self.replace("potato :: ", "")
+        let ret = self
+            .replace("potato :: ", "")
             .replace("std :: ", "")
             .replace("net :: ", "")
             .replace("anyhow :: ", "")
-            .replace("-> ", "")
+            .replace("-> ", "");
+        match ret.is_empty() {
+            true => "()".to_string(),
+            false => ret,
+        }
     }
 }
