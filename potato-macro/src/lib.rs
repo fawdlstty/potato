@@ -167,7 +167,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             potato::HttpMethod::#req_name,
             #route_path,
             #wrap_func_name,
-            potato::RequestHandlerFlagDoc::new(#doc_show, #doc_summary, #doc_desp, #doc_args)
+            potato::RequestHandlerFlagDoc::new(#doc_show, false, #doc_summary, #doc_desp, #doc_args)
         )}
     }.into()
     // }.to_string();
@@ -279,6 +279,7 @@ pub fn declare_doc_path(input: TokenStream) -> TokenStream {
         #[doc(hidden)]
         #[http_get(#doc_index_json)]
         async fn doc_doc_json() -> HttpResponse {
+            let mut any_use_auth = false;
             let contact = {
                 let re = potato::regex::Regex::new(r"([[:word:]]+)\s*<([^>]+)>").unwrap();
                 match re.captures(env!("CARGO_PKG_AUTHORS")) {
@@ -328,8 +329,11 @@ pub fn declare_doc_path(input: TokenStream) -> TokenStream {
                             let mut parameters = vec![];
                             for (arg_name, arg_type) in arg_pairs.iter() {
                                 parameters.push(potato::serde_json::json!({
-                                    "name": arg_name, "in": "query", "description": "",
-                                    "required": true, "schema": { "type": arg_type },
+                                    "name": arg_name,
+                                    "in": "query",
+                                    "description": "",
+                                    "required": true,
+                                    "schema": { "type": arg_type },
                                 }));
                             }
                             root_cur_path["parameters"] = potato::serde_json::Value::Array(parameters);
@@ -340,20 +344,27 @@ pub fn declare_doc_path(input: TokenStream) -> TokenStream {
                                 properties[arg_name] = potato::serde_json::json!({ "type": arg_type });
                                 required.push(arg_name);
                             }
-                            root_cur_path["requestBody"]["content"]["application/x-www-form-urlencoded"]
-                                ["schema"] = potato::serde_json::json!({ "type": "object",
-                                "properties": properties, "required": required });
+                            root_cur_path["requestBody"]["content"] = potato::serde_json::json!({
+                                "application/x-www-form-urlencoded": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": properties,
+                                        "required": required
+                                    }
+                                }
+                            });
                         }
                     }
-                    // root_cur_path["security"] = potato::serde_json::json!({
-                    //     "bearerAuth": []
-                    // });
+                    if flag.doc.auth {
+                        root_cur_path["security"] = potato::serde_json::json!([{ "bearerAuth": [] }]);
+                        any_use_auth = true;
+                    }
                     paths.entry(flag.path).or_insert_with(std::collections::HashMap::new)
                         .insert(flag.method.to_string().to_lowercase(), root_cur_path);
                 }
                 paths
             };
-            let json = potato::serde_json::json!({
+            let mut root = potato::serde_json::json!({
                 "openapi": "3.1.0",
                 "info": {
                     "title": env!("CARGO_PKG_NAME"),
@@ -362,18 +373,16 @@ pub fn declare_doc_path(input: TokenStream) -> TokenStream {
                     "contact": contact,
                 },
                 "paths": paths,
-                // "components": {
-                //     "securitySchemes": {
-                //         "bearerAuth": {
-                //             "description": "Bearer token using a JWT",
-                //             "type": "http",
-                //             "scheme": "Bearer",
-                //             "bearerFormat": "JWT",
-                //         },
-                //     },
-                // }
             });
-            HttpResponse::json(potato::serde_json::to_string(&json).unwrap_or("{}".to_string()))
+            if any_use_auth {
+                root["components"]["securitySchemes"]["bearerAuth"] = potato::serde_json::json!({
+                    "description": "Bearer token using a JWT",
+                    "type": "http",
+                    "scheme": "Bearer",
+                    "bearerFormat": "JWT",
+                });
+            }
+            HttpResponse::json(potato::serde_json::to_string(&root).unwrap_or("{}".to_string()))
         }
     }
     .into()

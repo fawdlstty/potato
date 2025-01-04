@@ -29,6 +29,7 @@ type HttpHandler = fn(
 
 pub struct RequestHandlerFlagDoc {
     pub show: bool,
+    pub auth: bool,
     pub summary: &'static str,
     pub desp: &'static str,
     pub args: &'static str,
@@ -37,12 +38,14 @@ pub struct RequestHandlerFlagDoc {
 impl RequestHandlerFlagDoc {
     pub const fn new(
         show: bool,
+        auth: bool,
         summary: &'static str,
         desp: &'static str,
         args: &'static str,
     ) -> Self {
         RequestHandlerFlagDoc {
             show,
+            auth,
             summary,
             desp,
             args,
