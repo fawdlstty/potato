@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 rust-version = "1.83"
 license = "MIT"
@@ -22,7 +22,7 @@ flate2 = "1.0.35"
 http = "1.2.0"
 inventory = "0.3.15"
 lazy_static = "1.5.0"
-potato-macro = { path = "../potato-macro" }           # "0.1.14"
+potato-macro = "0.1.15"                               # { path = "../potato-macro" }
 regex = "1.11.1"
 serde_json = "1.0.134"
 sha1 = "0.10.6"

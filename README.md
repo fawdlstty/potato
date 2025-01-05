@@ -48,6 +48,16 @@ async fn hello(name: String) -> HttpResponse {
 }
 ```
 
+对于POST或PUT等请求来说，可以在参数直接接受文件：
+
+```rust
+// http://127.0.0.1:8080/test
+#[http_post("/test")]
+async fn test(file1: PostFile) -> HttpResponse {
+    HttpResponse::html(format!("file[{}] len: {}", file1.filename, file1.data.len()))
+}
+```
+
 HTTP请求处理函数还可包含以下类型参数：
 
 - `req: potato::HttpRequest` **请求结构体**
