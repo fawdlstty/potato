@@ -18,6 +18,7 @@ use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utils::bytes::VecU8Ext;
+use utils::number::HttpCodeExt;
 use utils::string::{StrExt, StringExt};
 use utils::tcp_stream::TcpStreamExt;
 
@@ -250,7 +251,7 @@ pub enum WsFrameImpl {
     PartData(Vec<u8>),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PostFile {
     pub filename: String,
     pub data: Vec<u8>,
@@ -407,41 +408,43 @@ impl HttpRequest {
             } else if cnt_type.starts_with("multipart/form-data") {
                 let boundary = cnt_type.split_once("boundary=").unwrap_or(("", "")).1;
                 if let Ok(body_str) = std::str::from_utf8(&req.body) {
-                    for mut s in body_str.split(format!("--{boundary}\r\n").as_str()) {
-                        if s.starts_with("\r\n") {
-                            s = &s[2..];
+                    for mut s in body_str.split(format!("--{boundary}").as_str()) {
+                        if s == "--" {
+                            break;
                         }
                         if s.ends_with("\r\n") {
                             s = &s[..s.len() - 2];
                         }
                         if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
                             let keys: Vec<&str> = key_str
-                                .split_inclusive(|p| [';', '\n'].contains(&p))
-                                .map(|p| p.trim())
-                                .filter(|p| !p.is_empty())
+                                .split("\r\n")
+                                .map(|p| p.split(";").collect::<Vec<_>>())
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .flatten()
                                 .collect();
+                            let mut name = None;
+                            let mut filename = None;
                             for key in keys.into_iter() {
-                                let mut name = None;
-                                let mut filename = None;
-                                if let Some((k, v)) = key.split_once('=') {
+                                if let Some((k, v)) = key.trim().split_once('=') {
                                     if k == "name" {
-                                        name = Some(v.to_string());
+                                        name = Some((&v[1..v.len() - 1]).to_string());
                                     } else if k == "filename" {
-                                        filename = Some(v.to_string());
+                                        filename = Some((&v[1..v.len() - 1]).to_string());
                                     }
                                 }
-                                if let Some(name) = name {
-                                    if let Some(filename) = filename {
-                                        req.body_files.insert(
-                                            name,
-                                            PostFile {
-                                                filename,
-                                                data: content.as_bytes().to_vec(),
-                                            },
-                                        );
-                                    } else {
-                                        req.body_pairs.insert(name, content.to_string());
-                                    }
+                            }
+                            if let Some(name) = name {
+                                if let Some(filename) = filename {
+                                    req.body_files.insert(
+                                        name,
+                                        PostFile {
+                                            filename,
+                                            data: content.as_bytes().to_vec(),
+                                        },
+                                    );
+                                } else {
+                                    req.body_pairs.insert(name, content.to_string());
                                 }
                             }
                         }
@@ -595,11 +598,7 @@ impl HttpResponse {
         };
         //
         let mut ret = "".to_string();
-        let status_str = http::StatusCode::from_u16(self.http_code)
-            .map(|c| c.canonical_reason())
-            .ok()
-            .flatten()
-            .unwrap_or("UNKNOWN");
+        let status_str = self.http_code.http_code_to_desp();
         ret.push_str(&format!(
             "{} {} {}\r\n",
             self.version, self.http_code, status_str

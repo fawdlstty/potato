@@ -15,8 +15,12 @@ async fn hello(name: String) -> HttpResponse {
 }
 
 #[http_post("/test")]
-async fn test(name: String) -> HttpResponse {
-    HttpResponse::html("hello")
+async fn test(file1: PostFile) -> HttpResponse {
+    HttpResponse::html(format!(
+        "file[{}] len: {}",
+        file1.filename,
+        file1.data.len()
+    ))
 }
 
 #[http_get("/")]

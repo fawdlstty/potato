@@ -82,10 +82,13 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 "HttpRequest" => quote! { req },
                 "SocketAddr" => quote! { client },
                 "& mut WebsocketContext" => quote! { wsctx },
-                "PostFile" => quote! {
-                    match req.body_files.get(#arg_name_str).cloned() {
-                        Some(file) => file,
-                        None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
+                "PostFile" => {
+                    doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
+                    quote! {
+                        match req.body_files.get(#arg_name_str).cloned() {
+                            Some(file) => file,
+                            None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
+                        }
                     }
                 },
                 arg_type_str if ARG_TYPES.contains(arg_type_str) => {
@@ -279,6 +282,7 @@ pub fn declare_doc_path(input: TokenStream) -> TokenStream {
         #[doc(hidden)]
         #[http_get(#doc_index_json)]
         async fn doc_doc_json() -> HttpResponse {
+            use potato::utils::number::HttpCodeExt;
             let mut any_use_auth = false;
             let contact = {
                 let re = potato::regex::Regex::new(r"([[:word:]]+)\s*<([^>]+)>").unwrap();
@@ -297,13 +301,10 @@ pub fn declare_doc_path(input: TokenStream) -> TokenStream {
                     if !flag.doc.show {
                         continue;
                     }
+                    let mut response_http_codes = vec![200, 500];
                     let mut root_cur_path = potato::serde_json::json!({
                         "summary": flag.doc.summary,
                         "description": flag.doc.desp,
-                        "responses": {
-                            "200": { "description": "OK" },
-                            "500": { "description": "Internal Error" },
-                        },
                     });
                     let mut arg_pairs = {
                         let mut arg_pairs = vec![];
@@ -315,6 +316,7 @@ pub fn declare_doc_path(input: TokenStream) -> TokenStream {
                                         let arg_type = arg["type"].as_str().unwrap_or("");
                                         match arg_type.starts_with('i') || arg_type.starts_with('u') {
                                             true => "number",
+                                            false if arg_type == "PostFile" => "file",
                                             false => "string"
                                         }
                                     };
@@ -341,11 +343,15 @@ pub fn declare_doc_path(input: TokenStream) -> TokenStream {
                             let mut properties = potato::serde_json::json!({});
                             let mut required = vec![];
                             for (arg_name, arg_type) in arg_pairs.iter() {
-                                properties[arg_name] = potato::serde_json::json!({ "type": arg_type });
+                                properties[arg_name] = match arg_type == "file" {
+                                    true => potato::serde_json::json!({ "type": "string", "format": "binary" }),
+                                    false => potato::serde_json::json!({ "type": arg_type }),
+                                };
                                 required.push(arg_name);
                             }
+                            // TODO add file
                             root_cur_path["requestBody"]["content"] = potato::serde_json::json!({
-                                "application/x-www-form-urlencoded": {
+                                "multipart/form-data": {
                                     "schema": {
                                         "type": "object",
                                         "properties": properties,
@@ -357,7 +363,12 @@ pub fn declare_doc_path(input: TokenStream) -> TokenStream {
                     }
                     if flag.doc.auth {
                         root_cur_path["security"] = potato::serde_json::json!([{ "bearerAuth": [] }]);
+                        response_http_codes = vec![200u16, 401, 500];
                         any_use_auth = true;
+                    }
+                    for http_code in response_http_codes.into_iter() {
+                        let http_code_str = http_code.to_string();
+                        root_cur_path["responses"][http_code_str]["description"] = http_code.http_code_to_desp().into();
                     }
                     paths.entry(flag.path).or_insert_with(std::collections::HashMap::new)
                         .insert(flag.method.to_string().to_lowercase(), root_cur_path);
