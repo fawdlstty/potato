@@ -1,13 +1,17 @@
+use crate::utils::string::StringUtil;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use crate::{RequestHandlerFlag, WebsocketContext};
 use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
@@ -23,12 +27,39 @@ lazy_static! {
         }
         handlers
     };
+    pub static ref AUTH_SECRET: RwLock<String> = RwLock::new(StringUtil::rand(32));
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: String, // JWT的subject
+    exp: usize,  // 过期时间
+}
+
+pub struct ServerAuth {
+    payload: String,
+    exp: i64,
+}
+
+impl ServerAuth {
+    pub async fn set_auth_secret(secret: String) {
+        let mut auth_secret = AUTH_SECRET.write().await;
+        *auth_secret = secret;
+    }
+
+    pub async fn issue(payload: String, expire: SystemTime) -> String {
+        todo!()
+    }
+
+    pub async fn check(data: String) -> String {
+        todo!()
+    }
 }
 
 pub struct HttpServer {
-    pub addr: String,
-    pub static_paths: Vec<(String, String)>,
-    pub doc_path: Option<String>,
+    addr: String,
+    static_paths: Vec<(String, String)>,
+    doc_path: Option<String>,
 }
 
 impl HttpServer {

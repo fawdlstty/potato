@@ -7,6 +7,11 @@ use potato::*;
 //     }
 // }
 
+#[http_get(path="/hello1", auth_arg=auth_payload)]
+async fn hello1(auth_payload: String) -> HttpResponse {
+    HttpResponse::html(format!("hello world, {auth_payload}!"))
+}
+
 // AAAAAAAAAAAAAAAA
 // BBBBBBBBBBBBBBBB
 #[http_get("/hello")]

@@ -9,8 +9,8 @@ use syn::{parse_macro_input, FnArg, ItemFn, LitStr};
 
 lazy_static! {
     static ref ARG_TYPES: HashSet<&'static str> = [
-        "String", "bool", "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "f32",
-        "f64", "isize",
+        "String", "bool", "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize",
+        "f32", "f64",
     ]
     .into_iter()
     .collect();
@@ -24,10 +24,44 @@ fn random_ident() -> Ident {
 
 fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> TokenStream {
     let req_name = Ident::new(req_name, Span::call_site());
-    let route_path = parse_macro_input!(attr as LitStr);
-    if !route_path.value().starts_with('/') {
-        panic!("route path must start with '/'");
-    }
+    let (route_path, oauth_arg) = {
+        let mut oroute_path = syn::parse::<LitStr>(attr.clone())
+            .ok()
+            .map(|path| path.value());
+        let mut oauth_arg = None;
+        //
+        if oroute_path.is_none() {
+            let http_parser = syn::meta::parser(|meta| {
+                if meta.path.is_ident("path") {
+                    if let Ok(arg) = meta.value() {
+                        if let Ok(route_path) = arg.parse::<LitStr>() {
+                            let route_path = route_path.value();
+                            oroute_path = Some(route_path);
+                        }
+                    }
+                    Ok(())
+                } else if meta.path.is_ident("auth_arg") {
+                    if let Ok(arg) = meta.value() {
+                        if let Ok(tmp_field) = arg.parse::<Ident>() {
+                            oauth_arg = Some(tmp_field.to_string());
+                        }
+                    }
+                    Ok(())
+                } else {
+                    Err(meta.error("unsupported annotation property"))
+                }
+            });
+            parse_macro_input!(attr with http_parser);
+        }
+        if oroute_path.is_none() {
+            panic!("`path` argument is required");
+        }
+        let route_path = oroute_path.unwrap();
+        if !route_path.starts_with('/') {
+            panic!("route path must start with '/'");
+        }
+        (route_path, oauth_arg)
+    };
     let root_fn = parse_macro_input!(input as ItemFn);
     let doc_show = {
         let mut doc_show = true;
@@ -43,6 +77,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
         doc_show
     };
+    let doc_auth = oauth_arg.is_some();
     let doc_summary = {
         let mut docs = vec![];
         for attr in root_fn.attrs.iter() {
@@ -69,6 +104,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let wrap_func_name = random_ident();
     let mut args = vec![];
     let mut doc_args = vec![];
+    let mut arg_auth_mark = false;
     for arg in root_fn.sig.inputs.iter() {
         if let FnArg::Typed(arg) = arg {
             let arg_type_str = arg
@@ -92,31 +128,47 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     }
                 },
                 arg_type_str if ARG_TYPES.contains(arg_type_str) => {
-                    doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
-                    let mut arg_value = quote! {
-                        match req.body_pairs.get(#arg_name_str).cloned() {
-                            Some(val) => val,
-                            None => match req.url_query.get(#arg_name_str).cloned() {
-                                Some(val) => val,
-                                None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
-                            },
-                        }
+                    let is_auth_arg = match oauth_arg.as_ref() {
+                        Some(auth_arg) => auth_arg == &arg_name_str,
+                        None => false,
                     };
-                    if arg_type_str != "String" {
-                        arg_value = quote! {
-                            match #arg_value.parse() {
-                                Ok(val) => val,
-                                Err(err) => return HttpResponse::error(format!("arg[{}] is not {} type", #arg_name_str, #arg_type_str)),
+                    if is_auth_arg {
+                        if arg_type_str != "String" {
+                            panic!("auth_arg argument is must String type");
+                        }
+                        arg_auth_mark = true;
+                        // TODO
+                        quote! { "TODO!!".to_string() }
+                    } else {
+                        doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
+                        let mut arg_value = quote! {
+                            match req.body_pairs.get(#arg_name_str).cloned() {
+                                Some(val) => val,
+                                None => match req.url_query.get(#arg_name_str).cloned() {
+                                    Some(val) => val,
+                                    None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
+                                },
+                            }
+                        };
+                        if arg_type_str != "String" {
+                            arg_value = quote! {
+                                match #arg_value.parse() {
+                                    Ok(val) => val,
+                                    Err(err) => return HttpResponse::error(format!("arg[{}] is not {} type", #arg_name_str, #arg_type_str)),
+                                }
                             }
                         }
+                        arg_value
                     }
-                    arg_value
                 },
                 _ => panic!("unsupported arg type: [{}]", arg_type_str),
             });
         } else {
             panic!("unsupported: {}", arg.to_token_stream().to_string());
         }
+    }
+    if !arg_auth_mark && doc_auth {
+        panic!("`auth_arg` attribute is must point to an existing argument");
     }
     let wrap_func_name2 = random_ident();
     let ret_type = root_fn
@@ -170,7 +222,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             potato::HttpMethod::#req_name,
             #route_path,
             #wrap_func_name,
-            potato::RequestHandlerFlagDoc::new(#doc_show, false, #doc_summary, #doc_desp, #doc_args)
+            potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args)
         )}
     }.into()
     // }.to_string();

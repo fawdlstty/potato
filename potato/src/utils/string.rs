@@ -1,3 +1,6 @@
+use lazy_static::lazy_static;
+use rand::Rng;
+
 pub trait StringExt {
     fn http_standardization(&self) -> String;
 }
@@ -51,5 +54,24 @@ impl StrExt for &str {
             }
         }
         String::from_utf8(ret).unwrap_or("".to_string())
+    }
+}
+
+lazy_static! {
+    pub static ref ALPHANUM_CHARS: Vec<char> =
+        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            .chars()
+            .collect();
+}
+
+pub struct StringUtil;
+
+impl StringUtil {
+    pub fn rand(num: usize) -> String {
+        let mut rng = rand::thread_rng();
+        std::iter::repeat(())
+            .map(|()| ALPHANUM_CHARS[rng.gen::<usize>() % ALPHANUM_CHARS.len()])
+            .take(32)
+            .collect()
     }
 }
