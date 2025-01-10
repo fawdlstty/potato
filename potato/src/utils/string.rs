@@ -71,7 +71,14 @@ impl StringUtil {
         let mut rng = rand::thread_rng();
         std::iter::repeat(())
             .map(|()| ALPHANUM_CHARS[rng.gen::<usize>() % ALPHANUM_CHARS.len()])
-            .take(32)
+            .take(num)
             .collect()
+    }
+
+    pub fn rand_name(num: usize) -> String {
+        if num == 0 {
+            return "".to_string();
+        }
+        format!("_{}", Self::rand(num - 1))
     }
 }

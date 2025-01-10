@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -27,32 +27,57 @@ lazy_static! {
         }
         handlers
     };
-    pub static ref AUTH_SECRET: RwLock<String> = RwLock::new(StringUtil::rand(32));
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
-    sub: String, // JWT的subject
-    exp: usize,  // 过期时间
+    sub: String,
+    exp: u64,
 }
 
-pub struct ServerAuth {
-    payload: String,
-    exp: i64,
+lazy_static! {
+    static ref JWT_SECRET: RwLock<String> = RwLock::new(StringUtil::rand(32));
 }
 
-impl ServerAuth {
-    pub async fn set_auth_secret(secret: String) {
-        let mut auth_secret = AUTH_SECRET.write().await;
-        *auth_secret = secret;
+pub struct JwtAuth;
+
+impl JwtAuth {
+    pub async fn set_secret(secret: String) {
+        let mut jwt_secret = JWT_SECRET.write().await;
+        *jwt_secret = secret;
     }
 
-    pub async fn issue(payload: String, expire: SystemTime) -> String {
-        todo!()
+    pub async fn issue(payload: String, expire: Duration) -> anyhow::Result<String> {
+        let secret = {
+            let jwt_secret = JWT_SECRET.read().await;
+            jwt_secret.clone()
+        };
+        let claims = Claims {
+            sub: payload,
+            exp: (SystemTime::now() + expire)
+                .duration_since(UNIX_EPOCH)?
+                .as_micros() as u64,
+        };
+        Ok(jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )?)
     }
 
-    pub async fn check(data: String) -> String {
-        todo!()
+    pub async fn check(token: String) -> anyhow::Result<String> {
+        let secret = {
+            let jwt_secret = JWT_SECRET.read().await;
+            jwt_secret.clone()
+        };
+        let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
+        let validation = jsonwebtoken::Validation::default();
+        let claims = jsonwebtoken::decode::<Claims>(&token, &decoding_key, &validation)?.claims;
+        let expired = SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(claims.exp);
+        match SystemTime::now() <= expired {
+            true => Ok(claims.sub),
+            false => Err(anyhow::Error::msg("token expired")),
+        }
     }
 }
 
