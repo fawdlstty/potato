@@ -14,7 +14,7 @@ cargo add potato
 cargo add tokio --features full
 ```
 
-最简单的示例：
+### Hello World
 
 ```rust
 use potato::*;
@@ -25,18 +25,37 @@ async fn hello() -> HttpResponse {
     HttpResponse::html("hello world")
 }
 
-// OpenAPI doc at http://127.0.0.1:80/doc/
-declare_doc_path!("/doc/");
-
 #[tokio::main]
 async fn main() {
-    let mut server = HttpServer::new("0.0.0.0:80"); // 0.0.0.0:443
+    let mut server = HttpServer::new("0.0.0.0:80");
     _ = server.serve_http().await;
-    // _ = server.serve_https("cert.pem", "key.pem").await;
 }
 ```
 
 如上所示，定义一个HTTP请求处理函数非常简洁。通过将 `http_get` 替换为 `http_post`、`http_put`、`http_delete`、`http_options`、`http_head` 可创建对应请求的处理函数。
+
+### HTTPS
+
+修改main函数代码为以下内容
+
+```rust
+#[tokio::main]
+async fn main() {
+    let mut server = HttpServer::new("0.0.0.0:443");
+    _ = server.serve_https("cert.pem", "key.pem").await;
+}
+```
+
+### OpenAPI
+
+源码里任意位置加入以下代码
+
+```rust
+// OpenAPI doc at http://127.0.0.1:80/doc/
+declare_doc_path!("/doc/");
+```
+
+### 参数解析
 
 HTTP请求处理函数可直接指定String、i32等类型的参数，可简化从body或url query提取的步骤，简化开发。示例：
 
@@ -76,6 +95,8 @@ async fn hello(req: HttpRequest, client: std::net::SocketAddr, wsctx: &mut Webso
 
 按需加入即可，不需要的参数可省略。
 
+### 处理函数返回类型
+
 HTTP请求处理函数返回类型支持以下几种格式：
 
 - `anyhow::Result<()>`
@@ -83,7 +104,7 @@ HTTP请求处理函数返回类型支持以下几种格式：
 - `()`
 - `HttpResponse`
 
-示例Websocket：
+### Websocket
 
 ```rust
 // http://127.0.0.1:8080
@@ -125,15 +146,32 @@ async fn main() {
 }
 ```
 
+### 鉴权
+
+鉴权功能本质提供签发Token，可附带一串字符串（通常为用户标识符），存储于客户端；也可用于校验用户端Token，验证成功获取附带内容。
+
+```rust
+// 签发Token，并传入附带数据、指定过期时间。附带内容尽可能短
+#[http_get("/issue")]
+async fn issue(payload: String) -> anyhow::Result<HttpResponse> {
+    let token = server::JwtAuth::issue(payload, Duration::from_secs(10000000)).await?;
+    Ok(HttpResponse::html(token))
+}
+
+// 校验Token，并获取附带内容
+#[http_get(path="/check", auth_arg=payload)]
+async fn check(payload: String) -> HttpResponse {
+    HttpResponse::html(format!("payload: [{payload}]"))
+}
+```
+
+上述check函数进入即代表Token有效且未过期，参数里直接获取签发时附带的信息。上述鉴权已在OpenAPI里直接支持，可通过接口文档查看如何调用。
+
 <!--
 # TODO
 
 - static path security
 - file for download
-- openapi
-- doc
-- server session
-- middleware
 - http client
 - cookie
 - chunked

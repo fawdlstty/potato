@@ -65,14 +65,14 @@ impl JwtAuth {
         )?)
     }
 
-    pub async fn check(token: String) -> anyhow::Result<String> {
+    pub async fn check(token: &str) -> anyhow::Result<String> {
         let secret = {
             let jwt_secret = JWT_SECRET.read().await;
             jwt_secret.clone()
         };
         let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
         let validation = jsonwebtoken::Validation::default();
-        let claims = jsonwebtoken::decode::<Claims>(&token, &decoding_key, &validation)?.claims;
+        let claims = jsonwebtoken::decode::<Claims>(token, &decoding_key, &validation)?.claims;
         let expired = SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(claims.exp);
         match SystemTime::now() <= expired {
             true => Ok(claims.sub),

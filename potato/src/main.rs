@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use potato::*;
 
 // async fn common_handler(req: HttpRequest) -> Option<HttpResponse> {
@@ -7,9 +9,15 @@ use potato::*;
 //     }
 // }
 
+#[http_get("/issue")]
+async fn issue(payload: String) -> anyhow::Result<HttpResponse> {
+    let token = server::JwtAuth::issue(payload, Duration::from_secs(10000000)).await?;
+    Ok(HttpResponse::html(token))
+}
+
 #[http_get(path="/hello1", auth_arg=auth_payload)]
 async fn hello1(auth_payload: String) -> HttpResponse {
-    HttpResponse::html(format!("hello world, {auth_payload}!"))
+    HttpResponse::html(format!("auth_payload: {auth_payload}!"))
 }
 
 // AAAAAAAAAAAAAAAA
@@ -65,6 +73,7 @@ declare_doc_path!("/doc/");
 #[tokio::main]
 async fn main() {
     let mut server = HttpServer::new("0.0.0.0:8080");
+    println!("visit: http://127.0.0.1:8080/doc/");
     //server.set_static_path("E:\\", "/");
     _ = server.serve_http().await;
     // _ = server.serve_https("cert.pem", "key.pem").await;

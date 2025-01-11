@@ -137,8 +137,20 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                             panic!("auth_arg argument is must String type");
                         }
                         arg_auth_mark = true;
-                        // TODO
-                        quote! { "TODO!!".to_string() }
+                        quote! {
+                            match req.headers.get("Authorization").cloned() {
+                                Some(mut auth) => {
+                                    if auth.starts_with("Bearer ") {
+                                        auth.drain(..7);
+                                    }
+                                    match potato::server::JwtAuth::check(&auth).await {
+                                        Ok(payload) => payload,
+                                        Err(err) => return HttpResponse::error(format!("auth failed: {:?}", err)),
+                                    }
+                                }
+                                None => return HttpResponse::error("miss header : Authorization"),
+                            }
+                        }
                     } else {
                         doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                         let mut arg_value = quote! {
