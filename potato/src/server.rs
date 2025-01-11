@@ -42,9 +42,9 @@ lazy_static! {
 pub struct JwtAuth;
 
 impl JwtAuth {
-    pub async fn set_secret(secret: String) {
+    pub async fn set_secret(secret: impl Into<String>) {
         let mut jwt_secret = JWT_SECRET.write().await;
-        *jwt_secret = secret;
+        *jwt_secret = secret.into();
     }
 
     pub async fn issue(payload: String, expire: Duration) -> anyhow::Result<String> {

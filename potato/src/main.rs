@@ -15,8 +15,8 @@ async fn issue(payload: String) -> anyhow::Result<HttpResponse> {
     Ok(HttpResponse::html(token))
 }
 
-#[http_get(path="/hello1", auth_arg=auth_payload)]
-async fn hello1(auth_payload: String) -> HttpResponse {
+#[http_get(path="/check", auth_arg=auth_payload)]
+async fn check(auth_payload: String) -> HttpResponse {
     HttpResponse::html(format!("auth_payload: {auth_payload}!"))
 }
 
@@ -72,6 +72,7 @@ declare_doc_path!("/doc/");
 
 #[tokio::main]
 async fn main() {
+    potato::server::JwtAuth::set_secret("AAAAAAAAAAAAAAABBBCCC").await;
     let mut server = HttpServer::new("0.0.0.0:8080");
     println!("visit: http://127.0.0.1:8080/doc/");
     //server.set_static_path("E:\\", "/");

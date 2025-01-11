@@ -146,9 +146,9 @@ async fn main() {
 }
 ```
 
-### 鉴权
+### JWT鉴权
 
-鉴权功能本质提供签发Token，可附带一串字符串（通常为用户标识符），存储于客户端；也可用于校验用户端Token，验证成功获取附带内容。
+JWT鉴权功能本质提供签发Token，可附带一串字符串（通常为用户标识符），存储于客户端；也可用于校验用户端Token，验证成功获取附带内容。
 
 ```rust
 // 签发Token，并传入附带数据、指定过期时间。附带内容尽可能短
@@ -159,9 +159,18 @@ async fn issue(payload: String) -> anyhow::Result<HttpResponse> {
 }
 
 // 校验Token，并获取附带内容
+// 实际请求需在HTTP header里加入：`Authorization: Bearer XXXXXXXXXXXXtoken`
 #[http_get(path="/check", auth_arg=payload)]
 async fn check(payload: String) -> HttpResponse {
     HttpResponse::html(format!("payload: [{payload}]"))
+}
+
+// 可选：在程序入口点指定secret key，如果不指定即为随机字符串
+#[tokio::main]
+async fn main() {
+    potato::server::JwtAuth::set_secret("AABBCCDD").await;
+
+    // ...
 }
 ```
 
