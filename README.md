@@ -19,7 +19,7 @@ cargo add tokio --features full
 ```rust
 use potato::*;
 
-// http://127.0.0.1:80/hello
+// http://127.0.0.1/hello
 #[http_get("/hello")]
 async fn hello() -> HttpResponse {
     HttpResponse::html("hello world")
@@ -51,7 +51,7 @@ async fn main() {
 源码里任意位置加入以下代码
 
 ```rust
-// OpenAPI doc at http://127.0.0.1:80/doc/
+// OpenAPI doc at http://127.0.0.1/doc/
 declare_doc_path!("/doc/");
 ```
 
@@ -60,7 +60,7 @@ declare_doc_path!("/doc/");
 HTTP请求处理函数可直接指定String、i32等类型的参数，可简化从body或url query提取的步骤，简化开发。示例：
 
 ```rust
-// http://127.0.0.1:8080/hello?name=miku
+// http://127.0.0.1/hello?name=miku
 #[http_get("/hello")]
 async fn hello(name: String) -> HttpResponse {
     HttpResponse::html("hello world, {}!")
@@ -70,7 +70,7 @@ async fn hello(name: String) -> HttpResponse {
 对于POST或PUT等请求来说，可以在参数直接接受文件：
 
 ```rust
-// http://127.0.0.1:8080/test
+// http://127.0.0.1/test
 #[http_post("/test")]
 async fn test(file1: PostFile) -> HttpResponse {
     HttpResponse::html(format!("file[{}] len: {}", file1.filename, file1.data.len()))
@@ -86,7 +86,7 @@ HTTP请求处理函数还可包含以下类型参数：
 示例参数完全体：
 
 ```rust
-// http://127.0.0.1:8080/hello
+// http://127.0.0.1/hello
 #[http_get("/hello")]
 async fn hello(req: HttpRequest, client: std::net::SocketAddr, wsctx: &mut WebsocketContext) -> HttpResponse {
     todo!()
@@ -107,7 +107,7 @@ HTTP请求处理函数返回类型支持以下几种格式：
 ### Websocket
 
 ```rust
-// http://127.0.0.1:8080
+// http://127.0.0.1
 #[http_get("/")]
 async fn index() -> HttpResponse {
     HttpResponse::html(r#"<!DOCTYPE html><html>
@@ -126,7 +126,7 @@ async fn index() -> HttpResponse {
     </html>"#)
 }
 
-// ws://127.0.0.1:8080/ws
+// ws://127.0.0.1/ws
 #[http_get("/ws")]
 async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Result<()> {
     let mut ws = wsctx.upgrade_websocket(&req).await?;
@@ -137,12 +137,6 @@ async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Re
             WsFrame::Binary(bin) => ws.send_binary(bin).await?,
         }
     }
-}
-
-#[tokio::main]
-async fn main() {
-    let mut server = HttpServer::new("0.0.0.0:8080");
-    _ = server.serve_http().await;
 }
 ```
 
