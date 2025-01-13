@@ -1,6 +1,5 @@
-use std::time::Duration;
-
 use potato::*;
+use std::time::Duration;
 
 // async fn common_handler(req: HttpRequest) -> Option<HttpResponse> {
 //     match req.uri.query().unwrap_or("").len() > 3 {
@@ -68,12 +67,21 @@ async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Re
     }
 }
 
-declare_doc_path!("/doc/");
+// declare_doc_path!("/doc/");
 
 #[tokio::main]
 async fn main() {
     potato::server::JwtAuth::set_secret("AAAAAAAAAAAAAAABBBCCC").await;
     let mut server = HttpServer::new("0.0.0.0:8080");
+    server.configure(|ctx| {
+        #[derive(rust_embed::Embed)]
+        #[folder = "../examples"]
+        struct Asset;
+        ctx.use_embedded_route::<Asset>("/");
+
+        ctx.use_doc("/doc/");
+        ctx.use_dispatch();
+    });
     println!("visit: http://127.0.0.1:8080/doc/");
     //server.set_static_path("E:\\", "/");
     _ = server.serve_http().await;

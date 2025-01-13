@@ -101,6 +101,10 @@ pub struct WebsocketContext {
 }
 
 impl WebsocketContext {
+    pub fn is_upgraded_websocket(&self) -> bool {
+        self.upgrade_ws
+    }
+
     pub async fn upgrade_websocket(
         &mut self,
         req: &HttpRequest,
@@ -460,6 +464,7 @@ impl HttpRequest {
     // }
 }
 
+#[derive(Clone)]
 pub struct HttpResponse {
     pub version: String,
     pub http_code: u16,
@@ -545,11 +550,13 @@ impl HttpResponse {
     pub fn from_mem_file(path: &str, data: Vec<u8>) -> Self {
         let mut ret = Self::empty();
         let mime_type = match path.split('.').last() {
+            Some("htm") => "text/html",
             Some("html") => "text/html",
             Some("js") => "application/javascript",
             Some("css") => "text/css",
             Some("json") => "application/json",
             Some("xml") => "application/xml",
+            _ if path.ends_with('/') => "text/html",
             _ => "application/octet-stream",
         };
         ret.add_header("Content-Type", mime_type);
