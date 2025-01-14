@@ -95,14 +95,17 @@ pub enum PipeContextItem {
 impl PipeContextItem {
     pub fn allow(&self, req: &HttpRequest) -> bool {
         match self {
-            PipeContextItem::Dispatch => match HANDLERS.get(&req.url_path[..]) {
-                Some(path_handlers) => match path_handlers.get(&req.method) {
-                    Some(_) => true,
-                    None => req.method == HttpMethod::HEAD || req.method == HttpMethod::OPTIONS,
+            PipeContextItem::Dispatch => match true {
+                true => req.method == HttpMethod::HEAD || req.method == HttpMethod::OPTIONS,
+                false => match HANDLERS.get(&req.url_path[..]) {
+                    Some(handlers) => handlers.get(&req.method).is_some(),
+                    None => false,
                 },
-                None => false,
             },
             PipeContextItem::LocationRoute((url_path, loc_path)) => {
+                if req.method != HttpMethod::GET {
+                    return false;
+                }
                 if !req.url_path.starts_with(url_path) {
                     return false;
                 }
@@ -130,6 +133,9 @@ impl PipeContextItem {
                 return false;
             }
             PipeContextItem::EmbeddedRoute(embedded_items) => {
+                if req.method != HttpMethod::GET {
+                    return false;
+                }
                 embedded_items.contains_key(&req.url_path[..])
             }
             PipeContextItem::FinalRoute(_) => true,
@@ -146,10 +152,7 @@ impl PipeContextItem {
         match self {
             PipeContextItem::Dispatch => {
                 let handler_ref = match HANDLERS.get(&req.url_path[..]) {
-                    Some(path_handlers) => match path_handlers.get(&req.method) {
-                        Some(handler) => Some(handler.handler),
-                        None => None,
-                    },
+                    Some(handlers) => handlers.get(&req.method).map(|p| p.handler),
                     None => None,
                 };
                 if let Some(handler_ref) = handler_ref {
@@ -161,25 +164,27 @@ impl PipeContextItem {
                     *upgrade_ws = wsctx.is_upgraded_websocket();
                     (res, wsctx.stream)
                 } else {
-                    if let Some(path_handlers) = HANDLERS.get(&req.url_path[..]) {
-                        if req.method == HttpMethod::HEAD {
-                            return (HttpResponse::empty(), stream);
-                        } else if req.method == HttpMethod::OPTIONS {
-                            let mut res2 = HttpResponse::html("");
-                            res2.add_header("Allow", {
-                                let mut options: HashSet<_> =
-                                    path_handlers.keys().map(|p| *p).collect();
-                                options.extend([HttpMethod::HEAD, HttpMethod::OPTIONS]);
-                                options
-                                    .into_iter()
-                                    .map(|m| m.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            });
-                            return (res2, stream);
+                    if req.method == HttpMethod::HEAD {
+                        return (HttpResponse::empty(), stream);
+                    } else if req.method == HttpMethod::OPTIONS {
+                        let mut res2 = HttpResponse::html("");
+                        let mut options: HashSet<_> = [HttpMethod::HEAD, HttpMethod::OPTIONS]
+                            .into_iter()
+                            .collect();
+                        if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
+                            options.extend(handlers.keys().map(|p| *p));
                         }
+                        res2.add_header("Allow", {
+                            options
+                                .into_iter()
+                                .map(|m| m.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        });
+                        return (res2, stream);
+                    } else {
+                        (HttpResponse::error("internal error: unhandled"), stream)
                     }
-                    (HttpResponse::error("internal error: unhandled"), stream)
                 }
             }
             PipeContextItem::LocationRoute((url_path, loc_path)) => {
@@ -256,7 +261,11 @@ impl PipeContext {
             .push(PipeContextItem::LocationRoute((url_path, loc_path)));
     }
 
-    pub fn use_embedded_route<T: Embed>(&mut self, url_path: impl Into<String>) {
+    pub fn use_embedded_route(
+        &mut self,
+        url_path: impl Into<String>,
+        assets: HashMap<String, Cow<'static, [u8]>>,
+    ) {
         let mut ret = HashMap::new();
         let url_path = {
             let mut url_path: String = url_path.into();
@@ -265,17 +274,8 @@ impl PipeContext {
             }
             url_path
         };
-        for name in T::iter().into_iter() {
-            if let Some(file) = T::get(&name) {
-                if name.ends_with("index.htm") || name.ends_with("index.html") {
-                    if let Some(path) = Path::new(&format!("{url_path}{name}")).parent() {
-                        if let Some(path) = path.to_str() {
-                            ret.insert(path.to_string(), file.data.clone());
-                        }
-                    }
-                }
-                ret.insert(format!("{url_path}{name}"), file.data);
-            }
+        for (key, value) in assets.into_iter() {
+            ret.insert(format!("{url_path}{key}"), value);
         }
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
     }
@@ -304,7 +304,7 @@ impl PipeContext {
                     "summary": flag.doc.summary,
                     "description": flag.doc.desp,
                 });
-                let mut arg_pairs = {
+                let arg_pairs = {
                     let mut arg_pairs = vec![];
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(flag.doc.args) {
                         if let Some(args) = args.as_array() {

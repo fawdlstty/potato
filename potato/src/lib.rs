@@ -7,13 +7,17 @@ pub use inventory;
 use lazy_static::lazy_static;
 pub use potato_macro::*;
 pub use regex;
+pub use rust_embed;
+use rust_embed::Embed;
 pub use serde_json;
 pub use server::*;
 
 use chrono::Utc;
 use sha1::{Digest, Sha1};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::Read;
+use std::path::Path;
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -668,4 +672,25 @@ impl DocResource {
     pub fn load_str(file: &str) -> &'static str {
         DOC_RES.get(file).map(|v| &**v).unwrap_or("")
     }
+}
+
+pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
+    let mut ret = HashMap::new();
+    for name in T::iter().into_iter() {
+        if let Some(file) = T::get(&name) {
+            if name.ends_with("index.htm") || name.ends_with("index.html") {
+                if let Some(path) = Path::new(&name[..]).parent() {
+                    if let Some(path) = path.to_str() {
+                        let path = match path.ends_with('/') {
+                            true => path.to_string(),
+                            false => format!("{path}/"),
+                        };
+                        ret.insert(path, file.data.clone());
+                    }
+                }
+            }
+            ret.insert(name.to_string(), file.data);
+        }
+    }
+    ret
 }

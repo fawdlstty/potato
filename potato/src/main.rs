@@ -67,23 +67,19 @@ async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Re
     }
 }
 
-// declare_doc_path!("/doc/");
-
 #[tokio::main]
 async fn main() {
-    potato::server::JwtAuth::set_secret("AAAAAAAAAAAAAAABBBCCC").await;
+    server::JwtAuth::set_secret("AAAAAAAAAAAAAAABBBCCC").await;
     let mut server = HttpServer::new("0.0.0.0:8080");
     server.configure(|ctx| {
-        #[derive(rust_embed::Embed)]
-        #[folder = "../examples"]
-        struct Asset;
-        ctx.use_embedded_route::<Asset>("/");
+        ctx.use_dispatch();
+
+        ctx.use_embedded_route("/", embed_dir!("../examples"));
 
         ctx.use_doc("/doc/");
-        ctx.use_dispatch();
+        ctx.use_location_route("/", "/wwwroot");
     });
     println!("visit: http://127.0.0.1:8080/doc/");
-    //server.set_static_path("E:\\", "/");
     _ = server.serve_http().await;
     // _ = server.serve_https("cert.pem", "key.pem").await;
 }

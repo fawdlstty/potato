@@ -272,197 +272,6 @@ pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "HEAD")
 }
 
-#[proc_macro]
-pub fn declare_doc_path(input: TokenStream) -> TokenStream {
-    let doc = parse_macro_input!(input as LitStr).value();
-    if !doc.starts_with('/') {
-        panic!("route path must start with '/'");
-    }
-    if !doc.ends_with('/') {
-        panic!("route path must ends with '/'");
-    }
-    let doc_index_htm = format!("{doc}index.htm");
-    let doc_index_html = format!("{doc}index.html");
-    let doc_index_css = format!("{doc}index.css");
-    let doc_swagger_ui_css = format!("{doc}swagger-ui.css");
-    let doc_swagger_ui_bundle_js = format!("{doc}swagger-ui-bundle.js");
-    let doc_swagger_ui_standalone_preset_js = format!("{doc}swagger-ui-standalone-preset.js");
-    let doc_swagger_initializer_js = format!("{doc}swagger-initializer.js");
-    //let doc_favicon_32x32_png = format!("{doc}favicon-32x32.png");
-    //let doc_favicon_16x16_png = format!("{doc}favicon-16x16.png");
-    let doc_index_json = format!("{doc}index.json");
-
-    quote! {
-        #[doc(hidden)]
-        #[http_get(#doc)]
-        #[http_get(#doc_index_htm)]
-        #[http_get(#doc_index_html)]
-        async fn doc_index() -> HttpResponse {
-            HttpResponse::html(potato::DocResource::load_str("index.html"))
-        }
-
-        #[doc(hidden)]
-        #[http_get(#doc_index_css)]
-        async fn doc_index_css() -> HttpResponse {
-            HttpResponse::css(potato::DocResource::load_str("index.css"))
-        }
-
-        #[doc(hidden)]
-        #[http_get(#doc_swagger_ui_css)]
-        async fn doc_swagger_ui_css() -> HttpResponse {
-            HttpResponse::css(potato::DocResource::load_str("swagger-ui.css"))
-        }
-
-        #[doc(hidden)]
-        #[http_get(#doc_swagger_ui_bundle_js)]
-        async fn doc_swagger_ui_bundle_js() -> HttpResponse {
-            HttpResponse::js(potato::DocResource::load_str("swagger-ui-bundle.js"))
-        }
-
-        #[doc(hidden)]
-        #[http_get(#doc_swagger_ui_standalone_preset_js)]
-        async fn doc_swagger_ui_standalone_preset_js() -> HttpResponse {
-            HttpResponse::js(potato::DocResource::load_str("swagger-ui-standalone-preset.js"))
-        }
-
-        #[doc(hidden)]
-        #[http_get(#doc_swagger_initializer_js)]
-        async fn doc_swagger_initializer_js() -> HttpResponse {
-            HttpResponse::js(potato::DocResource::load_str("swagger-initializer.js"))
-        }
-
-        // #[doc(hidden)]
-        // #[http_get(#doc_favicon_32x32_png)]
-        // async fn doc_favicon_32x32_png() -> HttpResponse {
-        //     HttpResponse::png(include_bytes!("../swagger_res/favicon-32x32.png"))
-        // }
-
-        // #[doc(hidden)]
-        // #[http_get(#doc_favicon_16x16_png)]
-        // async fn doc_favicon_16x16_png() -> HttpResponse {
-        //     HttpResponse::png(include_bytes!("../swagger_res/favicon-16x16.png"))
-        // }
-
-        #[doc(hidden)]
-        #[http_get(#doc_index_json)]
-        async fn doc_doc_json() -> HttpResponse {
-            use potato::utils::number::HttpCodeExt;
-            let mut any_use_auth = false;
-            let contact = {
-                let re = potato::regex::Regex::new(r"([[:word:]]+)\s*<([^>]+)>").unwrap();
-                match re.captures(env!("CARGO_PKG_AUTHORS")) {
-                    Some(caps) => {
-                        let name = caps.get(1).map_or("", |m| m.as_str());
-                        let email = caps.get(2).map_or("", |m| m.as_str());
-                        potato::serde_json::json!({ "name": name, "email": email })
-                    }
-                    None => potato::serde_json::json!({}),
-                }
-            };
-            let paths = {
-                let mut paths = std::collections::HashMap::new();
-                for flag in inventory::iter::<RequestHandlerFlag> {
-                    if !flag.doc.show {
-                        continue;
-                    }
-                    let mut response_http_codes = vec![200, 500];
-                    let mut root_cur_path = potato::serde_json::json!({
-                        "summary": flag.doc.summary,
-                        "description": flag.doc.desp,
-                    });
-                    let mut arg_pairs = {
-                        let mut arg_pairs = vec![];
-                        if let Ok(args) = potato::serde_json::from_str::<potato::serde_json::Value>(flag.doc.args) {
-                            if let Some(args) = args.as_array() {
-                                for arg in args.iter() {
-                                    let arg_name = arg["name"].as_str().unwrap_or("");
-                                    let arg_type = {
-                                        let arg_type = arg["type"].as_str().unwrap_or("");
-                                        match arg_type.starts_with('i') || arg_type.starts_with('u') {
-                                            true => "number",
-                                            false if arg_type == "PostFile" => "file",
-                                            false => "string"
-                                        }
-                                    };
-                                    arg_pairs.push((arg_name.to_string(), arg_type.to_string()));
-                                }
-                            }
-                        }
-                        arg_pairs
-                    };
-                    if !arg_pairs.is_empty() {
-                        if flag.method == potato::HttpMethod::GET {
-                            let mut parameters = vec![];
-                            for (arg_name, arg_type) in arg_pairs.iter() {
-                                parameters.push(potato::serde_json::json!({
-                                    "name": arg_name,
-                                    "in": "query",
-                                    "description": "",
-                                    "required": true,
-                                    "schema": { "type": arg_type },
-                                }));
-                            }
-                            root_cur_path["parameters"] = potato::serde_json::Value::Array(parameters);
-                        } else {
-                            let mut properties = potato::serde_json::json!({});
-                            let mut required = vec![];
-                            for (arg_name, arg_type) in arg_pairs.iter() {
-                                properties[arg_name] = match arg_type == "file" {
-                                    true => potato::serde_json::json!({ "type": "string", "format": "binary" }),
-                                    false => potato::serde_json::json!({ "type": arg_type }),
-                                };
-                                required.push(arg_name);
-                            }
-                            // TODO add file
-                            root_cur_path["requestBody"]["content"] = potato::serde_json::json!({
-                                "multipart/form-data": {
-                                    "schema": {
-                                        "type": "object",
-                                        "properties": properties,
-                                        "required": required
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    if flag.doc.auth {
-                        root_cur_path["security"] = potato::serde_json::json!([{ "bearerAuth": [] }]);
-                        response_http_codes = vec![200u16, 401, 500];
-                        any_use_auth = true;
-                    }
-                    for http_code in response_http_codes.into_iter() {
-                        let http_code_str = http_code.to_string();
-                        root_cur_path["responses"][http_code_str]["description"] = http_code.http_code_to_desp().into();
-                    }
-                    paths.entry(flag.path).or_insert_with(std::collections::HashMap::new)
-                        .insert(flag.method.to_string().to_lowercase(), root_cur_path);
-                }
-                paths
-            };
-            let mut root = potato::serde_json::json!({
-                "openapi": "3.1.0",
-                "info": {
-                    "title": env!("CARGO_PKG_NAME"),
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "description": env!("CARGO_PKG_DESCRIPTION"),
-                    "contact": contact,
-                },
-                "paths": paths,
-            });
-            if any_use_auth {
-                root["components"]["securitySchemes"]["bearerAuth"] = potato::serde_json::json!({
-                    "description": "Bearer token using a JWT",
-                    "type": "http",
-                    "scheme": "Bearer",
-                    "bearerFormat": "JWT",
-                });
-            }
-            HttpResponse::json(potato::serde_json::to_string(&root).unwrap_or("{}".to_string()))
-        }
-    }
-    .into()
-}
-
 trait StringExt {
     fn type_simplify(&self) -> String;
 }
@@ -480,4 +289,17 @@ impl StringExt for String {
             false => ret,
         }
     }
+}
+
+#[proc_macro]
+pub fn embed_dir(input: TokenStream) -> TokenStream {
+    let path = parse_macro_input!(input as LitStr).value();
+    quote! {{
+        #[derive(potato::rust_embed::Embed)]
+        #[folder = #path]
+        struct Asset;
+
+        potato::load_embed::<Asset>()
+    }}
+    .into()
 }
