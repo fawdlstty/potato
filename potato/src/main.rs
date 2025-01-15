@@ -1,8 +1,8 @@
 use potato::*;
 
 #[http_get("/hello")]
-async fn hello(name: String) -> HttpResponse {
-    HttpResponse::html(format!("hello world, {name}!"))
+async fn hello() -> HttpResponse {
+    HttpResponse::html("hello world")
 }
 
 #[tokio::main]

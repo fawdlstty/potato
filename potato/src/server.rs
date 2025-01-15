@@ -4,7 +4,6 @@ use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use crate::{RequestHandlerFlag, WebsocketContext};
 use lazy_static::lazy_static;
-use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -92,150 +91,6 @@ pub enum PipeContextItem {
     FinalRoute(HttpResponse),
 }
 
-impl PipeContextItem {
-    pub fn allow(&self, req: &HttpRequest) -> bool {
-        match self {
-            PipeContextItem::Dispatch => match HANDLERS.get(&req.url_path[..]) {
-                Some(handlers) => {
-                    handlers.get(&req.method).is_some()
-                        || req.method == HttpMethod::HEAD
-                        || req.method == HttpMethod::OPTIONS
-                }
-                None => false,
-            },
-            PipeContextItem::LocationRoute((url_path, loc_path)) => {
-                if req.method != HttpMethod::GET {
-                    return false;
-                }
-                if !req.url_path.starts_with(url_path) {
-                    return false;
-                }
-                let mut path = PathBuf::new();
-                path.push(loc_path);
-                path.push(&req.url_path[url_path.len()..]);
-                if let Ok(path) = path.canonicalize() {
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        if meta.is_file() {
-                            return true;
-                        } else if meta.is_dir() {
-                            let mut tmp_path = path.clone();
-                            tmp_path.push("index.htm");
-                            if let Ok(tmp) = std::fs::metadata(&tmp_path) {
-                                return tmp.is_file();
-                            }
-                            let mut tmp_path = path.clone();
-                            tmp_path.push("index.html");
-                            if let Ok(tmp) = std::fs::metadata(&tmp_path) {
-                                return tmp.is_file();
-                            }
-                        }
-                    }
-                }
-                return false;
-            }
-            PipeContextItem::EmbeddedRoute(embedded_items) => {
-                if req.method != HttpMethod::GET {
-                    return false;
-                }
-                embedded_items.contains_key(&req.url_path[..])
-            }
-            PipeContextItem::FinalRoute(_) => true,
-        }
-    }
-
-    pub async fn process(
-        &self,
-        req: HttpRequest,
-        client_addr: SocketAddr,
-        stream: Box<dyn TcpStreamExt>,
-        upgrade_ws: &mut bool,
-    ) -> (HttpResponse, Box<dyn TcpStreamExt>) {
-        match self {
-            PipeContextItem::Dispatch => {
-                let handler_ref = match HANDLERS.get(&req.url_path[..]) {
-                    Some(handlers) => handlers.get(&req.method).map(|p| p.handler),
-                    None => None,
-                };
-                if let Some(handler_ref) = handler_ref {
-                    let mut wsctx = WebsocketContext {
-                        stream,
-                        upgrade_ws: false,
-                    };
-                    let res = handler_ref(req, client_addr, &mut wsctx).await;
-                    *upgrade_ws = wsctx.is_upgraded_websocket();
-                    (res, wsctx.stream)
-                } else {
-                    if req.method == HttpMethod::HEAD {
-                        return (HttpResponse::empty(), stream);
-                    } else if req.method == HttpMethod::OPTIONS {
-                        let mut res2 = HttpResponse::html("");
-                        let mut options: HashSet<_> = [HttpMethod::HEAD, HttpMethod::OPTIONS]
-                            .into_iter()
-                            .collect();
-                        if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
-                            options.extend(handlers.keys().map(|p| *p));
-                        }
-                        res2.add_header("Allow", {
-                            options
-                                .into_iter()
-                                .map(|m| m.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        });
-                        return (res2, stream);
-                    } else {
-                        (HttpResponse::error("internal error: unhandled"), stream)
-                    }
-                }
-            }
-            PipeContextItem::LocationRoute((url_path, loc_path)) => {
-                if !req.url_path.starts_with(url_path) {
-                    return (HttpResponse::error("internal error: unhandled"), stream);
-                }
-                let mut path = PathBuf::new();
-                path.push(loc_path);
-                path.push(&req.url_path[url_path.len()..]);
-                if let Ok(path) = path.canonicalize() {
-                    if !path.starts_with(loc_path) {
-                        return (HttpResponse::error("url path over directory"), stream);
-                    }
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        if meta.is_file() {
-                            if let Some(path) = path.to_str() {
-                                return (HttpResponse::from_file(path), stream);
-                            }
-                        } else if meta.is_dir() {
-                            let mut tmp_path = path.clone();
-                            tmp_path.push("index.htm");
-                            if let Ok(tmp) = std::fs::metadata(&tmp_path) {
-                                if tmp.is_file() {
-                                    if let Some(path) = tmp_path.to_str() {
-                                        return (HttpResponse::from_file(path), stream);
-                                    }
-                                }
-                            }
-                            let mut tmp_path = path.clone();
-                            tmp_path.push("index.html");
-                            if let Some(path) = tmp_path.to_str() {
-                                return (HttpResponse::from_file(path), stream);
-                            }
-                        }
-                    }
-                }
-                (HttpResponse::error("internal error: unhandled"), stream)
-            }
-            PipeContextItem::EmbeddedRoute(embedded_items) => {
-                if let Some(item) = embedded_items.get(&req.url_path[..]) {
-                    let ret = HttpResponse::from_mem_file(&req.url_path[..], item.to_vec());
-                    return (ret, stream);
-                }
-                (HttpResponse::error("internal error: unhandled"), stream)
-            }
-            PipeContextItem::FinalRoute(res) => (res.clone(), stream),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct PipeContext {
     items: Vec<PipeContextItem>,
@@ -250,6 +105,10 @@ impl PipeContext {
 
     pub fn empty() -> Self {
         Self { items: vec![] }
+    }
+
+    pub fn clone_items(&self) -> Vec<PipeContextItem> {
+        self.items.clone()
     }
 
     pub fn use_dispatch(&mut self) {
@@ -457,6 +316,122 @@ impl PipeContext {
     }
 }
 
+pub struct PipeHandlerContext {
+    items: Vec<PipeContextItem>,
+    client_addr: SocketAddr,
+    pub stream: Option<Box<dyn TcpStreamExt>>,
+}
+
+impl PipeHandlerContext {
+    pub fn new(
+        items: Vec<PipeContextItem>,
+        client_addr: SocketAddr,
+        stream: Box<dyn TcpStreamExt>,
+    ) -> Self {
+        Self {
+            items,
+            client_addr,
+            stream: Some(stream),
+        }
+    }
+
+    pub fn is_upgraded_websocket(&self) -> bool {
+        self.stream.is_none()
+    }
+
+    pub async fn handle_request(&mut self, req: HttpRequest) -> HttpResponse {
+        for item in self.items.iter() {
+            match item {
+                PipeContextItem::Dispatch => {
+                    let handler_ref = match HANDLERS.get(&req.url_path[..]) {
+                        Some(handlers) => handlers.get(&req.method).map(|p| p.handler),
+                        None => None,
+                    };
+                    if let Some(handler_ref) = handler_ref {
+                        let mut wsctx = WebsocketContext {
+                            stream: self.stream.take().unwrap(),
+                            upgrade_ws: false,
+                        };
+                        let res = handler_ref(req, self.client_addr, &mut wsctx).await;
+                        if !wsctx.is_upgraded_websocket() {
+                            self.stream = Some(wsctx.stream);
+                        }
+                        return res;
+                    } else {
+                        if req.method == HttpMethod::HEAD {
+                            return HttpResponse::empty();
+                        } else if req.method == HttpMethod::OPTIONS {
+                            let mut res2 = HttpResponse::html("");
+                            let mut options: HashSet<_> = [HttpMethod::HEAD, HttpMethod::OPTIONS]
+                                .into_iter()
+                                .collect();
+                            if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
+                                options.extend(handlers.keys().map(|p| *p));
+                            }
+                            res2.add_header("Allow", {
+                                options
+                                    .into_iter()
+                                    .map(|m| m.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            });
+                            return res2;
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+                PipeContextItem::LocationRoute((url_path, loc_path)) => {
+                    if !req.url_path.starts_with(url_path) {
+                        continue;
+                    }
+                    let mut path = PathBuf::new();
+                    path.push(loc_path);
+                    path.push(&req.url_path[url_path.len()..]);
+                    if let Ok(path) = path.canonicalize() {
+                        if !path.starts_with(loc_path) {
+                            return HttpResponse::error("url path over directory");
+                        }
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            if meta.is_file() {
+                                if let Some(path) = path.to_str() {
+                                    return HttpResponse::from_file(path);
+                                }
+                            } else if meta.is_dir() {
+                                let mut tmp_path = path.clone();
+                                tmp_path.push("index.htm");
+                                if let Ok(tmp) = std::fs::metadata(&tmp_path) {
+                                    if tmp.is_file() {
+                                        if let Some(path) = tmp_path.to_str() {
+                                            return HttpResponse::from_file(path);
+                                        }
+                                    }
+                                }
+                                let mut tmp_path = path.clone();
+                                tmp_path.push("index.html");
+                                if let Some(path) = tmp_path.to_str() {
+                                    return HttpResponse::from_file(path);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                PipeContextItem::EmbeddedRoute(embedded_items) => {
+                    if let Some(item) = embedded_items.get(&req.url_path[..]) {
+                        let ret = HttpResponse::from_mem_file(&req.url_path[..], item.to_vec());
+                        return ret;
+                    }
+                    continue;
+                }
+                PipeContextItem::FinalRoute(res) => return res.clone(),
+            }
+        }
+
+        HttpResponse::not_found()
+    }
+}
+
 pub struct HttpServer {
     addr: String,
     pipe_ctx: PipeContext,
@@ -483,29 +458,28 @@ impl HttpServer {
         loop {
             // accept connection
             let (stream, client_addr) = listener.accept().await?;
-            let mut stream: Box<dyn TcpStreamExt> = Box::new(stream);
-            let pipe_ctx = self.pipe_ctx.clone();
+            let stream: Box<dyn TcpStreamExt> = Box::new(stream);
+            let mut pipe_ctx =
+                PipeHandlerContext::new(self.pipe_ctx.clone_items(), client_addr, stream);
             _ = tokio::task::spawn(async move {
                 loop {
-                    let req = match HttpRequest::from_stream(&mut stream).await {
-                        Ok(req) => req,
-                        Err(_) => break,
-                    };
+                    let req =
+                        match HttpRequest::from_stream(pipe_ctx.stream.as_mut().unwrap()).await {
+                            Ok(req) => req,
+                            Err(_) => break,
+                        };
                     let cmode = req.get_header_accept_encoding();
-                    let mut res = HttpResponse::not_found();
-                    let mut upgrade_ws = false;
-                    for pipe_item in pipe_ctx.items.iter() {
-                        if pipe_item.allow(&req) {
-                            (res, stream) = pipe_item
-                                .process(req, client_addr, stream, &mut upgrade_ws)
-                                .await;
-                            break;
-                        }
-                    }
-                    if upgrade_ws {
+                    let res = pipe_ctx.handle_request(req).await;
+                    if pipe_ctx.is_upgraded_websocket() {
                         break;
                     }
-                    if let Err(_) = stream.write_all(&res.as_bytes(cmode)).await {
+                    if let Err(_) = pipe_ctx
+                        .stream
+                        .as_mut()
+                        .unwrap()
+                        .write_all(&res.as_bytes(cmode))
+                        .await
+                    {
                         break;
                     }
                 }
@@ -527,34 +501,33 @@ impl HttpServer {
         loop {
             // accept connection
             let (stream, client_addr) = listener.accept().await?;
-            let pipe_ctx = self.pipe_ctx.clone();
             let acceptor = acceptor.clone();
             let stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
                 Err(_) => continue,
             };
-            let mut stream: Box<dyn TcpStreamExt> = Box::new(stream);
+            let stream: Box<dyn TcpStreamExt> = Box::new(stream);
+            let mut pipe_ctx =
+                PipeHandlerContext::new(self.pipe_ctx.clone_items(), client_addr, stream);
             _ = tokio::task::spawn(async move {
                 loop {
-                    let req = match HttpRequest::from_stream(&mut stream).await {
-                        Ok(req) => req,
-                        Err(_) => break,
-                    };
+                    let req =
+                        match HttpRequest::from_stream(pipe_ctx.stream.as_mut().unwrap()).await {
+                            Ok(req) => req,
+                            Err(_) => break,
+                        };
                     let cmode = req.get_header_accept_encoding();
-                    let mut res = HttpResponse::not_found();
-                    let mut upgrade_ws = false;
-                    for pipe_item in pipe_ctx.items.iter() {
-                        if pipe_item.allow(&req) {
-                            (res, stream) = pipe_item
-                                .process(req, client_addr, stream, &mut upgrade_ws)
-                                .await;
-                            break;
-                        }
-                    }
-                    if upgrade_ws {
+                    let res = pipe_ctx.handle_request(req).await;
+                    if pipe_ctx.is_upgraded_websocket() {
                         break;
                     }
-                    if let Err(_) = stream.write_all(&res.as_bytes(cmode)).await {
+                    if let Err(_) = pipe_ctx
+                        .stream
+                        .as_mut()
+                        .unwrap()
+                        .write_all(&res.as_bytes(cmode))
+                        .await
+                    {
                         break;
                     }
                 }
