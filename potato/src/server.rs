@@ -95,12 +95,13 @@ pub enum PipeContextItem {
 impl PipeContextItem {
     pub fn allow(&self, req: &HttpRequest) -> bool {
         match self {
-            PipeContextItem::Dispatch => match true {
-                true => req.method == HttpMethod::HEAD || req.method == HttpMethod::OPTIONS,
-                false => match HANDLERS.get(&req.url_path[..]) {
-                    Some(handlers) => handlers.get(&req.method).is_some(),
-                    None => false,
-                },
+            PipeContextItem::Dispatch => match HANDLERS.get(&req.url_path[..]) {
+                Some(handlers) => {
+                    handlers.get(&req.method).is_some()
+                        || req.method == HttpMethod::HEAD
+                        || req.method == HttpMethod::OPTIONS
+                }
+                None => false,
             },
             PipeContextItem::LocationRoute((url_path, loc_path)) => {
                 if req.method != HttpMethod::GET {
