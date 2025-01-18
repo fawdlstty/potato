@@ -2,6 +2,7 @@ pub mod client;
 pub mod server;
 pub mod utils;
 
+use anyhow::Error;
 pub use client::*;
 pub use inventory;
 use lazy_static::lazy_static;
@@ -23,6 +24,7 @@ use strum::Display;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utils::bytes::VecU8Ext;
 use utils::number::HttpCodeExt;
+use utils::refstr::{RefStr, ToRefStrExt};
 use utils::string::{StrExt, StringExt};
 use utils::tcp_stream::TcpStreamExt;
 
@@ -89,8 +91,11 @@ pub enum HttpMethod {
     POST,
     PUT,
     DELETE,
-    OPTIONS,
     HEAD,
+    OPTIONS,
+    CONNECT,
+    PATCH,
+    TRACE,
 }
 
 #[derive(Eq, PartialEq)]
@@ -268,13 +273,13 @@ pub struct PostFile {
 #[derive(Debug)]
 pub struct HttpRequest {
     pub method: HttpMethod,
-    pub url_path: String,
-    pub url_query: HashMap<String, String>,
-    pub version: String,
-    pub headers: HashMap<String, String>,
+    pub url_path: RefStr,
+    pub url_query: HashMap<RefStr, RefStr>,
+    pub version: u8,
+    pub headers: HashMap<RefStr, RefStr>,
     pub body: Vec<u8>,
-    pub body_pairs: HashMap<String, String>,
-    pub body_files: HashMap<String, PostFile>,
+    pub body_pairs: HashMap<RefStr, RefStr>,
+    pub body_files: HashMap<RefStr, PostFile>,
 }
 unsafe impl Send for HttpRequest {}
 
@@ -282,25 +287,22 @@ impl HttpRequest {
     pub fn new() -> Self {
         Self {
             method: HttpMethod::GET,
-            url_path: "/".to_string(),
+            url_path: "/".to_ref_str(),
             url_query: HashMap::new(),
-            version: "HTTP/1.1".to_string(),
-            headers: HashMap::new(),
+            version: 11,
+            headers: HashMap::with_capacity(16),
             body: vec![],
-            body_pairs: HashMap::new(),
-            body_files: HashMap::new(),
+            body_pairs: HashMap::with_capacity(16),
+            body_files: HashMap::with_capacity(4),
         }
     }
 
-    pub fn set_header(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.headers
-            .insert(key.into().http_standardization(), value.into());
+    pub fn set_header(&mut self, key: RefStr, value: RefStr) {
+        self.headers.insert(key, value);
     }
 
     pub fn get_header(&self, key: &str) -> Option<&str> {
-        self.headers
-            .get(&key.http_standardization())
-            .map(|a| &a[..])
+        self.headers.get(&key.to_ref_str()).map(|a| a.to_str())
     }
 
     pub fn get_header_accept_encoding(&self) -> CompressMode {
@@ -346,121 +348,141 @@ impl HttpRequest {
         true
     }
 
-    pub async fn from_stream(stream: &mut Box<dyn TcpStreamExt>) -> anyhow::Result<Self> {
-        let mut req = HttpRequest::new();
-        let line = stream.read_line().await;
-        let items = line.split(' ').collect::<Vec<&str>>();
-        if items.len() != 3 {
-            return Err(anyhow::Error::msg("Unresolvable request"));
-        }
-        req.method = match items[0] {
-            "GET" => HttpMethod::GET,
-            "POST" => HttpMethod::POST,
-            "PUT" => HttpMethod::PUT,
-            "DELETE" => HttpMethod::DELETE,
-            "OPTIONS" => HttpMethod::OPTIONS,
-            "HEAD" => HttpMethod::HEAD,
-            _ => return Err(anyhow::Error::msg("Unresolvable method")),
+    pub fn from_buf(buf: &[u8]) -> anyhow::Result<Option<(Self, usize)>> {
+        let mut headers = [httparse::EMPTY_HEADER; 96];
+        let (rreq, n) = {
+            let mut req = httparse::Request::new(&mut headers);
+            let n = match httparse::ParserConfig::default().parse_request(&mut req, buf)? {
+                httparse::Status::Complete(n) => n,
+                httparse::Status::Partial => return Ok(None),
+            };
+            (req, n)
         };
-        let url = items[1];
+
+        let mut req = HttpRequest::new();
+        req.method = {
+            let method = rreq.method.unwrap();
+            match method.len() {
+                3 if method == "GET" => HttpMethod::GET,
+                3 if method == "PUT" => HttpMethod::PUT,
+                4 if method == "HEAD" => HttpMethod::HEAD,
+                4 if method == "POST" => HttpMethod::POST,
+                5 if method == "PATCH" => HttpMethod::PATCH,
+                5 if method == "TRACE" => HttpMethod::TRACE,
+                6 if method == "DELETE" => HttpMethod::DELETE,
+                7 if method == "OPTIONS" => HttpMethod::OPTIONS,
+                7 if method == "CONNECT" => HttpMethod::CONNECT,
+                _ => return Err(Error::msg(format!("unrecognized method: {method}"))),
+            }
+        };
+        let url = rreq.path.unwrap();
         match url.find('?') {
             Some(p) => {
-                req.url_path = url[..p].to_string();
+                req.url_path = url[..p].to_ref_str();
                 req.url_query = url[p + 1..]
                     .split('&')
                     .into_iter()
                     .map(|s| s.split_once('=').unwrap_or((s, "")))
-                    .map(|(a, b)| (a.url_decode(), b.url_decode()))
+                    .map(|(a, b)| (a.to_ref_str(), b.to_ref_str()))
                     .collect();
             }
-            None => req.url_path = url.to_string(),
+            None => req.url_path = url.to_ref_str(),
         }
-        req.url_path = (&req.url_path[..]).url_decode();
-        req.version = items[2].to_string();
-        loop {
-            let line = stream.read_line().await;
-            if let Some((key, value)) = line.split_once(':') {
-                req.set_header(key.trim(), value.trim());
-            } else {
+        req.version = rreq.version.unwrap_or(1) + 10;
+        for h in rreq.headers.iter() {
+            if h.name == "" {
                 break;
             }
+            req.headers
+                .insert(h.name.to_ref_str(), h.value.to_ref_str());
         }
-        if let Some(cnt_len) = req.get_header("Content-Length") {
-            if let Ok(cnt_len) = cnt_len.parse::<usize>() {
-                if cnt_len > 0 {
-                    let mut body = vec![0u8; cnt_len];
-                    stream.read_exact(&mut body).await?;
-                    req.body = body;
-                }
-            }
-        }
-        if let Some(cnt_type) = req.get_header("Content-Type") {
-            if cnt_type == "application/json" {
-                if let Ok(body_str) = std::str::from_utf8(&req.body) {
-                    if let Ok(root) = serde_json::from_str::<serde_json::Value>(&body_str) {
-                        if let serde_json::Value::Object(obj) = root {
-                            for (k, v) in obj {
-                                req.body_pairs.insert(k, v.to_string());
-                            }
-                        }
-                    }
-                }
-            } else if cnt_type == "application/x-www-form-urlencoded" {
-                if let Ok(body_str) = std::str::from_utf8(&req.body) {
-                    body_str.split('&').for_each(|s| {
-                        if let Some((a, b)) = s.split_once('=') {
-                            req.body_pairs.insert(a.url_decode(), b.url_decode());
-                        }
-                    });
-                }
-            } else if cnt_type.starts_with("multipart/form-data") {
-                let boundary = cnt_type.split_once("boundary=").unwrap_or(("", "")).1;
-                if let Ok(body_str) = std::str::from_utf8(&req.body) {
-                    for mut s in body_str.split(format!("--{boundary}").as_str()) {
-                        if s == "--" {
-                            break;
-                        }
-                        if s.ends_with("\r\n") {
-                            s = &s[..s.len() - 2];
-                        }
-                        if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
-                            let keys: Vec<&str> = key_str
-                                .split("\r\n")
-                                .map(|p| p.split(";").collect::<Vec<_>>())
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .flatten()
-                                .collect();
-                            let mut name = None;
-                            let mut filename = None;
-                            for key in keys.into_iter() {
-                                if let Some((k, v)) = key.trim().split_once('=') {
-                                    if k == "name" {
-                                        name = Some((&v[1..v.len() - 1]).to_string());
-                                    } else if k == "filename" {
-                                        filename = Some((&v[1..v.len() - 1]).to_string());
-                                    }
-                                }
-                            }
-                            if let Some(name) = name {
-                                if let Some(filename) = filename {
-                                    req.body_files.insert(
-                                        name,
-                                        PostFile {
-                                            filename,
-                                            data: content.as_bytes().to_vec(),
-                                        },
-                                    );
-                                } else {
-                                    req.body_pairs.insert(name, content.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(req)
+        // // // pub body: Vec<u8>,
+        // // // pub body_pairs: HashMap<RefStr, RefStr>,
+        // // // pub body_files: HashMap<RefStr, PostFile>,
+        // loop {
+        //     let line = stream.read_line().await;
+        //     if let Some((key, value)) = line.split_once(':') {
+        //         req.set_header(key.trim(), value.trim());
+        //     } else {
+        //         break;
+        //     }
+        // }
+        // if let Some(cnt_len) = req.get_header("Content-Length") {
+        //     if let Ok(cnt_len) = cnt_len.parse::<usize>() {
+        //         if cnt_len > 0 {
+        //             let mut body = vec![0u8; cnt_len];
+        //             stream.read_exact(&mut body).await?;
+        //             req.body = body;
+        //         }
+        //     }
+        // }
+        // if let Some(cnt_type) = req.get_header("Content-Type") {
+        //     if cnt_type == "application/json" {
+        //         if let Ok(body_str) = std::str::from_utf8(&req.body) {
+        //             if let Ok(root) = serde_json::from_str::<serde_json::Value>(&body_str) {
+        //                 if let serde_json::Value::Object(obj) = root {
+        //                     for (k, v) in obj {
+        //                         req.body_pairs.insert(k, v.to_string());
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     } else if cnt_type == "application/x-www-form-urlencoded" {
+        //         if let Ok(body_str) = std::str::from_utf8(&req.body) {
+        //             body_str.split('&').for_each(|s| {
+        //                 if let Some((a, b)) = s.split_once('=') {
+        //                     req.body_pairs.insert(a.url_decode(), b.url_decode());
+        //                 }
+        //             });
+        //         }
+        //     } else if cnt_type.starts_with("multipart/form-data") {
+        //         let boundary = cnt_type.split_once("boundary=").unwrap_or(("", "")).1;
+        //         if let Ok(body_str) = std::str::from_utf8(&req.body) {
+        //             for mut s in body_str.split(format!("--{boundary}").as_str()) {
+        //                 if s == "--" {
+        //                     break;
+        //                 }
+        //                 if s.ends_with("\r\n") {
+        //                     s = &s[..s.len() - 2];
+        //                 }
+        //                 if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
+        //                     let keys: Vec<&str> = key_str
+        //                         .split("\r\n")
+        //                         .map(|p| p.split(";").collect::<Vec<_>>())
+        //                         .collect::<Vec<_>>()
+        //                         .into_iter()
+        //                         .flatten()
+        //                         .collect();
+        //                     let mut name = None;
+        //                     let mut filename = None;
+        //                     for key in keys.into_iter() {
+        //                         if let Some((k, v)) = key.trim().split_once('=') {
+        //                             if k == "name" {
+        //                                 name = Some((&v[1..v.len() - 1]).to_string());
+        //                             } else if k == "filename" {
+        //                                 filename = Some((&v[1..v.len() - 1]).to_string());
+        //                             }
+        //                         }
+        //                     }
+        //                     if let Some(name) = name {
+        //                         if let Some(filename) = filename {
+        //                             req.body_files.insert(
+        //                                 name,
+        //                                 PostFile {
+        //                                     filename,
+        //                                     data: content.as_bytes().to_vec(),
+        //                                 },
+        //                             );
+        //                         } else {
+        //                             req.body_pairs.insert(name, content.to_string());
+        //                         }
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
+        Ok(Some((req, n)))
     }
 
     // pub async fn process_request(self) -> HttpResponse {

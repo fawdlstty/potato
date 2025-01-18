@@ -3,6 +3,7 @@ use crate::utils::string::StringUtil;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use crate::{RequestHandlerFlag, WebsocketContext};
+use anyhow::Error;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -11,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
@@ -343,7 +344,7 @@ impl PipeHandlerContext {
         for item in self.items.iter() {
             match item {
                 PipeContextItem::Dispatch => {
-                    let handler_ref = match HANDLERS.get(&req.url_path[..]) {
+                    let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
                         Some(handlers) => handlers.get(&req.method).map(|p| p.handler),
                         None => None,
                     };
@@ -365,7 +366,7 @@ impl PipeHandlerContext {
                             let mut options: HashSet<_> = [HttpMethod::HEAD, HttpMethod::OPTIONS]
                                 .into_iter()
                                 .collect();
-                            if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
+                            if let Some(handlers) = HANDLERS.get(req.url_path.to_str()) {
                                 options.extend(handlers.keys().map(|p| *p));
                             }
                             res2.add_header("Allow", {
@@ -382,12 +383,12 @@ impl PipeHandlerContext {
                     }
                 }
                 PipeContextItem::LocationRoute((url_path, loc_path)) => {
-                    if !req.url_path.starts_with(url_path) {
+                    if !req.url_path.to_str().starts_with(url_path) {
                         continue;
                     }
                     let mut path = PathBuf::new();
                     path.push(loc_path);
-                    path.push(&req.url_path[url_path.len()..]);
+                    path.push(&req.url_path.to_str()[url_path.len()..]);
                     if let Ok(path) = path.canonicalize() {
                         if !path.starts_with(loc_path) {
                             return HttpResponse::error("url path over directory");
@@ -418,8 +419,8 @@ impl PipeHandlerContext {
                     continue;
                 }
                 PipeContextItem::EmbeddedRoute(embedded_items) => {
-                    if let Some(item) = embedded_items.get(&req.url_path[..]) {
-                        let ret = HttpResponse::from_mem_file(&req.url_path[..], item.to_vec());
+                    if let Some(item) = embedded_items.get(req.url_path.to_str()) {
+                        let ret = HttpResponse::from_mem_file(req.url_path.to_str(), item.to_vec());
                         return ret;
                     }
                     continue;
@@ -458,16 +459,30 @@ impl HttpServer {
         loop {
             // accept connection
             let (stream, client_addr) = listener.accept().await?;
-            let stream: Box<dyn TcpStreamExt> = Box::new(stream);
             let mut pipe_ctx =
-                PipeHandlerContext::new(self.pipe_ctx.clone_items(), client_addr, stream);
+                PipeHandlerContext::new(self.pipe_ctx.clone_items(), client_addr, Box::new(stream));
             _ = tokio::task::spawn(async move {
+                let mut buf: Vec<u8> = Vec::with_capacity(4096);
+                let mut tmp_buf = [0u8; 1024];
                 loop {
-                    let req =
-                        match HttpRequest::from_stream(pipe_ctx.stream.as_mut().unwrap()).await {
-                            Ok(req) => req,
-                            Err(_) => break,
-                        };
+                    let (req, n) = {
+                        let stream = pipe_ctx.stream.as_mut().unwrap();
+                        loop {
+                            let n = match stream.read(&mut tmp_buf).await {
+                                Ok(n) if n > 0 => n,
+                                _ => return,
+                            };
+                            buf.extend(&tmp_buf[0..n]);
+                            match HttpRequest::from_buf(&buf[..]) {
+                                Ok(Some(req)) => break req,
+                                Ok(None) => continue,
+                                Err(err) => {
+                                    println!("parse failed: {err:?}");
+                                    return;
+                                }
+                            }
+                        }
+                    };
                     let cmode = req.get_header_accept_encoding();
                     let res = pipe_ctx.handle_request(req).await;
                     if pipe_ctx.is_upgraded_websocket() {
@@ -482,6 +497,7 @@ impl HttpServer {
                     {
                         break;
                     }
+                    buf.drain(..n);
                 }
             });
         }
@@ -510,12 +526,24 @@ impl HttpServer {
             let mut pipe_ctx =
                 PipeHandlerContext::new(self.pipe_ctx.clone_items(), client_addr, stream);
             _ = tokio::task::spawn(async move {
+                let mut buf: Vec<u8> = Vec::with_capacity(4096);
+                let mut tmp_buf = [0u8; 1024];
                 loop {
-                    let req =
-                        match HttpRequest::from_stream(pipe_ctx.stream.as_mut().unwrap()).await {
-                            Ok(req) => req,
-                            Err(_) => break,
-                        };
+                    let (req, n) = {
+                        let stream = pipe_ctx.stream.as_mut().unwrap();
+                        loop {
+                            let n = match stream.read(&mut tmp_buf).await {
+                                Ok(n) if n > 0 => n,
+                                _ => return,
+                            };
+                            buf.extend(&tmp_buf[0..n]);
+                            match HttpRequest::from_buf(&buf[..]) {
+                                Ok(Some(req)) => break req,
+                                Ok(None) => continue,
+                                Err(_) => return,
+                            }
+                        }
+                    };
                     let cmode = req.get_header_accept_encoding();
                     let res = pipe_ctx.handle_request(req).await;
                     if pipe_ctx.is_upgraded_websocket() {
@@ -530,8 +558,48 @@ impl HttpServer {
                     {
                         break;
                     }
+                    buf.drain(..n);
                 }
             });
         }
     }
 }
+
+// pub struct HttpRequestBuilder<'a> {
+//     headers: [httparse::Header<'a>; 96],
+//     buf: Vec<u8>,
+//     last_len: usize,
+// }
+
+// impl<'a> HttpRequestBuilder<'a> {
+//     pub fn new() -> Self {
+//         Self {
+//             headers: [httparse::EMPTY_HEADER; 96],
+//             buf: Vec::with_capacity(4096),
+//             last_len: 0,
+//         }
+//     }
+
+//     pub async fn read_request(
+//         &mut self,
+//         stream: &mut Box<dyn TcpStreamExt>,
+//     ) -> anyhow::Result<Option<HttpRequest>> {
+//         if self.last_len > 0 {
+//             self.buf.drain(..self.last_len);
+//             self.last_len = 0;
+//         }
+//         let mut tmp_buf = [0u8, 1024];
+//         let (req, n) = {
+//             let n = stream.read(&mut tmp_buf[..]).await?;
+//             if n == 0 {
+//                 return Err(Error::msg("read 0 size"));
+//             }
+//             self.buf.extend(&tmp_buf[0..n]);
+//             match HttpRequest::from_buf(&self.buf[..], &mut self.headers)? {
+//                 Some(req) => req,
+//                 None => return Ok(None),
+//             }
+//         };
+//         Ok(None)
+//     }
+// }
