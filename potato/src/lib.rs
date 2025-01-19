@@ -101,6 +101,7 @@ pub enum HttpMethod {
 
 #[derive(Eq, PartialEq)]
 pub enum CompressMode {
+    None,
     Gzip,
 }
 
@@ -124,7 +125,9 @@ impl WebsocketContext {
         let ws_key = req.get_header("Sec-WebSocket-Key").unwrap();
         // let ws_ext = req.get_header("Sec-WebSocket-Extensions").unwrap_or("".to_string());
         let res = HttpResponse::from_websocket(ws_key);
-        self.stream.write_all(&res.as_bytes(None)).await?;
+        self.stream
+            .write_all(&res.as_bytes(CompressMode::None))
+            .await?;
         self.upgrade_ws = true;
         Ok(WebsocketConnection {
             stream: &mut self.stream,
@@ -268,6 +271,8 @@ pub struct PostFile {
     pub data: RefBuf,
 }
 
+unsafe impl Send for PostFile {}
+
 #[derive(Debug)]
 pub struct HttpRequest {
     pub method: HttpMethod,
@@ -279,7 +284,9 @@ pub struct HttpRequest {
     pub body_pairs: HashMap<RefStrOrString, RefStrOrString>,
     pub body_files: HashMap<RefStr, PostFile>,
 }
+
 unsafe impl Send for HttpRequest {}
+unsafe impl Sync for HttpRequest {}
 
 impl HttpRequest {
     pub fn new() -> Self {
@@ -303,14 +310,14 @@ impl HttpRequest {
         self.headers.get(&key.to_ref_str()).map(|a| a.to_str())
     }
 
-    pub fn get_header_accept_encoding(&self) -> Option<CompressMode> {
+    pub fn get_header_accept_encoding(&self) -> CompressMode {
         for item in self.get_header("Accept-Encoding").unwrap_or("").split(',') {
             match item.trim() {
-                "gzip" => return Some(CompressMode::Gzip),
+                "gzip" => return CompressMode::Gzip,
                 _ => continue,
             };
         }
-        None
+        CompressMode::None
     }
 
     pub fn get_header_content_length(&self) -> usize {
@@ -623,18 +630,18 @@ impl HttpResponse {
         }
     }
 
-    pub fn as_bytes(&self, mut cmode: Option<CompressMode>) -> Vec<u8> {
+    pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {
         #[allow(unused_assignments)]
         let mut payload_tmp = vec![];
         let payload_ref = match cmode {
-            None => &self.payload,
-            Some(CompressMode::Gzip) => match self.payload.compress() {
+            CompressMode::None => &self.payload,
+            CompressMode::Gzip => match self.payload.compress() {
                 Ok(data) => {
                     payload_tmp = data;
                     &payload_tmp
                 }
                 Err(_) => {
-                    cmode = None;
+                    cmode = CompressMode::None;
                     &self.payload
                 }
             },
@@ -651,7 +658,7 @@ impl HttpResponse {
         }
         if self.http_code != 101 {
             ret.push_str(&format!("Content-Length: {}\r\n", payload_ref.len()));
-            if cmode == Some(CompressMode::Gzip) {
+            if cmode == CompressMode::Gzip {
                 ret.push_str("Content-Encoding: gzip\r\n");
             }
         }

@@ -126,6 +126,8 @@ impl RefStrOrString {
     }
 }
 
+unsafe impl Send for RefStrOrString {}
+
 impl Into<RefStrOrString> for String {
     fn into(self) -> RefStrOrString {
         RefStrOrString::String(self)

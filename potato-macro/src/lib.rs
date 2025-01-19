@@ -121,7 +121,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 "PostFile" => {
                     doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                     quote! {
-                        match req.body_files.get(#arg_name_str).cloned() {
+                        match req.body_files.get(&potato::utils::refstr::RefStr::from_str(#arg_name_str)).cloned() {
                             Some(file) => file,
                             None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
                         }
@@ -138,10 +138,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         }
                         arg_auth_mark = true;
                         quote! {
-                            match req.headers.get("Authorization").cloned() {
+                            match req.headers
+                                .get(&potato::utils::refstr::RefStr::from_str("Authorization"))
+                                .map(|v| v.to_str()) {
                                 Some(mut auth) => {
                                     if auth.starts_with("Bearer ") {
-                                        auth.drain(..7);
+                                        auth = &auth[7..];
                                     }
                                     match potato::server::JwtAuth::check(&auth).await {
                                         Ok(payload) => payload,
