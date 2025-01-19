@@ -1,8 +1,6 @@
 use http::Uri;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 pub async fn get(url: &str) -> anyhow::Result<String> {
     let uri = url.parse::<Uri>()?;

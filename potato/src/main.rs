@@ -5,6 +5,11 @@ async fn hello() -> HttpResponse {
     HttpResponse::html("hello world")
 }
 
+#[http_get("/hello_name")]
+async fn hello_name(name: String) -> HttpResponse {
+    HttpResponse::html(format!("hello world {name}"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     server::JwtAuth::set_secret("AAAAAAAAAAAAAAABBBCCC").await;

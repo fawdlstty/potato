@@ -154,9 +154,13 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     } else {
                         doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                         let mut arg_value = quote! {
-                            match req.body_pairs.get(#arg_name_str).cloned() {
+                            match req.body_pairs
+                                .get(&potato::utils::refstr::RefStrOrString::from_str(#arg_name_str))
+                                .map(|p| p.to_string()) {
                                 Some(val) => val,
-                                None => match req.url_query.get(#arg_name_str).cloned() {
+                                None => match req.url_query
+                                    .get(&potato::utils::refstr::RefStr::from_str(#arg_name_str))
+                                    .map(|p| p.to_str().to_string()) {
                                     Some(val) => val,
                                     None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
                                 },
@@ -212,7 +216,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         _ => panic!("unsupported ret type: {}", ret_type),
     };
     let doc_args = serde_json::to_string(&doc_args).unwrap();
-    //let mut content =
+    // let mut content =
     quote! {
         #root_fn
 

@@ -22,10 +22,11 @@ use std::path::Path;
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use utils::bytes::VecU8Ext;
+use utils::bytes::CompressExt;
 use utils::number::HttpCodeExt;
-use utils::refstr::{RefStr, ToRefStrExt};
-use utils::string::{StrExt, StringExt};
+use utils::refbuf::{RefBuf, ToRefBufExt};
+use utils::refstr::{RefStr, RefStrOrString, ToRefStrExt};
+use utils::string::StrExt;
 use utils::tcp_stream::TcpStreamExt;
 
 type HttpHandler = fn(
@@ -100,7 +101,6 @@ pub enum HttpMethod {
 
 #[derive(Eq, PartialEq)]
 pub enum CompressMode {
-    None,
     Gzip,
 }
 
@@ -124,9 +124,7 @@ impl WebsocketContext {
         let ws_key = req.get_header("Sec-WebSocket-Key").unwrap();
         // let ws_ext = req.get_header("Sec-WebSocket-Extensions").unwrap_or("".to_string());
         let res = HttpResponse::from_websocket(ws_key);
-        self.stream
-            .write_all(&res.as_bytes(CompressMode::None))
-            .await?;
+        self.stream.write_all(&res.as_bytes(None)).await?;
         self.upgrade_ws = true;
         Ok(WebsocketConnection {
             stream: &mut self.stream,
@@ -266,8 +264,8 @@ pub enum WsFrameImpl {
 
 #[derive(Clone, Debug)]
 pub struct PostFile {
-    pub filename: String,
-    pub data: Vec<u8>,
+    pub filename: RefStr,
+    pub data: RefBuf,
 }
 
 #[derive(Debug)]
@@ -277,8 +275,8 @@ pub struct HttpRequest {
     pub url_query: HashMap<RefStr, RefStr>,
     pub version: u8,
     pub headers: HashMap<RefStr, RefStr>,
-    pub body: Vec<u8>,
-    pub body_pairs: HashMap<RefStr, RefStr>,
+    pub body: RefBuf,
+    pub body_pairs: HashMap<RefStrOrString, RefStrOrString>,
     pub body_files: HashMap<RefStr, PostFile>,
 }
 unsafe impl Send for HttpRequest {}
@@ -291,7 +289,7 @@ impl HttpRequest {
             url_query: HashMap::new(),
             version: 11,
             headers: HashMap::with_capacity(16),
-            body: vec![],
+            body: [].to_ref_buf(),
             body_pairs: HashMap::with_capacity(16),
             body_files: HashMap::with_capacity(4),
         }
@@ -305,16 +303,19 @@ impl HttpRequest {
         self.headers.get(&key.to_ref_str()).map(|a| a.to_str())
     }
 
-    pub fn get_header_accept_encoding(&self) -> CompressMode {
-        if let Some(encodings) = self.get_header("Accept-Encoding") {
-            for encoding in encodings.split(',') {
-                let encoding = encoding.trim();
-                if encoding == "gzip" {
-                    return CompressMode::Gzip;
-                }
-            }
+    pub fn get_header_accept_encoding(&self) -> Option<CompressMode> {
+        for item in self.get_header("Accept-Encoding").unwrap_or("").split(',') {
+            match item.trim() {
+                "gzip" => return Some(CompressMode::Gzip),
+                _ => continue,
+            };
         }
-        CompressMode::None
+        None
+    }
+
+    pub fn get_header_content_length(&self) -> usize {
+        self.get_header("Content-Length")
+            .map_or(0, |val| val.parse::<usize>().unwrap_or(0))
     }
 
     pub fn is_websocket(&self) -> bool {
@@ -348,7 +349,102 @@ impl HttpRequest {
         true
     }
 
-    pub fn from_buf(buf: &[u8]) -> anyhow::Result<Option<(Self, usize)>> {
+    pub async fn from_stream(
+        buf: &mut Vec<u8>,
+        stream: &mut Box<dyn TcpStreamExt>,
+    ) -> anyhow::Result<(Self, usize)> {
+        let mut tmp_buf = [0u8; 1024];
+        let (mut req, hdr_len) = loop {
+            let n = stream.read(&mut tmp_buf).await?;
+            if n == 0 {
+                return Err(anyhow::Error::msg("connection closed"));
+            }
+            buf.extend(&tmp_buf[0..n]);
+            match HttpRequest::from_headers_part(&buf[..])? {
+                Some(req) => break req,
+                None => continue,
+            }
+        };
+        let bdy_len = req.get_header_content_length();
+        while hdr_len + bdy_len < buf.len() {
+            let t = stream.read(&mut tmp_buf).await?;
+            if t == 0 {
+                return Err(anyhow::Error::msg("connection closed"));
+            }
+            buf.extend(&tmp_buf[0..t]);
+        }
+        req.body = buf[hdr_len..hdr_len + bdy_len].to_ref_buf();
+        if let Some(cnt_type) = req.get_header("Content-Type") {
+            if cnt_type == "application/json" {
+                if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
+                    if let Ok(root) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                        if let serde_json::Value::Object(obj) = root {
+                            for (k, v) in obj {
+                                req.body_pairs.insert(k.into(), v.to_string().into());
+                            }
+                        }
+                    }
+                }
+            } else if cnt_type == "application/x-www-form-urlencoded" {
+                if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
+                    body_str.split('&').for_each(|s| {
+                        if let Some((a, b)) = s.split_once('=') {
+                            req.body_pairs
+                                .insert(a.url_decode().into(), b.url_decode().into());
+                        }
+                    });
+                }
+            } else if cnt_type.starts_with("multipart/form-data") {
+                let boundary = cnt_type.split_once("boundary=").unwrap_or(("", "")).1;
+                if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
+                    for mut s in body_str.split(format!("--{boundary}").as_str()) {
+                        if s == "--" {
+                            break;
+                        }
+                        if s.ends_with("\r\n") {
+                            s = &s[..s.len() - 2];
+                        }
+                        if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
+                            let keys: Vec<&str> = key_str
+                                .split("\r\n")
+                                .map(|p| p.split(";").collect::<Vec<_>>())
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .flatten()
+                                .collect();
+                            let mut name = None;
+                            let mut filename = None;
+                            for key in keys.into_iter() {
+                                if let Some((k, v)) = key.trim().split_once('=') {
+                                    if k == "name" {
+                                        name = Some(v[1..v.len() - 1].to_ref_str());
+                                    } else if k == "filename" {
+                                        filename = Some(v[1..v.len() - 1].to_ref_str());
+                                    }
+                                }
+                            }
+                            if let Some(name) = name {
+                                if let Some(filename) = filename {
+                                    req.body_files.insert(
+                                        name,
+                                        PostFile {
+                                            filename,
+                                            data: content.as_bytes().to_ref_buf(),
+                                        },
+                                    );
+                                } else {
+                                    req.body_pairs.insert(name.into(), content.to_ref_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok((req, hdr_len + bdy_len))
+    }
+
+    pub fn from_headers_part(buf: &[u8]) -> anyhow::Result<Option<(Self, usize)>> {
         let mut headers = [httparse::EMPTY_HEADER; 96];
         let (rreq, n) = {
             let mut req = httparse::Request::new(&mut headers);
@@ -396,92 +492,6 @@ impl HttpRequest {
             req.headers
                 .insert(h.name.to_ref_str(), h.value.to_ref_str());
         }
-        // // // pub body: Vec<u8>,
-        // // // pub body_pairs: HashMap<RefStr, RefStr>,
-        // // // pub body_files: HashMap<RefStr, PostFile>,
-        // loop {
-        //     let line = stream.read_line().await;
-        //     if let Some((key, value)) = line.split_once(':') {
-        //         req.set_header(key.trim(), value.trim());
-        //     } else {
-        //         break;
-        //     }
-        // }
-        // if let Some(cnt_len) = req.get_header("Content-Length") {
-        //     if let Ok(cnt_len) = cnt_len.parse::<usize>() {
-        //         if cnt_len > 0 {
-        //             let mut body = vec![0u8; cnt_len];
-        //             stream.read_exact(&mut body).await?;
-        //             req.body = body;
-        //         }
-        //     }
-        // }
-        // if let Some(cnt_type) = req.get_header("Content-Type") {
-        //     if cnt_type == "application/json" {
-        //         if let Ok(body_str) = std::str::from_utf8(&req.body) {
-        //             if let Ok(root) = serde_json::from_str::<serde_json::Value>(&body_str) {
-        //                 if let serde_json::Value::Object(obj) = root {
-        //                     for (k, v) in obj {
-        //                         req.body_pairs.insert(k, v.to_string());
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //     } else if cnt_type == "application/x-www-form-urlencoded" {
-        //         if let Ok(body_str) = std::str::from_utf8(&req.body) {
-        //             body_str.split('&').for_each(|s| {
-        //                 if let Some((a, b)) = s.split_once('=') {
-        //                     req.body_pairs.insert(a.url_decode(), b.url_decode());
-        //                 }
-        //             });
-        //         }
-        //     } else if cnt_type.starts_with("multipart/form-data") {
-        //         let boundary = cnt_type.split_once("boundary=").unwrap_or(("", "")).1;
-        //         if let Ok(body_str) = std::str::from_utf8(&req.body) {
-        //             for mut s in body_str.split(format!("--{boundary}").as_str()) {
-        //                 if s == "--" {
-        //                     break;
-        //                 }
-        //                 if s.ends_with("\r\n") {
-        //                     s = &s[..s.len() - 2];
-        //                 }
-        //                 if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
-        //                     let keys: Vec<&str> = key_str
-        //                         .split("\r\n")
-        //                         .map(|p| p.split(";").collect::<Vec<_>>())
-        //                         .collect::<Vec<_>>()
-        //                         .into_iter()
-        //                         .flatten()
-        //                         .collect();
-        //                     let mut name = None;
-        //                     let mut filename = None;
-        //                     for key in keys.into_iter() {
-        //                         if let Some((k, v)) = key.trim().split_once('=') {
-        //                             if k == "name" {
-        //                                 name = Some((&v[1..v.len() - 1]).to_string());
-        //                             } else if k == "filename" {
-        //                                 filename = Some((&v[1..v.len() - 1]).to_string());
-        //                             }
-        //                         }
-        //                     }
-        //                     if let Some(name) = name {
-        //                         if let Some(filename) = filename {
-        //                             req.body_files.insert(
-        //                                 name,
-        //                                 PostFile {
-        //                                     filename,
-        //                                     data: content.as_bytes().to_vec(),
-        //                                 },
-        //                             );
-        //                         } else {
-        //                             req.body_pairs.insert(name, content.to_string());
-        //                         }
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
         Ok(Some((req, n)))
     }
 
@@ -613,24 +623,24 @@ impl HttpResponse {
         }
     }
 
-    pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {
+    pub fn as_bytes(&self, mut cmode: Option<CompressMode>) -> Vec<u8> {
         #[allow(unused_assignments)]
         let mut payload_tmp = vec![];
         let payload_ref = match cmode {
-            CompressMode::None => &self.payload,
-            CompressMode::Gzip => match self.payload.compress() {
+            None => &self.payload,
+            Some(CompressMode::Gzip) => match self.payload.compress() {
                 Ok(data) => {
                     payload_tmp = data;
                     &payload_tmp
                 }
                 Err(_) => {
-                    cmode = CompressMode::None;
+                    cmode = None;
                     &self.payload
                 }
             },
         };
         //
-        let mut ret = "".to_string();
+        let mut ret = String::with_capacity(4096);
         let status_str = self.http_code.http_code_to_desp();
         ret.push_str(&format!(
             "{} {} {}\r\n",
@@ -641,7 +651,7 @@ impl HttpResponse {
         }
         if self.http_code != 101 {
             ret.push_str(&format!("Content-Length: {}\r\n", payload_ref.len()));
-            if cmode == CompressMode::Gzip {
+            if cmode == Some(CompressMode::Gzip) {
                 ret.push_str("Content-Encoding: gzip\r\n");
             }
         }

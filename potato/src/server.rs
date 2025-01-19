@@ -3,7 +3,6 @@ use crate::utils::string::StringUtil;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use crate::{RequestHandlerFlag, WebsocketContext};
-use anyhow::Error;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -12,7 +11,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
@@ -463,24 +462,12 @@ impl HttpServer {
                 PipeHandlerContext::new(self.pipe_ctx.clone_items(), client_addr, Box::new(stream));
             _ = tokio::task::spawn(async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
-                let mut tmp_buf = [0u8; 1024];
                 loop {
                     let (req, n) = {
                         let stream = pipe_ctx.stream.as_mut().unwrap();
-                        loop {
-                            let n = match stream.read(&mut tmp_buf).await {
-                                Ok(n) if n > 0 => n,
-                                _ => return,
-                            };
-                            buf.extend(&tmp_buf[0..n]);
-                            match HttpRequest::from_buf(&buf[..]) {
-                                Ok(Some(req)) => break req,
-                                Ok(None) => continue,
-                                Err(err) => {
-                                    println!("parse failed: {err:?}");
-                                    return;
-                                }
-                            }
+                        match HttpRequest::from_stream(&mut buf, stream).await {
+                            Ok((req, n)) => (req, n),
+                            Err(_) => break,
                         }
                     };
                     let cmode = req.get_header_accept_encoding();
@@ -488,12 +475,13 @@ impl HttpServer {
                     if pipe_ctx.is_upgraded_websocket() {
                         break;
                     }
-                    if let Err(_) = pipe_ctx
+                    if pipe_ctx
                         .stream
                         .as_mut()
                         .unwrap()
                         .write_all(&res.as_bytes(cmode))
                         .await
+                        .is_err()
                     {
                         break;
                     }
@@ -527,21 +515,12 @@ impl HttpServer {
                 PipeHandlerContext::new(self.pipe_ctx.clone_items(), client_addr, stream);
             _ = tokio::task::spawn(async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
-                let mut tmp_buf = [0u8; 1024];
                 loop {
                     let (req, n) = {
                         let stream = pipe_ctx.stream.as_mut().unwrap();
-                        loop {
-                            let n = match stream.read(&mut tmp_buf).await {
-                                Ok(n) if n > 0 => n,
-                                _ => return,
-                            };
-                            buf.extend(&tmp_buf[0..n]);
-                            match HttpRequest::from_buf(&buf[..]) {
-                                Ok(Some(req)) => break req,
-                                Ok(None) => continue,
-                                Err(_) => return,
-                            }
+                        match HttpRequest::from_stream(&mut buf, stream).await {
+                            Ok((req, n)) => (req, n),
+                            Err(_) => break,
                         }
                     };
                     let cmode = req.get_header_accept_encoding();
@@ -549,12 +528,13 @@ impl HttpServer {
                     if pipe_ctx.is_upgraded_websocket() {
                         break;
                     }
-                    if let Err(_) = pipe_ctx
+                    if pipe_ctx
                         .stream
                         .as_mut()
                         .unwrap()
                         .write_all(&res.as_bytes(cmode))
                         .await
+                        .is_err()
                     {
                         break;
                     }
@@ -564,42 +544,3 @@ impl HttpServer {
         }
     }
 }
-
-// pub struct HttpRequestBuilder<'a> {
-//     headers: [httparse::Header<'a>; 96],
-//     buf: Vec<u8>,
-//     last_len: usize,
-// }
-
-// impl<'a> HttpRequestBuilder<'a> {
-//     pub fn new() -> Self {
-//         Self {
-//             headers: [httparse::EMPTY_HEADER; 96],
-//             buf: Vec::with_capacity(4096),
-//             last_len: 0,
-//         }
-//     }
-
-//     pub async fn read_request(
-//         &mut self,
-//         stream: &mut Box<dyn TcpStreamExt>,
-//     ) -> anyhow::Result<Option<HttpRequest>> {
-//         if self.last_len > 0 {
-//             self.buf.drain(..self.last_len);
-//             self.last_len = 0;
-//         }
-//         let mut tmp_buf = [0u8, 1024];
-//         let (req, n) = {
-//             let n = stream.read(&mut tmp_buf[..]).await?;
-//             if n == 0 {
-//                 return Err(Error::msg("read 0 size"));
-//             }
-//             self.buf.extend(&tmp_buf[0..n]);
-//             match HttpRequest::from_buf(&self.buf[..], &mut self.headers)? {
-//                 Some(req) => req,
-//                 None => return Ok(None),
-//             }
-//         };
-//         Ok(None)
-//     }
-// }

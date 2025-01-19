@@ -1,8 +1,9 @@
 #![allow(async_fn_in_trait)]
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
+//use tokio::io::AsyncWriteExt;
 
 #[async_trait]
 pub trait TcpStreamExt: AsyncRead + AsyncWrite + Unpin + Send {
