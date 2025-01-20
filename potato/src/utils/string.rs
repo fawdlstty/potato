@@ -2,11 +2,13 @@ use lazy_static::lazy_static;
 use rand::Rng;
 
 pub trait StringExt {
-    fn http_standardization(&self) -> String;
+    fn http_std_case(&self) -> String;
+    fn url_decode(&self) -> String;
+    fn starts_with_ignore_ascii_case(&self, other: &str) -> bool;
 }
 
-impl StringExt for &str {
-    fn http_standardization(&self) -> String {
+impl StringExt for str {
+    fn http_std_case(&self) -> String {
         let mut ret = "".to_string();
         let mut upper = true;
         for ch in self.chars() {
@@ -22,19 +24,7 @@ impl StringExt for &str {
         }
         ret
     }
-}
 
-impl StringExt for String {
-    fn http_standardization(&self) -> String {
-        (&self[..]).http_standardization()
-    }
-}
-
-pub trait StrExt {
-    fn url_decode(&self) -> String;
-}
-
-impl StrExt for &str {
     fn url_decode(&self) -> String {
         let mut ret = vec![];
         let mut chars = self.chars();
@@ -54,6 +44,27 @@ impl StrExt for &str {
             }
         }
         String::from_utf8(ret).unwrap_or("".to_string())
+    }
+
+    fn starts_with_ignore_ascii_case(&self, other: &str) -> bool {
+        if self.len() < other.len() {
+            return false;
+        }
+        (&self[..other.len()]).eq_ignore_ascii_case(other)
+    }
+}
+
+impl StringExt for String {
+    fn http_std_case(&self) -> String {
+        self[..].http_std_case()
+    }
+
+    fn url_decode(&self) -> String {
+        self[..].url_decode()
+    }
+
+    fn starts_with_ignore_ascii_case(&self, other: &str) -> bool {
+        self[..].starts_with_ignore_ascii_case(other)
     }
 }
 
@@ -81,4 +92,15 @@ impl StringUtil {
         }
         format!("_{}", Self::rand(num - 1))
     }
+}
+
+macro_rules! ssformat {
+    ($len:expr, $($arg:tt)*) => {
+        {
+            use std::fmt::Write;
+            let mut buf = smallstr::SmallString::<[u8; $len]>::new();
+            buf.write_fmt(::core::format_args!($($arg)*)).unwrap();
+            buf
+        }
+    };
 }

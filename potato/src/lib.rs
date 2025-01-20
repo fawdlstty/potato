@@ -1,19 +1,20 @@
 pub mod client;
 pub mod server;
+#[macro_use]
 pub mod utils;
 
-use anyhow::Error;
 pub use client::*;
 pub use inventory;
-use lazy_static::lazy_static;
 pub use potato_macro::*;
 pub use regex;
 pub use rust_embed;
-use rust_embed::Embed;
 pub use serde_json;
 pub use server::*;
 
+use anyhow::Error;
 use chrono::Utc;
+use lazy_static::lazy_static;
+use rust_embed::Embed;
 use sha1::{Digest, Sha1};
 use std::borrow::Cow;
 use std::fs::File;
@@ -23,10 +24,11 @@ use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utils::bytes::CompressExt;
+use utils::enums::{HttpConnection, HttpContentType};
 use utils::number::HttpCodeExt;
 use utils::refbuf::{RefBuf, ToRefBufExt};
 use utils::refstr::{RefStr, RefStrOrString, ToRefStrExt};
-use utils::string::StrExt;
+use utils::string::StringExt;
 use utils::tcp_stream::TcpStreamExt;
 
 type HttpHandler = fn(
@@ -320,19 +322,28 @@ impl HttpRequest {
         CompressMode::None
     }
 
+    pub fn get_header_connection(&self) -> HttpConnection {
+        if let Some(conn) = self.get_header("Connection") {
+            HttpConnection::from_str(conn).unwrap_or(HttpConnection::Close)
+        } else {
+            HttpConnection::Close
+        }
+    }
+
     pub fn get_header_content_length(&self) -> usize {
         self.get_header("Content-Length")
             .map_or(0, |val| val.parse::<usize>().unwrap_or(0))
+    }
+
+    pub fn get_header_content_type(&self) -> Option<HttpContentType> {
+        HttpContentType::from_str(self.get_header("Content-Type").unwrap_or(""))
     }
 
     pub fn is_websocket(&self) -> bool {
         if self.method != HttpMethod::GET {
             return false;
         }
-        if self
-            .get_header("Connection")
-            .map_or(false, |val| val.to_lowercase() != "upgrade")
-        {
+        if self.get_header_connection() == HttpConnection::Upgrade {
             return false;
         }
         if self
@@ -381,66 +392,66 @@ impl HttpRequest {
             buf.extend(&tmp_buf[0..t]);
         }
         req.body = buf[hdr_len..hdr_len + bdy_len].to_ref_buf();
-        if let Some(cnt_type) = req.get_header("Content-Type") {
-            if cnt_type == "application/json" {
-                if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
-                    if let Ok(root) = serde_json::from_str::<serde_json::Value>(&body_str) {
-                        if let serde_json::Value::Object(obj) = root {
-                            for (k, v) in obj {
-                                req.body_pairs.insert(k.into(), v.to_string().into());
+        if let Some(cnt_type) = req.get_header_content_type() {
+            match cnt_type {
+                HttpContentType::ApplicationJson => {
+                    if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
+                        if let Ok(root) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                            if let serde_json::Value::Object(obj) = root {
+                                for (k, v) in obj {
+                                    req.body_pairs.insert(k.into(), v.to_string().into());
+                                }
                             }
                         }
                     }
                 }
-            } else if cnt_type == "application/x-www-form-urlencoded" {
-                if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
-                    body_str.split('&').for_each(|s| {
-                        if let Some((a, b)) = s.split_once('=') {
-                            req.body_pairs
-                                .insert(a.url_decode().into(), b.url_decode().into());
-                        }
-                    });
+                HttpContentType::ApplicationXWwwFormUrlencoded => {
+                    if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
+                        body_str.split('&').for_each(|s| {
+                            if let Some((a, b)) = s.split_once('=') {
+                                req.body_pairs
+                                    .insert(a.url_decode().into(), b.url_decode().into());
+                            }
+                        });
+                    }
                 }
-            } else if cnt_type.starts_with("multipart/form-data") {
-                let boundary = cnt_type.split_once("boundary=").unwrap_or(("", "")).1;
-                if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
-                    for mut s in body_str.split(format!("--{boundary}").as_str()) {
-                        if s == "--" {
-                            break;
-                        }
-                        if s.ends_with("\r\n") {
-                            s = &s[..s.len() - 2];
-                        }
-                        if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
-                            let keys: Vec<&str> = key_str
-                                .split("\r\n")
-                                .map(|p| p.split(";").collect::<Vec<_>>())
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .flatten()
-                                .collect();
-                            let mut name = None;
-                            let mut filename = None;
-                            for key in keys.into_iter() {
-                                if let Some((k, v)) = key.trim().split_once('=') {
-                                    if k == "name" {
-                                        name = Some(v[1..v.len() - 1].to_ref_str());
-                                    } else if k == "filename" {
-                                        filename = Some(v[1..v.len() - 1].to_ref_str());
+                HttpContentType::MultipartFormData(boundary) => {
+                    let boundary = boundary.to_str();
+                    if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
+                        let split_str = ssformat!(64, "--{boundary}");
+                        for mut s in body_str.split(split_str.as_str()) {
+                            if s == "--" {
+                                break;
+                            }
+                            if s.ends_with("\r\n") {
+                                s = &s[..s.len() - 2];
+                            }
+                            if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
+                                let keys: Vec<&str> = key_str
+                                    .split("\r\n")
+                                    .map(|p| p.split(";").collect::<Vec<_>>())
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .flatten()
+                                    .collect();
+                                let mut name = None;
+                                let mut filename = None;
+                                for key in keys.into_iter() {
+                                    if let Some((k, v)) = key.trim().split_once('=') {
+                                        if k == "name" {
+                                            name = Some(v[1..v.len() - 1].to_ref_str());
+                                        } else if k == "filename" {
+                                            filename = Some(v[1..v.len() - 1].to_ref_str());
+                                        }
                                     }
                                 }
-                            }
-                            if let Some(name) = name {
-                                if let Some(filename) = filename {
-                                    req.body_files.insert(
-                                        name,
-                                        PostFile {
-                                            filename,
-                                            data: content.as_bytes().to_ref_buf(),
-                                        },
-                                    );
-                                } else {
-                                    req.body_pairs.insert(name.into(), content.to_ref_string());
+                                if let Some(name) = name {
+                                    if let Some(filename) = filename {
+                                        let data = content.as_bytes().to_ref_buf();
+                                        req.body_files.insert(name, PostFile { filename, data });
+                                    } else {
+                                        req.body_pairs.insert(name.into(), content.to_ref_string());
+                                    }
                                 }
                             }
                         }
@@ -647,17 +658,20 @@ impl HttpResponse {
             },
         };
         //
-        let mut ret = String::with_capacity(4096);
+        let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
         let status_str = self.http_code.http_code_to_desp();
-        ret.push_str(&format!(
+        ret.push_str(&ssformat!(
+            64,
             "{} {} {}\r\n",
-            self.version, self.http_code, status_str
+            self.version,
+            self.http_code,
+            status_str
         ));
         for (key, value) in self.headers.iter() {
-            ret.push_str(&format!("{}: {}\r\n", key, value));
+            ret.push_str(&ssformat!(512, "{}: {}\r\n", key, value));
         }
         if self.http_code != 101 {
-            ret.push_str(&format!("Content-Length: {}\r\n", payload_ref.len()));
+            ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
             if cmode == CompressMode::Gzip {
                 ret.push_str("Content-Encoding: gzip\r\n");
             }
