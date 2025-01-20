@@ -1,3 +1,7 @@
+#![allow(non_camel_case_types)]
+
+use super::string::StringExt;
+
 #[derive(Clone, Eq)]
 pub struct RefStr {
     ptr: *const u8,
@@ -80,6 +84,7 @@ impl PartialEq for RefStr {
 pub trait ToRefStrExt {
     fn to_ref_str(&self) -> RefStr;
     fn to_ref_string(&self) -> RefStrOrString;
+    fn to_header_ref_str(&self) -> HeaderRefStr;
 }
 
 impl ToRefStrExt for str {
@@ -89,6 +94,9 @@ impl ToRefStrExt for str {
     fn to_ref_string(&self) -> RefStrOrString {
         self.to_ref_str().into()
     }
+    fn to_header_ref_str(&self) -> HeaderRefStr {
+        self.to_ref_str().into()
+    }
 }
 
 impl ToRefStrExt for [u8] {
@@ -96,6 +104,9 @@ impl ToRefStrExt for [u8] {
         RefStr::from_str(unsafe { std::str::from_utf8_unchecked(self) })
     }
     fn to_ref_string(&self) -> RefStrOrString {
+        self.to_ref_str().into()
+    }
+    fn to_header_ref_str(&self) -> HeaderRefStr {
         self.to_ref_str().into()
     }
 }
@@ -175,5 +186,47 @@ impl PartialEq for RefStrOrString {
             }
         }
         true
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum HeaderRefStr {
+    HeaderItem(HeaderItem),
+    RefStr(RefStr),
+}
+
+impl HeaderRefStr {
+    pub fn from_str(val: &str) -> Self {
+        val.to_ref_str().into()
+    }
+}
+
+impl Into<HeaderRefStr> for HeaderItem {
+    fn into(self) -> HeaderRefStr {
+        HeaderRefStr::HeaderItem(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum HeaderItem {
+    Upgrade,
+    Connection,
+    Content_Type,
+    Content_Length,
+    Accept_Encoding,
+}
+
+impl Into<HeaderRefStr> for RefStr {
+    fn into(self) -> HeaderRefStr {
+        let val = self.to_str().http_std_case();
+        let val_ref = &val[..];
+        HeaderRefStr::HeaderItem(match val.len() {
+            7 if val_ref == "Upgrade" => HeaderItem::Upgrade,
+            10 if val_ref == "Connection" => HeaderItem::Connection,
+            12 if val_ref == "Content-Type" => HeaderItem::Content_Type,
+            14 if val_ref == "Content-Length" => HeaderItem::Content_Length,
+            15 if val_ref == "Accept-Encoding" => HeaderItem::Accept_Encoding,
+            _ => return HeaderRefStr::RefStr(self),
+        })
     }
 }

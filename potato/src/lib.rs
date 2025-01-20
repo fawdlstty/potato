@@ -27,7 +27,7 @@ use utils::bytes::CompressExt;
 use utils::enums::{HttpConnection, HttpContentType};
 use utils::number::HttpCodeExt;
 use utils::refbuf::{RefBuf, ToRefBufExt};
-use utils::refstr::{RefStr, RefStrOrString, ToRefStrExt};
+use utils::refstr::{HeaderItem, HeaderRefStr, RefStr, RefStrOrString, ToRefStrExt};
 use utils::string::StringExt;
 use utils::tcp_stream::TcpStreamExt;
 
@@ -281,7 +281,7 @@ pub struct HttpRequest {
     pub url_path: RefStr,
     pub url_query: HashMap<RefStr, RefStr>,
     pub version: u8,
-    pub headers: HashMap<RefStr, RefStr>,
+    pub headers: HashMap<HeaderRefStr, RefStr>,
     pub body: RefBuf,
     pub body_pairs: HashMap<RefStrOrString, RefStrOrString>,
     pub body_files: HashMap<RefStr, PostFile>,
@@ -305,15 +305,25 @@ impl HttpRequest {
     }
 
     pub fn set_header(&mut self, key: RefStr, value: RefStr) {
-        self.headers.insert(key, value);
+        self.headers.insert(key.into(), value);
     }
 
     pub fn get_header(&self, key: &str) -> Option<&str> {
-        self.headers.get(&key.to_ref_str()).map(|a| a.to_str())
+        self.headers
+            .get(&key.to_ref_str().into())
+            .map(|a| a.to_str())
+    }
+
+    pub fn get_header_key(&self, key: HeaderItem) -> Option<&str> {
+        self.headers.get(&key.into()).map(|a| a.to_str())
     }
 
     pub fn get_header_accept_encoding(&self) -> CompressMode {
-        for item in self.get_header("Accept-Encoding").unwrap_or("").split(',') {
+        for item in self
+            .get_header_key(HeaderItem::Accept_Encoding)
+            .unwrap_or("")
+            .split(',')
+        {
             match item.trim() {
                 "gzip" => return CompressMode::Gzip,
                 _ => continue,
@@ -323,7 +333,7 @@ impl HttpRequest {
     }
 
     pub fn get_header_connection(&self) -> HttpConnection {
-        if let Some(conn) = self.get_header("Connection") {
+        if let Some(conn) = self.get_header_key(HeaderItem::Connection) {
             HttpConnection::from_str(conn).unwrap_or(HttpConnection::Close)
         } else {
             HttpConnection::Close
@@ -331,12 +341,12 @@ impl HttpRequest {
     }
 
     pub fn get_header_content_length(&self) -> usize {
-        self.get_header("Content-Length")
+        self.get_header_key(HeaderItem::Content_Length)
             .map_or(0, |val| val.parse::<usize>().unwrap_or(0))
     }
 
     pub fn get_header_content_type(&self) -> Option<HttpContentType> {
-        HttpContentType::from_str(self.get_header("Content-Type").unwrap_or(""))
+        HttpContentType::from_str(self.get_header_key(HeaderItem::Content_Type).unwrap_or(""))
     }
 
     pub fn is_websocket(&self) -> bool {
@@ -347,7 +357,7 @@ impl HttpRequest {
             return false;
         }
         if self
-            .get_header("Upgrade")
+            .get_header_key(HeaderItem::Upgrade)
             .map_or(false, |val| val.to_lowercase() != "websocket")
         {
             return false;
@@ -508,7 +518,7 @@ impl HttpRequest {
                 break;
             }
             req.headers
-                .insert(h.name.to_ref_str(), h.value.to_ref_str());
+                .insert(h.name.to_header_ref_str(), h.value.to_ref_str());
         }
         Ok(Some((req, n)))
     }
@@ -645,8 +655,7 @@ impl HttpResponse {
         #[allow(unused_assignments)]
         let mut payload_tmp = vec![];
         let payload_ref = match cmode {
-            CompressMode::None => &self.payload,
-            CompressMode::Gzip => match self.payload.compress() {
+            CompressMode::Gzip if self.payload.len() >= 32 => match self.payload.compress() {
                 Ok(data) => {
                     payload_tmp = data;
                     &payload_tmp
@@ -656,6 +665,11 @@ impl HttpResponse {
                     &self.payload
                 }
             },
+            CompressMode::Gzip => {
+                cmode = CompressMode::None;
+                &self.payload
+            }
+            _ => &self.payload,
         };
         //
         let mut ret = smallstr::SmallString::<[u8; 4096]>::new();

@@ -1,3 +1,4 @@
+use crate::utils::enums::HttpConnection;
 use crate::utils::number::HttpCodeExt;
 use crate::utils::string::StringUtil;
 use crate::utils::tcp_stream::TcpStreamExt;
@@ -462,7 +463,8 @@ impl HttpServer {
                 PipeHandlerContext::new(self.pipe_ctx.clone_items(), client_addr, Box::new(stream));
             _ = tokio::task::spawn(async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
-                loop {
+                let mut conn = HttpConnection::KeepAlive;
+                while conn == HttpConnection::KeepAlive {
                     let (req, n) = {
                         let stream = pipe_ctx.stream.as_mut().unwrap();
                         match HttpRequest::from_stream(&mut buf, stream).await {
@@ -471,6 +473,8 @@ impl HttpServer {
                         }
                     };
                     let cmode = req.get_header_accept_encoding();
+                    // TODO: Know why this line of code affects performance
+                    conn = req.get_header_connection();
                     let res = pipe_ctx.handle_request(req).await;
                     if pipe_ctx.is_upgraded_websocket() {
                         break;

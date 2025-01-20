@@ -139,7 +139,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         arg_auth_mark = true;
                         quote! {
                             match req.headers
-                                .get(&potato::utils::refstr::RefStr::from_str("Authorization"))
+                                .get(&potato::utils::refstr::HeaderRefStr::from_str("Authorization"))
                                 .map(|v| v.to_str()) {
                                 Some(mut auth) => {
                                     if auth.starts_with("Bearer ") {
