@@ -1,8 +1,8 @@
 [package]
 name = "potato"
-version = "0.1.20"
+version = "0.1.21"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.73"
 license = "MIT"
 repository = "https://github.com/fawdlstty/potato"
 homepage = "https://github.com/fawdlstty/potato"
@@ -24,7 +24,7 @@ httparse = "1.9.5"
 inventory = "0.3.15"
 jsonwebtoken = "9.3.0"
 lazy_static = "1.5.0"
-potato-macro = "0.1.20"                               # { path = "../potato-macro" }
+potato-macro = "0.1.21"                               # { path = "../potato-macro" }
 rand = "0.8.5"
 regex = "1.11.1"
 rust-embed = "8.5.0"

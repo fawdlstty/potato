@@ -1,8 +1,8 @@
 [package]
 name = "potato-macro"
-version = "0.1.20"
+version = "0.1.21"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.73"
 license = "MIT"
 repository = "https://github.com/fawdlstty/potato"
 homepage = "https://github.com/fawdlstty/potato"
