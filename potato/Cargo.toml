@@ -36,3 +36,4 @@ smallvec = "1.13.2"
 strum = { version = "0.26.3", features = ["derive"] }
 tokio = { version = "1.42.0", features = ["full"] }
 tokio-rustls = "0.26.1"
+webpki-roots = "0.26.7"

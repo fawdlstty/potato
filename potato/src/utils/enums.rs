@@ -1,6 +1,6 @@
 use super::refstr::{RefStr, ToRefStrExt};
 
-#[derive(PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HttpConnection {
     KeepAlive,
     Close,

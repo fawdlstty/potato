@@ -92,7 +92,6 @@ pub enum PipeContextItem {
     FinalRoute(HttpResponse),
 }
 
-#[derive(Clone)]
 pub struct PipeContext {
     items: Vec<PipeContextItem>,
 }
@@ -318,30 +317,26 @@ impl PipeContext {
 }
 
 pub struct PipeHandlerContext {
-    items: Vec<PipeContextItem>,
+    pipe_ctx: Arc<PipeContext>,
     client_addr: SocketAddr,
     pub stream: Option<Box<dyn TcpStreamExt>>,
 }
 
 impl PipeHandlerContext {
     pub fn new(
-        items: Vec<PipeContextItem>,
+        pipe_ctx: Arc<PipeContext>,
         client_addr: SocketAddr,
         stream: Box<dyn TcpStreamExt>,
     ) -> Self {
         Self {
-            items,
+            pipe_ctx,
             client_addr,
             stream: Some(stream),
         }
     }
 
-    pub fn is_upgraded_websocket(&self) -> bool {
-        self.stream.is_none()
-    }
-
     pub async fn handle_request(&mut self, req: HttpRequest) -> HttpResponse {
-        for item in self.items.iter() {
+        for item in self.pipe_ctx.items.iter() {
             match item {
                 PipeContextItem::Dispatch => {
                     let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
@@ -435,21 +430,21 @@ impl PipeHandlerContext {
 
 pub struct HttpServer {
     addr: String,
-    pipe_ctx: PipeContext,
+    pipe_ctx: Arc<PipeContext>,
 }
 
 impl HttpServer {
     pub fn new(addr: impl Into<String>) -> Self {
         HttpServer {
             addr: addr.into(),
-            pipe_ctx: PipeContext::new(),
+            pipe_ctx: Arc::new(PipeContext::new()),
         }
     }
 
     pub fn configure(&mut self, callback: impl Fn(&mut PipeContext)) {
         let mut ctx = PipeContext::empty();
         callback(&mut ctx);
-        self.pipe_ctx = ctx;
+        self.pipe_ctx = Arc::new(ctx);
     }
 
     pub async fn serve_http(&mut self) -> anyhow::Result<()> {
@@ -460,7 +455,7 @@ impl HttpServer {
             // accept connection
             let (stream, client_addr) = listener.accept().await?;
             let mut pipe_ctx =
-                PipeHandlerContext::new(self.pipe_ctx.clone_items(), client_addr, Box::new(stream));
+                PipeHandlerContext::new(Arc::clone(&self.pipe_ctx), client_addr, Box::new(stream));
             _ = tokio::task::spawn(async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
                 let mut conn = HttpConnection::KeepAlive;
@@ -473,23 +468,15 @@ impl HttpServer {
                         }
                     };
                     let cmode = req.get_header_accept_encoding();
-                    // TODO: Know why this line of code affects performance
                     conn = req.get_header_connection();
                     let res = pipe_ctx.handle_request(req).await;
-                    if pipe_ctx.is_upgraded_websocket() {
-                        break;
+                    if let Some(stream) = pipe_ctx.stream.as_mut() {
+                        if stream.write_all(&res.as_bytes(cmode)).await.is_ok() {
+                            buf.drain(..n);
+                            continue;
+                        }
                     }
-                    if pipe_ctx
-                        .stream
-                        .as_mut()
-                        .unwrap()
-                        .write_all(&res.as_bytes(cmode))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    buf.drain(..n);
+                    break;
                 }
             });
         }
@@ -516,10 +503,11 @@ impl HttpServer {
             };
             let stream: Box<dyn TcpStreamExt> = Box::new(stream);
             let mut pipe_ctx =
-                PipeHandlerContext::new(self.pipe_ctx.clone_items(), client_addr, stream);
+                PipeHandlerContext::new(Arc::clone(&self.pipe_ctx), client_addr, stream);
             _ = tokio::task::spawn(async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
-                loop {
+                let mut conn = HttpConnection::KeepAlive;
+                while conn == HttpConnection::KeepAlive {
                     let (req, n) = {
                         let stream = pipe_ctx.stream.as_mut().unwrap();
                         match HttpRequest::from_stream(&mut buf, stream).await {
@@ -528,21 +516,15 @@ impl HttpServer {
                         }
                     };
                     let cmode = req.get_header_accept_encoding();
+                    conn = req.get_header_connection();
                     let res = pipe_ctx.handle_request(req).await;
-                    if pipe_ctx.is_upgraded_websocket() {
-                        break;
+                    if let Some(stream) = pipe_ctx.stream.as_mut() {
+                        if stream.write_all(&res.as_bytes(cmode)).await.is_ok() {
+                            buf.drain(..n);
+                            continue;
+                        }
                     }
-                    if pipe_ctx
-                        .stream
-                        .as_mut()
-                        .unwrap()
-                        .write_all(&res.as_bytes(cmode))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    buf.drain(..n);
+                    break;
                 }
             });
         }

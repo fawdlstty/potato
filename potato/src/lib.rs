@@ -13,13 +13,9 @@ pub use server::*;
 
 use anyhow::Error;
 use chrono::Utc;
-use lazy_static::lazy_static;
-use rust_embed::Embed;
 use sha1::{Digest, Sha1};
-use std::borrow::Cow;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -695,69 +691,4 @@ impl HttpResponse {
         ret.extend(payload_ref);
         ret
     }
-}
-
-lazy_static! {
-    pub static ref DOC_RES: HashMap<&'static str, &'static str> = {
-        [
-            ("index.html", include_str!("../swagger_res/index.html")),
-            ("index.css", include_str!("../swagger_res/index.css")),
-            (
-                "swagger-ui.css",
-                include_str!("../swagger_res/swagger-ui.css"),
-            ),
-            (
-                "swagger-ui-bundle.js",
-                include_str!("../swagger_res/swagger-ui-bundle.js"),
-            ),
-            (
-                "swagger-ui-standalone-preset.js",
-                include_str!("../swagger_res/swagger-ui-standalone-preset.js"),
-            ),
-            (
-                "swagger-initializer.js",
-                r#"window.onload = function() {
-   window.ui = SwaggerUIBundle({
-       url: "./index.json",
-       dom_id: '#swagger-ui',
-       deepLinking: true,
-       presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
-       plugins: [SwaggerUIBundle.plugins.DownloadUrl],
-       layout: "StandaloneLayout"
-   });
- };"#,
-            ),
-        ]
-        .into_iter()
-        .collect()
-    };
-}
-
-pub struct DocResource {}
-
-impl DocResource {
-    pub fn load_str(file: &str) -> &'static str {
-        DOC_RES.get(file).map(|v| &**v).unwrap_or("")
-    }
-}
-
-pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
-    let mut ret = HashMap::new();
-    for name in T::iter().into_iter() {
-        if let Some(file) = T::get(&name) {
-            if name.ends_with("index.htm") || name.ends_with("index.html") {
-                if let Some(path) = Path::new(&name[..]).parent() {
-                    if let Some(path) = path.to_str() {
-                        let path = match path.ends_with('/') {
-                            true => path.to_string(),
-                            false => format!("{path}/"),
-                        };
-                        ret.insert(path, file.data.clone());
-                    }
-                }
-            }
-            ret.insert(name.to_string(), file.data);
-        }
-    }
-    ret
 }

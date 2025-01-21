@@ -2,7 +2,8 @@
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_rustls::server::TlsStream;
+use tokio_rustls::client::TlsStream as ClientTlsStream;
+use tokio_rustls::server::TlsStream as ServerTlsStream;
 //use tokio::io::AsyncWriteExt;
 
 #[async_trait]
@@ -28,4 +29,5 @@ pub trait TcpStreamExt: AsyncRead + AsyncWrite + Unpin + Send {
 }
 
 impl TcpStreamExt for TcpStream {}
-impl TcpStreamExt for TlsStream<TcpStream> {}
+impl TcpStreamExt for ClientTlsStream<TcpStream> {}
+impl TcpStreamExt for ServerTlsStream<TcpStream> {}
