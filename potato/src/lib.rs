@@ -8,14 +8,17 @@ pub use inventory;
 pub use potato_macro::*;
 pub use regex;
 pub use rust_embed;
+use rust_embed::Embed;
 pub use serde_json;
 pub use server::*;
 
 use anyhow::Error;
 use chrono::Utc;
 use sha1::{Digest, Sha1};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::Read;
+use std::path::Path;
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -599,15 +602,15 @@ impl HttpResponse {
         Self::html("")
     }
 
-    pub fn from_file(path: &str) -> Self {
+    pub fn from_file(path: &str, download: bool) -> Self {
         let mut buffer = vec![];
         if let Ok(mut file) = File::open(path) {
             _ = file.read_to_end(&mut buffer);
         }
-        Self::from_mem_file(path, buffer)
+        Self::from_mem_file(path, buffer, download)
     }
 
-    pub fn from_mem_file(path: &str, data: Vec<u8>) -> Self {
+    pub fn from_mem_file(path: &str, data: Vec<u8>, download: bool) -> Self {
         let mut ret = Self::empty();
         let mime_type = match path.split('.').last() {
             Some("htm") => "text/html",
@@ -620,6 +623,18 @@ impl HttpResponse {
             _ => "application/octet-stream",
         };
         ret.add_header("Content-Type", mime_type);
+        if download {
+            let file = match path.rfind('/') {
+                Some(p) => &path[p + 1..],
+                None => path,
+            };
+            if file.len() > 0 {
+                ret.add_header(
+                    "Content-Disposition",
+                    format!("attachment; filename={file}"),
+                );
+            }
+        }
         ret.payload = data;
         ret
     }
@@ -691,4 +706,21 @@ impl HttpResponse {
         ret.extend(payload_ref);
         ret
     }
+}
+
+pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
+    let mut ret = HashMap::new();
+    for name in T::iter().into_iter() {
+        if let Some(file) = T::get(&name) {
+            if name.ends_with("index.htm") || name.ends_with("index.html") {
+                if let Some(path) = Path::new(&name[..]).parent() {
+                    if let Some(path) = path.to_str() {
+                        ret.insert(path.to_string(), file.data.clone());
+                    }
+                }
+            }
+            ret.insert(name.to_string(), file.data);
+        }
+    }
+    ret
 }

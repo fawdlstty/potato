@@ -6,6 +6,6 @@ async fn main() -> anyhow::Result<()> {
     server.configure(|ctx| {
         ctx.use_embedded_route("/", embed_dir!("assets/wwwroot"));
     });
-    println!("visit: https://127.0.0.1:8080/");
+    println!("visit: http://127.0.0.1:8080/");
     server.serve_http().await
 }

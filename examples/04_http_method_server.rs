@@ -37,6 +37,6 @@ async fn main() -> anyhow::Result<()> {
         ctx.use_dispatch();
         ctx.use_doc("/doc/");
     });
-    println!("visit: https://127.0.0.1:8080/doc/");
+    println!("visit: http://127.0.0.1:8080/doc/");
     server.serve_http().await
 }

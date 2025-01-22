@@ -391,7 +391,7 @@ impl PipeHandlerContext {
                         if let Ok(meta) = std::fs::metadata(&path) {
                             if meta.is_file() {
                                 if let Some(path) = path.to_str() {
-                                    return HttpResponse::from_file(path);
+                                    return HttpResponse::from_file(path, false);
                                 }
                             } else if meta.is_dir() {
                                 let mut tmp_path = path.clone();
@@ -399,14 +399,14 @@ impl PipeHandlerContext {
                                 if let Ok(tmp) = std::fs::metadata(&tmp_path) {
                                     if tmp.is_file() {
                                         if let Some(path) = tmp_path.to_str() {
-                                            return HttpResponse::from_file(path);
+                                            return HttpResponse::from_file(path, false);
                                         }
                                     }
                                 }
                                 let mut tmp_path = path.clone();
                                 tmp_path.push("index.html");
                                 if let Some(path) = tmp_path.to_str() {
-                                    return HttpResponse::from_file(path);
+                                    return HttpResponse::from_file(path, false);
                                 }
                             }
                         }
@@ -415,7 +415,11 @@ impl PipeHandlerContext {
                 }
                 PipeContextItem::EmbeddedRoute(embedded_items) => {
                     if let Some(item) = embedded_items.get(req.url_path.to_str()) {
-                        let ret = HttpResponse::from_mem_file(req.url_path.to_str(), item.to_vec());
+                        let ret = HttpResponse::from_mem_file(
+                            req.url_path.to_str(),
+                            item.to_vec(),
+                            false,
+                        );
                         return ret;
                     }
                     continue;

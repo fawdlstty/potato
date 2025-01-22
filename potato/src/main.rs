@@ -1,4 +1,5 @@
 use potato::*;
+//use tikv_jemalloc_ctl::{Access, AsName};
 
 #[http_get("/hello")]
 async fn hello() -> HttpResponse {
@@ -42,8 +43,75 @@ async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Re
     }
 }
 
+//
+
+// fn jemalloc_active_prof(active: bool) -> bool {
+//     const PROF_ACTIVE: &'static [u8] = b"prof.active\0";
+//     let name = PROF_ACTIVE.name();
+//     match name.write(active) {
+//         Ok(()) => {
+//             println!("[main] active({}) jemalloc prof success", active);
+//             true
+//         }
+//         Err(err) => {
+//             println!("[main] active({}) jemalloc prof failed: {}", active, err);
+//             false
+//         }
+//     }
+// }
+
+// #[global_allocator]
+// static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// #[allow(non_upper_case_globals)]
+// #[export_name = "malloc_conf"]
+// pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+
+// #[http_get("/heap.pb.gz")]
+// pub async fn heap_pb_gz() -> anyhow::Result<HttpResponse> {
+//     let mut prof_ctl = jemalloc_pprof::PROF_CTL.as_ref().unwrap().lock().await;
+//     require_profiling_activated(&prof_ctl)?;
+//     let data = prof_ctl.dump_pprof()?;
+//     Ok(HttpResponse::from_mem_file("heap.bp.gz", data, true))
+// }
+
+// #[http_get("/ds.prof")]
+// pub async fn ds_prof() -> anyhow::Result<HttpResponse> {
+//     jemalloc_active_prof(false);
+//     jemalloc_dump_profile("ds.prof");
+//     Ok(HttpResponse::html("ds.prof"))
+// }
+
+// fn require_profiling_activated(prof_ctl: &jemalloc_pprof::JemallocProfCtl) -> anyhow::Result<()> {
+//     if prof_ctl.activated() {
+//         Ok(())
+//     } else {
+//         Err(anyhow::Error::msg("heap profiling not activated"))
+//     }
+// }
+
+// fn jemalloc_dump_profile(prof_name: &str) -> bool {
+//     const PROF_DUMP: &'static [u8] = b"prof.dump\0";
+//     let mut prof_name2 = prof_name.to_string();
+//     prof_name2.push('\0');
+//     let prof_name2 = prof_name2.into_boxed_str();
+//     let prof_name_ptr: &'static [u8] = unsafe { std::mem::transmute(prof_name2) };
+//     let name = PROF_DUMP.name();
+//     match name.write(prof_name_ptr) {
+//         Ok(()) => {
+//             println!("[main] dump jemalloc prof file[{prof_name}] success");
+//             true
+//         }
+//         Err(err) => {
+//             println!("[main] dump jemalloc prof file[{prof_name}] failed: {err}");
+//             false
+//         }
+//     }
+// }
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    //jemalloc_active_prof(true);
     server::JwtAuth::set_secret("AAAAAAAAAAAAAAABBBCCC").await;
     let mut server = HttpServer::new("0.0.0.0:8080");
     server.configure(|ctx| {
