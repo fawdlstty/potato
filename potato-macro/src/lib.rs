@@ -145,7 +145,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                                     if auth.starts_with("Bearer ") {
                                         auth = &auth[7..];
                                     }
-                                    match potato::server::JwtAuth::check(&auth).await {
+                                    match potato::ServerAuth::jwt_check(&auth).await {
                                         Ok(payload) => payload,
                                         Err(err) => return HttpResponse::error(format!("auth failed: {:?}", err)),
                                     }

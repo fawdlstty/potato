@@ -1,20 +1,16 @@
 use crate::utils::enums::HttpConnection;
 use crate::utils::number::HttpCodeExt;
-use crate::utils::string::StringUtil;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use crate::{RequestHandlerFlag, WebsocketContext};
 use lazy_static::lazy_static;
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
@@ -30,58 +26,6 @@ lazy_static! {
         }
         handlers
     };
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: u64,
-}
-
-lazy_static! {
-    static ref JWT_SECRET: RwLock<String> = RwLock::new(StringUtil::rand(32));
-}
-
-pub struct JwtAuth;
-
-impl JwtAuth {
-    pub async fn set_secret(secret: impl Into<String>) {
-        let mut jwt_secret = JWT_SECRET.write().await;
-        *jwt_secret = secret.into();
-    }
-
-    pub async fn issue(payload: String, expire: Duration) -> anyhow::Result<String> {
-        let secret = {
-            let jwt_secret = JWT_SECRET.read().await;
-            jwt_secret.clone()
-        };
-        let claims = Claims {
-            sub: payload,
-            exp: (SystemTime::now() + expire)
-                .duration_since(UNIX_EPOCH)?
-                .as_micros() as u64,
-        };
-        Ok(jsonwebtoken::encode(
-            &jsonwebtoken::Header::default(),
-            &claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
-        )?)
-    }
-
-    pub async fn check(token: &str) -> anyhow::Result<String> {
-        let secret = {
-            let jwt_secret = JWT_SECRET.read().await;
-            jwt_secret.clone()
-        };
-        let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
-        let validation = jsonwebtoken::Validation::default();
-        let claims = jsonwebtoken::decode::<Claims>(token, &decoding_key, &validation)?.claims;
-        let expired = SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(claims.exp);
-        match SystemTime::now() <= expired {
-            true => Ok(claims.sub),
-            false => Err(anyhow::Error::msg("token expired")),
-        }
-    }
 }
 
 #[derive(Clone)]

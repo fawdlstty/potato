@@ -1,3 +1,4 @@
+use global_config::ServerConfig;
 use potato::*;
 //use tikv_jemalloc_ctl::{Access, AsName};
 
@@ -22,7 +23,7 @@ async fn upload(file1: PostFile) -> HttpResponse {
 
 #[http_get("/issue")]
 async fn issue(payload: String) -> anyhow::Result<HttpResponse> {
-    let token = server::JwtAuth::issue(payload, std::time::Duration::from_secs(10000000)).await?;
+    let token = ServerAuth::jwt_issue(payload, std::time::Duration::from_secs(10000000)).await?;
     Ok(HttpResponse::html(token))
 }
 
@@ -112,7 +113,7 @@ async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Re
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     //jemalloc_active_prof(true);
-    server::JwtAuth::set_secret("AAAAAAAAAAAAAAABBBCCC").await;
+    ServerConfig::set_jwt_secret("AAABBBCCC").await;
     let mut server = HttpServer::new("0.0.0.0:8080");
     server.configure(|ctx| {
         ctx.use_dispatch();

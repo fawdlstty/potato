@@ -2,7 +2,7 @@ use potato::*;
 
 #[http_get("/issue")]
 async fn issue(payload: String) -> anyhow::Result<HttpResponse> {
-    let token = server::JwtAuth::issue(payload, Duration::from_secs(10000000)).await?;
+    let token = ServerAuth::jwt_issue(payload, std::time::Duration::from_secs(10000000)).await?;
     Ok(HttpResponse::html(token))
 }
 
@@ -13,7 +13,7 @@ async fn check(payload: String) -> HttpResponse {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    potato::server::JwtAuth::set_secret("AABBCCDD").await; // optional, otherwise random str
+    ServerConfig::set_jwt_secret("AAABBBCCC").await; // optional, otherwise random str
     let mut server = HttpServer::new("0.0.0.0:8080");
     server.configure(|ctx| {
         ctx.use_dispatch();

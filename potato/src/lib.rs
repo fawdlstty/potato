@@ -1,9 +1,11 @@
 pub mod client;
+pub mod global_config;
 pub mod server;
 #[macro_use]
 pub mod utils;
 
 pub use client::*;
+pub use global_config::*;
 pub use inventory;
 pub use potato_macro::*;
 pub use regex;
@@ -194,20 +196,24 @@ impl<'a> WebsocketConnection<'_> {
     pub async fn recv_frame(&mut self) -> anyhow::Result<WsFrame> {
         let mut tmp = vec![];
         loop {
-            match self.recv_frame_impl().await? {
-                WsFrameImpl::Close => return Err(anyhow::Error::msg("close frame")),
-                WsFrameImpl::Ping => self.write_frame_impl(WsFrameImpl::Pong).await?,
-                WsFrameImpl::Pong => (),
-                WsFrameImpl::Binary(data) => {
-                    tmp.extend(data);
-                    return Ok(WsFrame::Binary(tmp));
-                }
-                WsFrameImpl::Text(data) => {
-                    tmp.extend(data);
-                    let ret_str = String::from_utf8(tmp).unwrap_or("".to_string());
-                    return Ok(WsFrame::Text(ret_str));
-                }
-                WsFrameImpl::PartData(data) => tmp.extend(data),
+            let timeout = ServerConfig::get_ws_ping_duration().await;
+            match tokio::time::timeout(timeout, self.recv_frame_impl()).await {
+                Ok(ws_frame) => match ws_frame? {
+                    WsFrameImpl::Close => return Err(anyhow::Error::msg("close frame")),
+                    WsFrameImpl::Ping => self.write_frame_impl(WsFrameImpl::Pong).await?,
+                    WsFrameImpl::Pong => (),
+                    WsFrameImpl::Binary(data) => {
+                        tmp.extend(data);
+                        return Ok(WsFrame::Binary(tmp));
+                    }
+                    WsFrameImpl::Text(data) => {
+                        tmp.extend(data);
+                        let ret_str = String::from_utf8(tmp).unwrap_or("".to_string());
+                        return Ok(WsFrame::Text(ret_str));
+                    }
+                    WsFrameImpl::PartData(data) => tmp.extend(data),
+                },
+                Err(_) => self.write_frame_impl(WsFrameImpl::Ping).await?,
             }
         }
     }
