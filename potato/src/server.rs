@@ -3,30 +3,28 @@ use crate::utils::number::HttpCodeExt;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use crate::{RequestHandlerFlag, WebsocketContext};
-use lazy_static::lazy_static;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
 
-lazy_static! {
-    pub static ref HANDLERS: HashMap<&'static str, HashMap<HttpMethod, &'static RequestHandlerFlag>> = {
-        let mut handlers = HashMap::new();
+static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static RequestHandlerFlag>>> =
+    LazyLock::new(|| {
+        let mut handlers = HashMap::with_capacity(16);
         for flag in inventory::iter::<RequestHandlerFlag> {
             handlers
                 .entry(flag.path)
-                .or_insert_with(HashMap::new)
+                .or_insert_with(|| HashMap::with_capacity(16))
                 .insert(flag.method, flag);
         }
         handlers
-    };
-}
+    });
 
 #[derive(Clone)]
 pub enum PipeContextItem {
@@ -70,16 +68,16 @@ impl PipeContext {
         url_path: impl Into<String>,
         assets: HashMap<String, Cow<'static, [u8]>>,
     ) {
-        let mut ret = HashMap::new();
+        let mut ret = HashMap::with_capacity(16);
         let url_path = {
             let mut url_path: String = url_path.into();
-            if !url_path.ends_with('/') {
-                url_path.push('/');
+            if url_path.ends_with('/') {
+                url_path.pop();
             }
             url_path
         };
         for (key, value) in assets.into_iter() {
-            ret.insert(format!("{url_path}{key}"), value);
+            ret.insert(format!("{url_path}/{key}"), value);
         }
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
     }
@@ -98,7 +96,7 @@ impl PipeContext {
             }
         };
         let paths = {
-            let mut paths = std::collections::HashMap::new();
+            let mut paths = std::collections::HashMap::with_capacity(16);
             for flag in inventory::iter::<RequestHandlerFlag> {
                 if !flag.doc.show {
                     continue;
@@ -177,7 +175,7 @@ impl PipeContext {
                 }
                 paths
                     .entry(flag.path)
-                    .or_insert_with(std::collections::HashMap::new)
+                    .or_insert_with(|| HashMap::with_capacity(16))
                     .insert(flag.method.to_string().to_lowercase(), root_cur_path);
             }
             paths
@@ -208,7 +206,7 @@ impl PipeContext {
         #[folder = "swagger_res"]
         struct DocAsset;
 
-        let mut ret = HashMap::new();
+        let mut ret = HashMap::with_capacity(16);
         let url_path = {
             let mut url_path: String = url_path.into();
             if !url_path.ends_with('/') {
@@ -416,6 +414,7 @@ impl HttpServer {
                         }
                     };
                     let cmode = req.get_header_accept_encoding();
+                    // FIXME: Why does this line of code affect performance?
                     conn = req.get_header_connection();
                     let res = pipe_ctx.handle_request(req).await;
                     if let Some(stream) = pipe_ctx.stream.as_mut() {

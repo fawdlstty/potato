@@ -1,6 +1,6 @@
 [package]
 name = "potato-macro"
-version = "0.1.23"
+version = "0.1.24"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -13,7 +13,6 @@ readme = "../README.md"
 
 [dependencies]
 inventory = "0.3.15"
-lazy_static = "1.5.0"
 proc-macro2 = "1.0.92"
 quote = "1.0.37"
 rand = "0.8.5"

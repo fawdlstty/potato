@@ -1,13 +1,13 @@
 use crate::utils::string::StringUtil;
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
-lazy_static! {
-    static ref SERVER_JWT_SECRET: RwLock<String> = RwLock::new(StringUtil::rand(32));
-    static ref SERVER_WS_PING_DURATION: RwLock<Duration> = RwLock::new(Duration::from_secs(60));
-}
+static SERVER_JWT_SECRET: LazyLock<RwLock<String>> =
+    LazyLock::new(|| RwLock::new(StringUtil::rand(32)));
+static SERVER_WS_PING_DURATION: LazyLock<RwLock<Duration>> =
+    LazyLock::new(|| RwLock::new(Duration::from_secs(60)));
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {

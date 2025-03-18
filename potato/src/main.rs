@@ -51,11 +51,11 @@ async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Re
 //     let name = PROF_ACTIVE.name();
 //     match name.write(active) {
 //         Ok(()) => {
-//             println!("[main] active({}) jemalloc prof success", active);
+//             println!("[main] active({active}) jemalloc prof success");
 //             true
 //         }
 //         Err(err) => {
-//             println!("[main] active({}) jemalloc prof failed: {}", active, err);
+//             println!("[main] active({active}) jemalloc prof failed: {err}");
 //             false
 //         }
 //     }

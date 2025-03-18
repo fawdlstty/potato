@@ -1,20 +1,19 @@
-use lazy_static::lazy_static;
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::{quote, ToTokens};
 use rand::Rng;
 use serde_json::json;
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::LazyLock};
 use syn::{parse_macro_input, FnArg, ItemFn, LitStr};
 
-lazy_static! {
-    static ref ARG_TYPES: HashSet<&'static str> = [
+static ARG_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    [
         "String", "bool", "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize",
         "f32", "f64",
     ]
     .into_iter()
-    .collect();
-}
+    .collect()
+});
 
 fn random_ident() -> Ident {
     let mut rng = rand::thread_rng();
@@ -179,7 +178,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         arg_value
                     }
                 },
-                _ => panic!("unsupported arg type: [{}]", arg_type_str),
+                _ => panic!("unsupported arg type: [{arg_type_str}]"),
             });
         } else {
             panic!("unsupported: {}", arg.to_token_stream().to_string());
@@ -215,7 +214,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         "HttpResponse" => quote! {
             #fn_name(#(#args),*).await
         },
-        _ => panic!("unsupported ret type: {}", ret_type),
+        _ => panic!("unsupported ret type: {ret_type}"),
     };
     let doc_args = serde_json::to_string(&doc_args).unwrap();
     // let mut content =
@@ -244,7 +243,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         )}
     }.into()
     // }.to_string();
-    // panic!("{}", content);
+    // panic!("{content}");
     // todo!()
 }
 

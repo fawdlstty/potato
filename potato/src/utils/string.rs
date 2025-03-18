@@ -1,5 +1,5 @@
-use lazy_static::lazy_static;
 use rand::Rng;
+use std::sync::LazyLock;
 
 pub trait StringExt {
     fn http_std_case(&self) -> String;
@@ -68,12 +68,11 @@ impl StringExt for String {
     }
 }
 
-lazy_static! {
-    pub static ref ALPHANUM_CHARS: Vec<char> =
-        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            .chars()
-            .collect();
-}
+pub static ALPHANUM_CHARS: LazyLock<Vec<char>> = LazyLock::new(|| {
+    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        .chars()
+        .collect()
+});
 
 pub struct StringUtil;
 

@@ -10,17 +10,18 @@ pub use inventory;
 pub use potato_macro::*;
 pub use regex;
 pub use rust_embed;
-use rust_embed::Embed;
 pub use serde_json;
 pub use server::*;
 
 use anyhow::Error;
 use chrono::Utc;
+use rust_embed::Embed;
 use sha1::{Digest, Sha1};
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::LazyLock;
 use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
 use strum::Display;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,6 +32,14 @@ use utils::refbuf::{RefBuf, ToRefBufExt};
 use utils::refstr::{HeaderItem, HeaderRefStr, RefStr, RefStrOrString, ToRefStrExt};
 use utils::string::StringExt;
 use utils::tcp_stream::TcpStreamExt;
+
+static SERVER_STR: LazyLock<Cow<str>> = LazyLock::new(|| {
+    Cow::Owned(format!(
+        "{} {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    ))
+});
 
 type HttpHandler = fn(
     HttpRequest,
@@ -300,7 +309,7 @@ impl HttpRequest {
         Self {
             method: HttpMethod::GET,
             url_path: "/".to_ref_str(),
-            url_query: HashMap::new(),
+            url_query: HashMap::with_capacity(16),
             version: 11,
             headers: HashMap::with_capacity(16),
             body: [].to_ref_buf(),
@@ -527,17 +536,13 @@ impl HttpRequest {
         }
         Ok(Some((req, n)))
     }
-
-    // pub async fn process_request(self) -> HttpResponse {
-
-    // }
 }
 
 #[derive(Clone)]
 pub struct HttpResponse {
-    pub version: String,
+    pub version: Cow<'static, str>,
     pub http_code: u16,
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<Cow<'static, str>, Cow<'static, str>>,
     pub payload: Vec<u8>,
 }
 unsafe impl Send for HttpResponse {}
@@ -547,12 +552,13 @@ macro_rules! make_resp_by_text {
         pub fn $fn_name(payload: impl Into<String>) -> Self {
             let payload = payload.into();
             Self {
-                version: "HTTP/1.1".to_string(),
+                version: "HTTP/1.1".into(),
                 http_code: 200,
                 headers: [
-                    ("Date".to_string(), Utc::now().to_rfc2822()),
-                    ("Server".to_string(), "Potato 0.1.0".to_string()),
-                    ("Content-Type".to_string(), $cnt_type.to_string()),
+                    ("Date".into(), Cow::Owned(Utc::now().to_rfc2822())),
+                    ("Server".into(), SERVER_STR.clone()),
+                    ("Connection".into(), "keep-alive".into()),
+                    ("Content-Type".into(), $cnt_type.into()),
                 ]
                 .into(),
                 payload: payload.as_bytes().to_vec(),
@@ -565,12 +571,13 @@ macro_rules! make_resp_by_binary {
     ($fn_name:ident, $cnt_type:expr) => {
         pub fn $fn_name(payload: &[u8]) -> Self {
             Self {
-                version: "HTTP/1.1".to_string(),
+                version: "HTTP/1.1".into(),
                 http_code: 200,
                 headers: [
-                    ("Date".to_string(), Utc::now().to_rfc2822()),
-                    ("Server".to_string(), "Potato 0.1.0".to_string()),
-                    ("Content-Type".to_string(), $cnt_type.to_string()),
+                    ("Date".into(), Cow::Owned(Utc::now().to_rfc2822())),
+                    ("Server".into(), SERVER_STR.clone()),
+                    ("Connection".into(), "keep-alive".into()),
+                    ("Content-Type".into(), $cnt_type.into()),
                 ]
                 .into(),
                 payload: payload.to_vec(),
@@ -588,7 +595,11 @@ impl HttpResponse {
     make_resp_by_text!(xml, "application/xml");
     make_resp_by_binary!(png, "image/png");
 
-    pub fn add_header(&mut self, key: impl Into<String>, value: impl Into<String>) {
+    pub fn add_header(
+        &mut self,
+        key: impl Into<Cow<'static, str>>,
+        value: impl Into<Cow<'static, str>>,
+    ) {
         self.headers.insert(key.into(), value.into());
     }
 
@@ -654,14 +665,14 @@ impl HttpResponse {
             base64::encode(&sha1.finalize())
         };
         Self {
-            version: "HTTP/1.1".to_string(),
+            version: "HTTP/1.1".into(),
             http_code: 101,
             headers: [
-                ("Date".to_string(), Utc::now().to_rfc2822()),
-                ("Server".to_string(), "Potato 0.1.0".to_string()),
-                ("Connection".to_string(), "Upgrade".to_string()),
-                ("Upgrade".to_string(), "websocket".to_string()),
-                ("Sec-WebSocket-Accept".to_string(), ws_accept),
+                ("Date".into(), Cow::Owned(Utc::now().to_rfc2822())),
+                ("Server".into(), SERVER_STR.clone()),
+                ("Connection".into(), "Upgrade".into()),
+                ("Upgrade".into(), "websocket".into()),
+                ("Sec-WebSocket-Accept".into(), ws_accept.into()),
             ]
             .into(),
             payload: vec![],
@@ -693,13 +704,12 @@ impl HttpResponse {
         let status_str = self.http_code.http_code_to_desp();
         ret.push_str(&ssformat!(
             64,
-            "{} {} {}\r\n",
+            "{} {} {status_str}\r\n",
             self.version,
-            self.http_code,
-            status_str
+            self.http_code
         ));
         for (key, value) in self.headers.iter() {
-            ret.push_str(&ssformat!(512, "{}: {}\r\n", key, value));
+            ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
         }
         if self.http_code != 101 {
             ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
@@ -715,7 +725,7 @@ impl HttpResponse {
 }
 
 pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
-    let mut ret = HashMap::new();
+    let mut ret = HashMap::with_capacity(16);
     for name in T::iter().into_iter() {
         if let Some(file) = T::get(&name) {
             if name.ends_with("index.htm") || name.ends_with("index.html") {
