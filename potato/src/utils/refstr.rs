@@ -1,7 +1,5 @@
 #![allow(non_camel_case_types)]
 
-use super::string::StringExt;
-
 #[derive(Clone, Eq)]
 pub struct RefStr {
     ptr: *const u8,

@@ -404,8 +404,7 @@ impl HttpServer {
                 PipeHandlerContext::new(Arc::clone(&self.pipe_ctx), client_addr, Box::new(stream));
             _ = tokio::task::spawn(async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
-                let mut conn = HttpConnection::KeepAlive;
-                while conn == HttpConnection::KeepAlive {
+                loop {
                     let (req, n) = {
                         let stream = pipe_ctx.stream.as_mut().unwrap();
                         match HttpRequest::from_stream(&mut buf, stream).await {
@@ -414,8 +413,7 @@ impl HttpServer {
                         }
                     };
                     let cmode = req.get_header_accept_encoding();
-                    // FIXME: Why does this line of code affect performance?
-                    conn = req.get_header_connection();
+                    let conn = req.get_header_connection();
                     let res = pipe_ctx.handle_request(req).await;
                     if let Some(stream) = pipe_ctx.stream.as_mut() {
                         if stream.write_all(&res.as_bytes(cmode)).await.is_ok() {
@@ -423,7 +421,9 @@ impl HttpServer {
                             continue;
                         }
                     }
-                    break;
+                    if conn != HttpConnection::KeepAlive {
+                        break;
+                    }
                 }
             });
         }
@@ -453,8 +453,7 @@ impl HttpServer {
                 PipeHandlerContext::new(Arc::clone(&self.pipe_ctx), client_addr, stream);
             _ = tokio::task::spawn(async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
-                let mut conn = HttpConnection::KeepAlive;
-                while conn == HttpConnection::KeepAlive {
+                loop {
                     let (req, n) = {
                         let stream = pipe_ctx.stream.as_mut().unwrap();
                         match HttpRequest::from_stream(&mut buf, stream).await {
@@ -463,7 +462,7 @@ impl HttpServer {
                         }
                     };
                     let cmode = req.get_header_accept_encoding();
-                    conn = req.get_header_connection();
+                    let conn = req.get_header_connection();
                     let res = pipe_ctx.handle_request(req).await;
                     if let Some(stream) = pipe_ctx.stream.as_mut() {
                         if stream.write_all(&res.as_bytes(cmode)).await.is_ok() {
@@ -471,7 +470,9 @@ impl HttpServer {
                             continue;
                         }
                     }
-                    break;
+                    if conn != HttpConnection::KeepAlive {
+                        break;
+                    }
                 }
             });
         }
