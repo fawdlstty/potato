@@ -42,5 +42,5 @@ strum = { version = "0.26.3", features = ["derive"] }
 #    "background_threads",
 #] }
 tokio = { version = "1.42.0", features = ["full"] }
-tokio-rustls = "0.26.1"
+tokio-rustls = { version = "0.26.1", default-features = false, features = ["tls12"] }
 webpki-roots = "0.26.7"
