@@ -9,13 +9,11 @@ pub enum HttpConnection {
 
 impl HttpConnection {
     pub fn from_str(val: &str) -> Option<Self> {
-        if val.eq_ignore_ascii_case("Keep-Alive") {
-            return Some(Self::KeepAlive);
+        match val.len() {
+            7 if val.eq_ignore_ascii_case("Upgrade") => Some(Self::Upgrade),
+            10 if val.eq_ignore_ascii_case("Keep-Alive") => Some(Self::KeepAlive),
+            _ => None,
         }
-        if val.eq_ignore_ascii_case("Upgrade") {
-            return Some(Self::Upgrade);
-        }
-        None
     }
 }
 
@@ -28,17 +26,15 @@ pub enum HttpContentType {
 
 impl HttpContentType {
     pub fn from_str(val: &str) -> Option<Self> {
-        if val.eq_ignore_ascii_case("application/json") {
-            return Some(Self::ApplicationJson);
-        }
-        if val.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
-            return Some(Self::ApplicationXWwwFormUrlencoded);
-        }
-        if val.starts_with("multipart/form-data") {
-            if let Some((_, boundary)) = val.split_once("boundary=") {
-                return Some(Self::MultipartFormData(boundary.to_ref_str()));
+        match val.len() {
+            16 if val.eq_ignore_ascii_case("application/json") => Some(Self::ApplicationJson),
+            19 if val.starts_with("multipart/form-data") => val
+                .split_once("boundary=")
+                .map(|(_, boundary)| Self::MultipartFormData(boundary.to_ref_str())),
+            33 if val.eq_ignore_ascii_case("application/x-www-form-urlencoded") => {
+                Some(Self::ApplicationXWwwFormUrlencoded)
             }
+            _ => None,
         }
-        None
     }
 }

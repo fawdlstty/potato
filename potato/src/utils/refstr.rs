@@ -218,14 +218,13 @@ pub enum HeaderItem {
 
 impl Into<HeaderRefStr> for RefStr {
     fn into(self) -> HeaderRefStr {
-        let val = self.to_str().http_std_case();
-        let val_ref = &val[..];
+        let val = self.to_str();
         HeaderRefStr::HeaderItem(match val.len() {
-            7 if val_ref == "Upgrade" => HeaderItem::Upgrade,
-            10 if val_ref == "Connection" => HeaderItem::Connection,
-            12 if val_ref == "Content-Type" => HeaderItem::Content_Type,
-            14 if val_ref == "Content-Length" => HeaderItem::Content_Length,
-            15 if val_ref == "Accept-Encoding" => HeaderItem::Accept_Encoding,
+            7 if val.eq_ignore_ascii_case("Upgrade") => HeaderItem::Upgrade,
+            10 if val.eq_ignore_ascii_case("Connection") => HeaderItem::Connection,
+            12 if val.eq_ignore_ascii_case("Content-Type") => HeaderItem::Content_Type,
+            14 if val.eq_ignore_ascii_case("Content-Length") => HeaderItem::Content_Length,
+            15 if val.eq_ignore_ascii_case("Accept-Encoding") => HeaderItem::Accept_Encoding,
             _ => return HeaderRefStr::RefStr(self),
         })
     }
