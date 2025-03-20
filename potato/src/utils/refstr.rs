@@ -207,6 +207,8 @@ impl Into<HeaderRefStr> for HeaderItem {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum HeaderItem {
+    Date,
+    Server,
     Upgrade,
     Connection,
     Content_Type,
@@ -218,6 +220,8 @@ impl Into<HeaderRefStr> for RefStr {
     fn into(self) -> HeaderRefStr {
         let val = self.to_str();
         HeaderRefStr::HeaderItem(match val.len() {
+            4 if val.eq_ignore_ascii_case("Date") => HeaderItem::Date,
+            6 if val.eq_ignore_ascii_case("Server") => HeaderItem::Server,
             7 if val.eq_ignore_ascii_case("Upgrade") => HeaderItem::Upgrade,
             10 if val.eq_ignore_ascii_case("Connection") => HeaderItem::Connection,
             12 if val.eq_ignore_ascii_case("Content-Type") => HeaderItem::Content_Type,

@@ -61,8 +61,9 @@ impl Session {
             self.uri.host().unwrap_or("localhost")
         );
         self.stream.write_all(req.as_bytes()).await?;
-        let mut buf = vec![];
-        self.stream.read_to_end(&mut buf).await?;
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        self.stream.read_buf(buf)
+        //self.stream.read_to_end(&mut buf).await?;
         panic!()
     }
 }

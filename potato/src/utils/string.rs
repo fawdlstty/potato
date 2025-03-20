@@ -2,11 +2,29 @@ use rand::Rng;
 use std::sync::LazyLock;
 
 pub trait StringExt {
+    fn http_std_case(&self) -> String;
     fn url_decode(&self) -> String;
     fn starts_with_ignore_ascii_case(&self, other: &str) -> bool;
 }
 
 impl StringExt for str {
+    fn http_std_case(&self) -> String {
+        let mut ret = "".to_string();
+        let mut upper = true;
+        for ch in self.chars() {
+            if ch == '-' {
+                upper = true;
+                ret.push(ch);
+            } else if upper {
+                ret.push(ch.to_ascii_uppercase());
+                upper = false;
+            } else {
+                ret.push(ch.to_ascii_lowercase());
+            }
+        }
+        ret
+    }
+
     fn url_decode(&self) -> String {
         let mut ret = vec![];
         let mut chars = self.chars();
@@ -37,6 +55,10 @@ impl StringExt for str {
 }
 
 impl StringExt for String {
+    fn http_std_case(&self) -> String {
+        self[..].http_std_case()
+    }
+
     fn url_decode(&self) -> String {
         self[..].url_decode()
     }
