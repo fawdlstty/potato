@@ -570,7 +570,7 @@ macro_rules! make_resp_by_binary {
                 version: "HTTP/1.1".into(),
                 http_code: 200,
                 headers: [
-                    ("Date".into(), Cow::Owned(Utc::now().to_rfc2822())),
+                    ("Date".into(), Utc::now().to_rfc2822()),
                     ("Server".into(), SERVER_STR.clone()),
                     ("Connection".into(), "keep-alive".into()),
                     ("Content-Type".into(), $cnt_type.into()),
@@ -600,11 +600,7 @@ impl HttpResponse {
         }
     }
 
-    pub fn add_header(
-        &mut self,
-        key: impl Into<Cow<'static, str>>,
-        value: impl Into<Cow<'static, str>>,
-    ) {
+    pub fn add_header(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.headers.insert(key.into(), value.into());
     }
 
@@ -673,7 +669,7 @@ impl HttpResponse {
             version: "HTTP/1.1".into(),
             http_code: 101,
             headers: [
-                ("Date".into(), Cow::Owned(Utc::now().to_rfc2822())),
+                ("Date".into(), Utc::now().to_rfc2822()),
                 ("Server".into(), SERVER_STR.clone()),
                 ("Connection".into(), "Upgrade".into()),
                 ("Upgrade".into(), "websocket".into()),
@@ -733,19 +729,22 @@ impl HttpResponse {
         stream: &mut Box<dyn TcpStreamExt>,
     ) -> anyhow::Result<(Self, usize)> {
         let mut tmp_buf = [0u8; 1024];
-        let (mut req, hdr_len) = loop {
+        let (mut res, hdr_len) = loop {
             let n = stream.read(&mut tmp_buf).await?;
             if n == 0 {
                 return Err(anyhow::Error::msg("connection closed"));
             }
             buf.extend(&tmp_buf[0..n]);
-            match HttpRequest::from_headers_part(&buf[..])? {
+            match HttpResponse::from_headers_part(&buf[..])? {
                 Some(req) => break req,
                 None => continue,
             }
         };
+        let bdy_len = res
+            .headers
+            .get("Content-Length")
+            .map_or(0, |v| v.parse::<usize>().unwrap_or(0));
         todo!()
-        // let bdy_len = req.get_header_content_length();
         // while hdr_len + bdy_len < buf.len() {
         //     let t = stream.read(&mut tmp_buf).await?;
         //     if t == 0 {
@@ -836,15 +835,15 @@ impl HttpResponse {
         };
 
         let mut req = HttpResponse::new();
-        req.version = Cow::Owned(format!("HTTP/1.{}", rres.version.unwrap_or(0)));
+        req.version = format!("HTTP/1.{}", rres.version.unwrap_or(0));
         req.http_code = rres.code.unwrap_or(0);
         for h in rres.headers.iter() {
             if h.name == "" {
                 break;
             }
             req.headers.insert(
-                Cow::Owned(h.name.to_string()),
-                Cow::Owned(str::from_utf8(h.value).unwrap_or("").to_string()),
+                h.name.to_string(),
+                str::from_utf8(h.value).unwrap_or("").to_string(),
             );
         }
         Ok(Some((req, n)))

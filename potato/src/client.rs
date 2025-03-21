@@ -62,8 +62,8 @@ impl Session {
         );
         self.stream.write_all(req.as_bytes()).await?;
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
-        self.stream.read_buf(buf)
-        //self.stream.read_to_end(&mut buf).await?;
+        //self.stream.read_buf(buf)
+        let (res, n) = HttpResponse::from_stream(&mut buf, &mut self.stream).await?;
         panic!()
     }
 }
