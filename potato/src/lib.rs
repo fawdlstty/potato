@@ -6,6 +6,8 @@ pub mod utils;
 
 pub use client::*;
 pub use global_config::*;
+use http::uri::Scheme;
+use http::Uri;
 pub use inventory;
 pub use potato_macro::*;
 pub use regex;
@@ -30,7 +32,7 @@ use utils::bytes::CompressExt;
 use utils::enums::{HttpConnection, HttpContentType};
 use utils::number::HttpCodeExt;
 use utils::refbuf::{RefBuf, ToRefBufExt};
-use utils::refstr::{HeaderItem, HeaderRefStr, RefStr, RefStrOrString, ToRefStrExt};
+use utils::refstr::{HeaderItem, HeaderRefOrString, RefOrString, ToRefStrExt};
 use utils::string::StringExt;
 use utils::tcp_stream::TcpStreamExt;
 
@@ -279,7 +281,7 @@ pub enum WsFrameImpl {
 
 #[derive(Clone, Debug)]
 pub struct PostFile {
-    pub filename: RefStr,
+    pub filename: RefOrString,
     pub data: RefBuf,
 }
 
@@ -288,13 +290,13 @@ unsafe impl Send for PostFile {}
 #[derive(Debug)]
 pub struct HttpRequest {
     pub method: HttpMethod,
-    pub url_path: RefStr,
-    pub url_query: HashMap<RefStr, RefStr>,
+    pub url_path: RefOrString,
+    pub url_query: HashMap<RefOrString, RefOrString>,
     pub version: u8,
-    pub headers: HashMap<HeaderRefStr, RefStr>,
+    pub headers: HashMap<HeaderRefOrString, RefOrString>,
     pub body: RefBuf,
-    pub body_pairs: HashMap<RefStrOrString, RefStrOrString>,
-    pub body_files: HashMap<RefStr, PostFile>,
+    pub body_pairs: HashMap<RefOrString, RefOrString>,
+    pub body_files: HashMap<RefOrString, PostFile>,
 }
 
 unsafe impl Send for HttpRequest {}
@@ -304,7 +306,7 @@ impl HttpRequest {
     pub fn new() -> Self {
         Self {
             method: HttpMethod::GET,
-            url_path: "/".to_ref_str(),
+            url_path: "/".to_ref_string(),
             url_query: HashMap::with_capacity(16),
             version: 11,
             headers: HashMap::with_capacity(16),
@@ -314,13 +316,27 @@ impl HttpRequest {
         }
     }
 
-    pub fn set_header(&mut self, key: RefStr, value: RefStr) {
-        self.headers.insert(key.into(), value);
+    pub fn from_url(url: &str, method: HttpMethod) -> anyhow::Result<(Self, bool, u16)> {
+        let uri = url.parse::<Uri>()?;
+        let mut req = Self::new();
+        req.method = method;
+        req.url_path = uri.path().to_ref_string();
+        req.headers
+            .insert("Host".into(), uri.host().unwrap_or("localhost").into());
+        Ok((
+            req,
+            uri.scheme() == Some(&Scheme::HTTPS),
+            uri.port_u16().unwrap_or(80),
+        ))
+    }
+
+    pub fn set_header(&mut self, key: impl Into<HeaderRefOrString>, value: impl Into<RefOrString>) {
+        self.headers.insert(key.into(), value.into());
     }
 
     pub fn get_header(&self, key: &str) -> Option<&str> {
         self.headers
-            .get(&key.to_ref_str().into())
+            .get(&key.to_ref_string().into())
             .map(|a| a.to_str())
     }
 
@@ -340,6 +356,10 @@ impl HttpRequest {
             };
         }
         CompressMode::None
+    }
+
+    pub fn get_header_host(&self) -> &str {
+        self.get_header_key(HeaderItem::Host).unwrap_or("")
     }
 
     pub fn get_header_connection(&self) -> HttpConnection {
@@ -459,9 +479,9 @@ impl HttpRequest {
                                 for key in keys.into_iter() {
                                     if let Some((k, v)) = key.trim().split_once('=') {
                                         if k == "name" {
-                                            name = Some(v[1..v.len() - 1].to_ref_str());
+                                            name = Some(v[1..v.len() - 1].to_ref_string());
                                         } else if k == "filename" {
-                                            filename = Some(v[1..v.len() - 1].to_ref_str());
+                                            filename = Some(v[1..v.len() - 1].to_ref_string());
                                         }
                                     }
                                 }
@@ -470,7 +490,7 @@ impl HttpRequest {
                                         let data = content.as_bytes().to_ref_buf();
                                         req.body_files.insert(name, PostFile { filename, data });
                                     } else {
-                                        req.body_pairs.insert(name.into(), content.to_ref_string());
+                                        req.body_pairs.insert(name, content.to_ref_string());
                                     }
                                 }
                             }
@@ -512,15 +532,15 @@ impl HttpRequest {
         let url = rreq.path.unwrap();
         match url.find('?') {
             Some(p) => {
-                req.url_path = url[..p].to_ref_str();
+                req.url_path = url[..p].to_ref_string();
                 req.url_query = url[p + 1..]
                     .split('&')
                     .into_iter()
                     .map(|s| s.split_once('=').unwrap_or((s, "")))
-                    .map(|(a, b)| (a.to_ref_str(), b.to_ref_str()))
+                    .map(|(a, b)| (a.to_ref_string(), b.to_ref_string()))
                     .collect();
             }
-            None => req.url_path = url.to_ref_str(),
+            None => req.url_path = url.to_ref_string(),
         }
         req.version = rreq.version.unwrap_or(1) + 10;
         for h in rreq.headers.iter() {
@@ -528,9 +548,13 @@ impl HttpRequest {
                 break;
             }
             req.headers
-                .insert(h.name.to_header_ref_str(), h.value.to_ref_str());
+                .insert(h.name.to_header_ref_string(), h.value.to_ref_string());
         }
         Ok(Some((req, n)))
+    }
+
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut req_str = format!("{} {} HTTP/1.1\r\n", self.method, self.url_path.to_str());
     }
 }
 

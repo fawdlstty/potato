@@ -81,19 +81,19 @@ impl PartialEq for RefStr {
 
 pub trait ToRefStrExt {
     fn to_ref_str(&self) -> RefStr;
-    fn to_ref_string(&self) -> RefStrOrString;
-    fn to_header_ref_str(&self) -> HeaderRefStr;
+    fn to_ref_string(&self) -> RefOrString;
+    fn to_header_ref_string(&self) -> HeaderRefOrString;
 }
 
 impl ToRefStrExt for str {
     fn to_ref_str(&self) -> RefStr {
         RefStr::from_str(self)
     }
-    fn to_ref_string(&self) -> RefStrOrString {
+    fn to_ref_string(&self) -> RefOrString {
         self.to_ref_str().into()
     }
-    fn to_header_ref_str(&self) -> HeaderRefStr {
-        self.to_ref_str().into()
+    fn to_header_ref_string(&self) -> HeaderRefOrString {
+        self.to_ref_string().into()
     }
 }
 
@@ -101,59 +101,78 @@ impl ToRefStrExt for [u8] {
     fn to_ref_str(&self) -> RefStr {
         RefStr::from_str(unsafe { std::str::from_utf8_unchecked(self) })
     }
-    fn to_ref_string(&self) -> RefStrOrString {
+    fn to_ref_string(&self) -> RefOrString {
         self.to_ref_str().into()
     }
-    fn to_header_ref_str(&self) -> HeaderRefStr {
-        self.to_ref_str().into()
+    fn to_header_ref_string(&self) -> HeaderRefOrString {
+        self.to_ref_string().into()
     }
 }
 
-#[derive(Debug, Eq)]
-pub enum RefStrOrString {
+#[derive(Clone, Debug, Eq)]
+pub enum RefOrString {
     RefStr(RefStr),
     String(String),
 }
 
-impl RefStrOrString {
+impl RefOrString {
     pub fn from_str(val: &str) -> Self {
-        RefStrOrString::RefStr(RefStr::from_str(val))
+        RefOrString::RefStr(RefStr::from_str(val))
     }
 
     pub fn to_bytes(&self) -> &[u8] {
         match self {
-            RefStrOrString::RefStr(ref_str) => ref_str.to_bytes(),
-            RefStrOrString::String(str) => str.as_bytes(),
+            RefOrString::RefStr(ref_str) => ref_str.to_bytes(),
+            RefOrString::String(str) => str.as_bytes(),
+        }
+    }
+
+    pub fn to_str(&self) -> &str {
+        match self {
+            RefOrString::RefStr(ref_str) => ref_str.to_str(),
+            RefOrString::String(str) => str.as_str(),
         }
     }
 
     pub fn to_string(&self) -> String {
         match self {
-            RefStrOrString::RefStr(ref_str) => ref_str.to_str().to_string(),
-            RefStrOrString::String(str) => str.clone(),
+            RefOrString::RefStr(ref_str) => ref_str.to_str().to_string(),
+            RefOrString::String(str) => str.clone(),
         }
     }
 }
 
-unsafe impl Send for RefStrOrString {}
+unsafe impl Send for RefOrString {}
 
-impl Into<RefStrOrString> for String {
-    fn into(self) -> RefStrOrString {
-        RefStrOrString::String(self)
+impl std::fmt::Display for RefOrString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_str().fmt(f)
     }
 }
 
-impl Into<RefStrOrString> for RefStr {
-    fn into(self) -> RefStrOrString {
-        RefStrOrString::RefStr(self)
+impl Into<RefOrString> for String {
+    fn into(self) -> RefOrString {
+        RefOrString::String(self)
     }
 }
 
-impl std::hash::Hash for RefStrOrString {
+impl Into<RefOrString> for RefStr {
+    fn into(self) -> RefOrString {
+        RefOrString::RefStr(self)
+    }
+}
+
+impl Into<RefOrString> for &str {
+    fn into(self) -> RefOrString {
+        self.to_ref_string()
+    }
+}
+
+impl std::hash::Hash for RefOrString {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
-            RefStrOrString::RefStr(ref_str) => ref_str.hash(state),
-            RefStrOrString::String(str) => {
+            RefOrString::RefStr(ref_str) => ref_str.hash(state),
+            RefOrString::String(str) => {
                 for &ch in str.as_bytes() {
                     state.write_u8(match ch >= b'A' && ch <= b'Z' {
                         true => ch - b'A' + b'a',
@@ -166,7 +185,7 @@ impl std::hash::Hash for RefStrOrString {
     }
 }
 
-impl PartialEq for RefStrOrString {
+impl PartialEq for RefOrString {
     fn eq(&self, other: &Self) -> bool {
         let (slice1, slice2) = (self.to_bytes(), other.to_bytes());
         if slice1.len() != slice2.len() {
@@ -188,26 +207,27 @@ impl PartialEq for RefStrOrString {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum HeaderRefStr {
+pub enum HeaderRefOrString {
     HeaderItem(HeaderItem),
-    RefStr(RefStr),
+    RefOrString(RefOrString),
 }
 
-impl HeaderRefStr {
+impl HeaderRefOrString {
     pub fn from_str(val: &str) -> Self {
-        val.to_ref_str().into()
+        val.to_ref_string().into()
     }
 }
 
-impl Into<HeaderRefStr> for HeaderItem {
-    fn into(self) -> HeaderRefStr {
-        HeaderRefStr::HeaderItem(self)
+impl Into<HeaderRefOrString> for HeaderItem {
+    fn into(self) -> HeaderRefOrString {
+        HeaderRefOrString::HeaderItem(self)
     }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum HeaderItem {
     Date,
+    Host,
     Server,
     Upgrade,
     Connection,
@@ -216,18 +236,25 @@ pub enum HeaderItem {
     Accept_Encoding,
 }
 
-impl Into<HeaderRefStr> for RefStr {
-    fn into(self) -> HeaderRefStr {
+impl Into<HeaderRefOrString> for RefOrString {
+    fn into(self) -> HeaderRefOrString {
         let val = self.to_str();
-        HeaderRefStr::HeaderItem(match val.len() {
+        HeaderRefOrString::HeaderItem(match val.len() {
             4 if val.eq_ignore_ascii_case("Date") => HeaderItem::Date,
+            4 if val.eq_ignore_ascii_case("Host") => HeaderItem::Host,
             6 if val.eq_ignore_ascii_case("Server") => HeaderItem::Server,
             7 if val.eq_ignore_ascii_case("Upgrade") => HeaderItem::Upgrade,
             10 if val.eq_ignore_ascii_case("Connection") => HeaderItem::Connection,
             12 if val.eq_ignore_ascii_case("Content-Type") => HeaderItem::Content_Type,
             14 if val.eq_ignore_ascii_case("Content-Length") => HeaderItem::Content_Length,
             15 if val.eq_ignore_ascii_case("Accept-Encoding") => HeaderItem::Accept_Encoding,
-            _ => return HeaderRefStr::RefStr(self),
+            _ => return HeaderRefOrString::RefOrString(self),
         })
+    }
+}
+
+impl Into<HeaderRefOrString> for &str {
+    fn into(self) -> HeaderRefOrString {
+        self.to_ref_string().into()
     }
 }

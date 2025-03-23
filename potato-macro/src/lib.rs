@@ -120,7 +120,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 "PostFile" => {
                     doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                     quote! {
-                        match req.body_files.get(&potato::utils::refstr::RefStr::from_str(#arg_name_str)).cloned() {
+                        match req.body_files.get(&potato::utils::refstr::RefOrString::from_str(#arg_name_str)).cloned() {
                             Some(file) => file,
                             None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
                         }
@@ -138,7 +138,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         arg_auth_mark = true;
                         quote! {
                             match req.headers
-                                .get(&potato::utils::refstr::HeaderRefStr::from_str("Authorization"))
+                                .get(&potato::utils::refstr::HeaderRefOrString::from_str("Authorization"))
                                 .map(|v| v.to_str()) {
                                 Some(mut auth) => {
                                     if auth.starts_with("Bearer ") {
@@ -156,11 +156,11 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                         let mut arg_value = quote! {
                             match req.body_pairs
-                                .get(&potato::utils::refstr::RefStrOrString::from_str(#arg_name_str))
+                                .get(&potato::utils::refstr::RefOrString::from_str(#arg_name_str))
                                 .map(|p| p.to_string()) {
                                 Some(val) => val,
                                 None => match req.url_query
-                                    .get(&potato::utils::refstr::RefStr::from_str(#arg_name_str))
+                                    .get(&potato::utils::refstr::RefOrString::from_str(#arg_name_str))
                                     .map(|p| p.to_str().to_string()) {
                                     Some(val) => val,
                                     None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
