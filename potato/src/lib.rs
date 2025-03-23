@@ -399,12 +399,12 @@ impl HttpRequest {
             }
             buf.extend(&tmp_buf[0..n]);
             match HttpRequest::from_headers_part(&buf[..])? {
-                Some(req) => break req,
+                Some((req, hdr_len)) => break (req, hdr_len),
                 None => continue,
             }
         };
         let bdy_len = req.get_header_content_length();
-        while hdr_len + bdy_len < buf.len() {
+        while hdr_len + bdy_len > buf.len() {
             let t = stream.read(&mut tmp_buf).await?;
             if t == 0 {
                 return Err(anyhow::Error::msg("connection closed"));
@@ -539,14 +539,14 @@ pub struct HttpResponse {
     pub version: String,
     pub http_code: u16,
     pub headers: HashMap<String, String>,
-    pub payload: Vec<u8>,
+    pub body: Vec<u8>,
 }
 unsafe impl Send for HttpResponse {}
 
 macro_rules! make_resp_by_text {
     ($fn_name:ident, $cnt_type:expr) => {
-        pub fn $fn_name(payload: impl Into<String>) -> Self {
-            let payload = payload.into();
+        pub fn $fn_name(body: impl Into<String>) -> Self {
+            let body = body.into();
             Self {
                 version: "HTTP/1.1".into(),
                 http_code: 200,
@@ -557,7 +557,7 @@ macro_rules! make_resp_by_text {
                     ("Content-Type".into(), $cnt_type.into()),
                 ]
                 .into(),
-                payload: payload.as_bytes().to_vec(),
+                body: body.as_bytes().to_vec(),
             }
         }
     };
@@ -565,7 +565,7 @@ macro_rules! make_resp_by_text {
 
 macro_rules! make_resp_by_binary {
     ($fn_name:ident, $cnt_type:expr) => {
-        pub fn $fn_name(payload: &[u8]) -> Self {
+        pub fn $fn_name(body: &[u8]) -> Self {
             Self {
                 version: "HTTP/1.1".into(),
                 http_code: 200,
@@ -576,7 +576,7 @@ macro_rules! make_resp_by_binary {
                     ("Content-Type".into(), $cnt_type.into()),
                 ]
                 .into(),
-                payload: payload.to_vec(),
+                body: body.to_vec(),
             }
         }
     };
@@ -596,7 +596,7 @@ impl HttpResponse {
             version: "".into(),
             http_code: 0,
             headers: HashMap::with_capacity(16),
-            payload: vec![],
+            body: vec![],
         }
     }
 
@@ -653,7 +653,7 @@ impl HttpResponse {
                 );
             }
         }
-        ret.payload = data;
+        ret.body = data;
         ret
     }
 
@@ -676,7 +676,7 @@ impl HttpResponse {
                 ("Sec-WebSocket-Accept".into(), ws_accept.into()),
             ]
             .into(),
-            payload: vec![],
+            body: vec![],
         }
     }
 
@@ -684,21 +684,21 @@ impl HttpResponse {
         #[allow(unused_assignments)]
         let mut payload_tmp = vec![];
         let payload_ref = match cmode {
-            CompressMode::Gzip if self.payload.len() >= 32 => match self.payload.compress() {
+            CompressMode::Gzip if self.body.len() >= 32 => match self.body.compress() {
                 Ok(data) => {
                     payload_tmp = data;
                     &payload_tmp
                 }
                 Err(_) => {
                     cmode = CompressMode::None;
-                    &self.payload
+                    &self.body
                 }
             },
             CompressMode::Gzip => {
                 cmode = CompressMode::None;
-                &self.payload
+                &self.body
             }
-            _ => &self.payload,
+            _ => &self.body,
         };
         //
         let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
@@ -736,7 +736,7 @@ impl HttpResponse {
             }
             buf.extend(&tmp_buf[0..n]);
             match HttpResponse::from_headers_part(&buf[..])? {
-                Some(req) => break req,
+                Some((res, hdr_len)) => break (res, hdr_len),
                 None => continue,
             }
         };
@@ -744,83 +744,15 @@ impl HttpResponse {
             .headers
             .get("Content-Length")
             .map_or(0, |v| v.parse::<usize>().unwrap_or(0));
-        todo!()
-        // while hdr_len + bdy_len < buf.len() {
-        //     let t = stream.read(&mut tmp_buf).await?;
-        //     if t == 0 {
-        //         return Err(anyhow::Error::msg("connection closed"));
-        //     }
-        //     buf.extend(&tmp_buf[0..t]);
-        // }
-        // req.body = buf[hdr_len..hdr_len + bdy_len].to_ref_buf();
-        // if let Some(cnt_type) = req.get_header_content_type() {
-        //     match cnt_type {
-        //         HttpContentType::ApplicationJson => {
-        //             if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
-        //                 if let Ok(root) = serde_json::from_str::<serde_json::Value>(&body_str) {
-        //                     if let serde_json::Value::Object(obj) = root {
-        //                         for (k, v) in obj {
-        //                             req.body_pairs.insert(k.into(), v.to_string().into());
-        //                         }
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //         HttpContentType::ApplicationXWwwFormUrlencoded => {
-        //             if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
-        //                 body_str.split('&').for_each(|s| {
-        //                     if let Some((a, b)) = s.split_once('=') {
-        //                         req.body_pairs
-        //                             .insert(a.url_decode().into(), b.url_decode().into());
-        //                     }
-        //                 });
-        //             }
-        //         }
-        //         HttpContentType::MultipartFormData(boundary) => {
-        //             let boundary = boundary.to_str();
-        //             if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
-        //                 let split_str = ssformat!(64, "--{boundary}");
-        //                 for mut s in body_str.split(split_str.as_str()) {
-        //                     if s == "--" {
-        //                         break;
-        //                     }
-        //                     if s.ends_with("\r\n") {
-        //                         s = &s[..s.len() - 2];
-        //                     }
-        //                     if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
-        //                         let keys: Vec<&str> = key_str
-        //                             .split("\r\n")
-        //                             .map(|p| p.split(";").collect::<Vec<_>>())
-        //                             .collect::<Vec<_>>()
-        //                             .into_iter()
-        //                             .flatten()
-        //                             .collect();
-        //                         let mut name = None;
-        //                         let mut filename = None;
-        //                         for key in keys.into_iter() {
-        //                             if let Some((k, v)) = key.trim().split_once('=') {
-        //                                 if k == "name" {
-        //                                     name = Some(v[1..v.len() - 1].to_ref_str());
-        //                                 } else if k == "filename" {
-        //                                     filename = Some(v[1..v.len() - 1].to_ref_str());
-        //                                 }
-        //                             }
-        //                         }
-        //                         if let Some(name) = name {
-        //                             if let Some(filename) = filename {
-        //                                 let data = content.as_bytes().to_ref_buf();
-        //                                 req.body_files.insert(name, PostFile { filename, data });
-        //                             } else {
-        //                                 req.body_pairs.insert(name.into(), content.to_ref_string());
-        //                             }
-        //                         }
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
-        // Ok((req, hdr_len + bdy_len))
+        while hdr_len + bdy_len > buf.len() {
+            let t = stream.read(&mut tmp_buf).await?;
+            if t == 0 {
+                return Err(anyhow::Error::msg("connection closed"));
+            }
+            buf.extend(&tmp_buf[0..t]);
+        }
+        res.body = buf[hdr_len..hdr_len + bdy_len].to_vec(); // to_ref_buf
+        Ok((res, hdr_len + bdy_len))
     }
 
     pub fn from_headers_part(buf: &[u8]) -> anyhow::Result<Option<(Self, usize)>> {
@@ -842,7 +774,7 @@ impl HttpResponse {
                 break;
             }
             req.headers.insert(
-                h.name.to_string(),
+                h.name.http_std_case(),
                 str::from_utf8(h.value).unwrap_or("").to_string(),
             );
         }

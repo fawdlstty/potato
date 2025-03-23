@@ -123,6 +123,9 @@ async fn main() -> anyhow::Result<()> {
     });
     println!("visit: http://127.0.0.1:8080/doc/");
     server.serve_http().await
+    // let r = potato::get("http://127.0.0.1:8081/hello").await?;
+    // println!("{}", unsafe { String::from_utf8_unchecked(r.body) });
+    // Ok(())
 }
 
 // cargo run -p potato

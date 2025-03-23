@@ -3,7 +3,7 @@ use crate::HttpResponse;
 use http::uri::Scheme;
 use http::Uri;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -50,21 +50,24 @@ impl Session {
         Ok(Self { uri, stream })
     }
 
-    pub async fn get(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
+    async fn http_request(&mut self, method: &str, url: &str) -> anyhow::Result<HttpResponse> {
         let uri = url.parse::<Uri>()?;
         if !self.is_same_host(&uri) {
             *self = Self::new(url).await?;
         }
         let req = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+            "{method} {} HTTP/1.1\r\nHost: {}\r\n\r\n",
             uri.path(),
             self.uri.host().unwrap_or("localhost")
         );
         self.stream.write_all(req.as_bytes()).await?;
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
-        //self.stream.read_buf(buf)
-        let (res, n) = HttpResponse::from_stream(&mut buf, &mut self.stream).await?;
-        panic!()
+        let (res, _) = HttpResponse::from_stream(&mut buf, &mut self.stream).await?;
+        Ok(res)
+    }
+
+    pub async fn get(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
+        self.http_request("GET", url).await
     }
 }
 
