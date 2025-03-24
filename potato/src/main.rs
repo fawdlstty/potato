@@ -112,20 +112,20 @@ async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Re
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    //jemalloc_active_prof(true);
-    ServerConfig::set_jwt_secret("AAABBBCCC").await;
-    let mut server = HttpServer::new("0.0.0.0:8080");
-    server.configure(|ctx| {
-        ctx.use_dispatch();
-        ctx.use_doc("/doc/");
-        //ctx.use_embedded_route("/", embed_dir!("assets/wwwroot"));
-        //ctx.use_location_route("/", "/wwwroot");
-    });
-    println!("visit: http://127.0.0.1:8080/doc/");
-    server.serve_http().await
-    // let r = potato::get("http://127.0.0.1:8081/hello").await?;
-    // println!("{}", unsafe { String::from_utf8_unchecked(r.body) });
-    // Ok(())
+    // //jemalloc_active_prof(true);
+    // ServerConfig::set_jwt_secret("AAABBBCCC").await;
+    // let mut server = HttpServer::new("0.0.0.0:8080");
+    // server.configure(|ctx| {
+    //     ctx.use_dispatch();
+    //     ctx.use_doc("/doc/");
+    //     //ctx.use_embedded_route("/", embed_dir!("assets/wwwroot"));
+    //     //ctx.use_location_route("/", "/wwwroot");
+    // });
+    // println!("visit: http://127.0.0.1:8080/doc/");
+    // server.serve_http().await
+    let r = potato::get("https://www.fawdlstty.com").await?;
+    println!("{}", unsafe { String::from_utf8_unchecked(r.body) });
+    Ok(())
 }
 
 // cargo run -p potato

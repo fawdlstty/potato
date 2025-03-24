@@ -1,5 +1,7 @@
 #![allow(non_camel_case_types)]
 
+use strum::Display;
+
 #[derive(Clone, Eq)]
 pub struct RefStr {
     ptr: *const u8,
@@ -216,6 +218,13 @@ impl HeaderRefOrString {
     pub fn from_str(val: &str) -> Self {
         val.to_ref_string().into()
     }
+
+    pub fn to_string(&self) -> String {
+        match self {
+            HeaderRefOrString::HeaderItem(header_item) => header_item.to_string(),
+            HeaderRefOrString::RefOrString(ref_or_string) => ref_or_string.to_string(),
+        }
+    }
 }
 
 impl Into<HeaderRefOrString> for HeaderItem {
@@ -224,7 +233,7 @@ impl Into<HeaderRefOrString> for HeaderItem {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Display, Eq, Hash, PartialEq)]
 pub enum HeaderItem {
     Date,
     Host,

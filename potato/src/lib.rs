@@ -555,6 +555,21 @@ impl HttpRequest {
 
     pub fn as_bytes(&self) -> Vec<u8> {
         let mut req_str = format!("{} {} HTTP/1.1\r\n", self.method, self.url_path.to_str());
+        for (k, v) in self.headers.iter() {
+            if let HeaderRefOrString::HeaderItem(HeaderItem::Content_Length) = k {
+                continue;
+            }
+            req_str.push_str(&format!("{}: {}\r\n", k.to_string(), v.to_str()));
+        }
+        req_str.push_str(&format!(
+            "{}: {}\r\n",
+            HeaderItem::Content_Length.to_string(),
+            self.body.to_buf().len()
+        ));
+        req_str.push_str("\r\n");
+        let mut ret = req_str.as_bytes().to_vec();
+        ret.extend(self.body.to_buf());
+        ret
     }
 }
 
