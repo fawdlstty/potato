@@ -15,7 +15,7 @@ pub use rust_embed;
 pub use serde_json;
 pub use server::*;
 
-use anyhow::Error;
+use anyhow::{anyhow, Error};
 use chrono::Utc;
 use core::str;
 use rust_embed::Embed;
@@ -34,7 +34,7 @@ use utils::number::HttpCodeExt;
 use utils::refbuf::{RefBuf, ToRefBufExt};
 use utils::refstr::{HeaderItem, HeaderRefOrString, RefOrString, ToRefStrExt};
 use utils::string::StringExt;
-use utils::tcp_stream::TcpStreamExt;
+use utils::tcp_stream::{TcpStreamExt, VecU8Ext};
 
 static SERVER_STR: LazyLock<String> =
     LazyLock::new(|| format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
@@ -573,7 +573,7 @@ impl HttpRequest {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct HttpResponse {
     pub version: String,
     pub http_code: u16,
@@ -767,30 +767,63 @@ impl HttpResponse {
         buf: &mut Vec<u8>,
         stream: &mut Box<dyn TcpStreamExt>,
     ) -> anyhow::Result<(Self, usize)> {
-        let mut tmp_buf = [0u8; 1024];
         let (mut res, hdr_len) = loop {
-            let n = stream.read(&mut tmp_buf).await?;
-            if n == 0 {
-                return Err(anyhow::Error::msg("connection closed"));
-            }
-            buf.extend(&tmp_buf[0..n]);
+            buf.extend_by_streams(stream).await?;
             match HttpResponse::from_headers_part(&buf[..])? {
                 Some((res, hdr_len)) => break (res, hdr_len),
                 None => continue,
             }
         };
-        let bdy_len = res
-            .headers
-            .get("Content-Length")
-            .map_or(0, |v| v.parse::<usize>().unwrap_or(0));
-        while hdr_len + bdy_len > buf.len() {
-            let t = stream.read(&mut tmp_buf).await?;
-            if t == 0 {
-                return Err(anyhow::Error::msg("connection closed"));
+        let mut bdy_len = 0;
+        if let Some(cnt_len) = res.headers.get("Content-Length") {
+            bdy_len = cnt_len.parse::<usize>().unwrap_or(0);
+            while hdr_len + bdy_len > buf.len() {
+                buf.extend_by_streams(stream).await?;
             }
-            buf.extend(&tmp_buf[0..t]);
+            res.body = buf[hdr_len..hdr_len + bdy_len].to_vec(); // to_ref_buf
+        } else if res.headers.get("Transfer-Encoding") == Some(&"chunked".to_string()) {
+            loop {
+                let chunked_len = {
+                    let mut chunked_len = 0;
+                    let mut is_fin = false;
+                    for c in buf[(hdr_len + bdy_len)..].iter() {
+                        bdy_len += 1;
+                        match *c {
+                            b'\r' => continue,
+                            b'\n' => {
+                                is_fin = true;
+                                break;
+                            }
+                            b'0'..=b'9' => chunked_len = chunked_len * 16 + (*c - b'0') as usize,
+                            b'a'..=b'z' => {
+                                chunked_len = chunked_len * 16 + (*c - b'a' + 10) as usize
+                            }
+                            b'A'..=b'Z' => {
+                                chunked_len = chunked_len * 16 + (*c - b'A' + 10) as usize
+                            }
+                            _ => Err(anyhow!("unexpected char: {}", *c as char))?,
+                        }
+                    }
+                    if !is_fin {
+                        buf.extend_by_streams(stream).await?;
+                        continue;
+                    }
+                    chunked_len
+                };
+                println!("chunked_len: {chunked_len}");
+                if chunked_len == 0 {
+                    bdy_len += 2;
+                    break;
+                }
+                while hdr_len + bdy_len + chunked_len + 2 > buf.len() {
+                    buf.extend_by_streams(stream).await?;
+                }
+                res.body
+                    .extend(&buf[(hdr_len + bdy_len)..(hdr_len + bdy_len + chunked_len)]);
+                bdy_len += chunked_len + 2;
+            }
         }
-        res.body = buf[hdr_len..hdr_len + bdy_len].to_vec(); // to_ref_buf
+
         Ok((res, hdr_len + bdy_len))
     }
 
@@ -818,6 +851,10 @@ impl HttpResponse {
             );
         }
         Ok(Some((req, n)))
+    }
+
+    pub fn get_header(&self, key: &str) -> Option<&str> {
+        self.headers.get(key).map(|a| a.as_str())
     }
 }
 

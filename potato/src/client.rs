@@ -17,10 +17,10 @@ impl SessionImpl {
     pub async fn new(host: String, use_ssl: bool, port: u16) -> anyhow::Result<Self> {
         let stream: Box<dyn TcpStreamExt> = match use_ssl {
             true => {
-                let mut root_cert_store = RootCertStore::empty();
-                root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let mut root_cert = RootCertStore::empty();
+                root_cert.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 let config = ClientConfig::builder()
-                    .with_root_certificates(root_cert_store)
+                    .with_root_certificates(root_cert)
                     .with_no_client_auth();
                 let connector = TlsConnector::from(Arc::new(config));
                 let dnsname = ServerName::try_from(host.clone())?;

@@ -92,7 +92,7 @@ impl ToRefStrExt for str {
         RefStr::from_str(self)
     }
     fn to_ref_string(&self) -> RefOrString {
-        self.to_ref_str().into()
+        RefOrString::String(self.to_string())
     }
     fn to_header_ref_string(&self) -> HeaderRefOrString {
         self.to_ref_string().into()
@@ -104,7 +104,7 @@ impl ToRefStrExt for [u8] {
         RefStr::from_str(unsafe { std::str::from_utf8_unchecked(self) })
     }
     fn to_ref_string(&self) -> RefOrString {
-        self.to_ref_str().into()
+        RefOrString::String(unsafe { std::str::from_utf8_unchecked(self) }.to_string())
     }
     fn to_header_ref_string(&self) -> HeaderRefOrString {
         self.to_ref_string().into()
@@ -243,6 +243,7 @@ pub enum HeaderItem {
     Content_Type,
     Content_Length,
     Accept_Encoding,
+    Transfer_Encoding,
 }
 
 impl Into<HeaderRefOrString> for RefOrString {
@@ -257,6 +258,7 @@ impl Into<HeaderRefOrString> for RefOrString {
             12 if val.eq_ignore_ascii_case("Content-Type") => HeaderItem::Content_Type,
             14 if val.eq_ignore_ascii_case("Content-Length") => HeaderItem::Content_Length,
             15 if val.eq_ignore_ascii_case("Accept-Encoding") => HeaderItem::Accept_Encoding,
+            17 if val.eq_ignore_ascii_case("Transfer-Encoding") => HeaderItem::Transfer_Encoding,
             _ => return HeaderRefOrString::RefOrString(self),
         })
     }
