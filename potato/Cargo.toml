@@ -41,6 +41,6 @@ strum = { version = "0.26.3", features = ["derive"] }
 #    "unprefixed_malloc_on_supported_platforms",
 #    "background_threads",
 #] }
-tokio = { version = "1.42.0", features = ["full"] }
-tokio-rustls = { version = "0.26.1", default-features = false, features = ["ring", "tls12"] }
-webpki-roots = "0.26.7"
+tokio = { version = "1.44.1", features = ["full"] }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "0.26.8"

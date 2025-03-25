@@ -559,11 +559,11 @@ impl HttpRequest {
             if let HeaderRefOrString::HeaderItem(HeaderItem::Content_Length) = k {
                 continue;
             }
-            req_str.push_str(&format!("{}: {}\r\n", k.to_string(), v.to_str()));
+            req_str.push_str(&format!("{}: {}\r\n", k.to_str(), v.to_str()));
         }
         req_str.push_str(&format!(
             "{}: {}\r\n",
-            HeaderItem::Content_Length.to_string(),
+            HeaderItem::Content_Length.to_str(),
             self.body.to_buf().len()
         ));
         req_str.push_str("\r\n");

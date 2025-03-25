@@ -1,7 +1,5 @@
 #![allow(non_camel_case_types)]
 
-use strum::Display;
-
 #[derive(Clone, Eq)]
 pub struct RefStr {
     ptr: *const u8,
@@ -219,10 +217,10 @@ impl HeaderRefOrString {
         val.to_ref_string().into()
     }
 
-    pub fn to_string(&self) -> String {
+    pub fn to_str(&self) -> &str {
         match self {
-            HeaderRefOrString::HeaderItem(header_item) => header_item.to_string(),
-            HeaderRefOrString::RefOrString(ref_or_string) => ref_or_string.to_string(),
+            HeaderRefOrString::HeaderItem(header_item) => header_item.to_str(),
+            HeaderRefOrString::RefOrString(ref_or_string) => ref_or_string.to_str(),
         }
     }
 }
@@ -233,7 +231,7 @@ impl Into<HeaderRefOrString> for HeaderItem {
     }
 }
 
-#[derive(Clone, Debug, Display, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum HeaderItem {
     Date,
     Host,
@@ -244,6 +242,23 @@ pub enum HeaderItem {
     Content_Length,
     Accept_Encoding,
     Transfer_Encoding,
+}
+
+impl HeaderItem {
+    pub fn to_str(&self) -> &str {
+        match self {
+            HeaderItem::Date => "Date",
+            HeaderItem::Host => "Host",
+            HeaderItem::Server => "Server",
+            HeaderItem::Upgrade => "Upgrade",
+            HeaderItem::Connection => "Connection",
+            HeaderItem::Content_Type => "Content-Type",
+            HeaderItem::Content_Length => "Content-Length",
+            HeaderItem::Accept_Encoding => "Accept-Encoding",
+            HeaderItem::Transfer_Encoding => "Transfer-Encoding",
+            _ => "Unknown",
+        }
+    }
 }
 
 impl Into<HeaderRefOrString> for RefOrString {
