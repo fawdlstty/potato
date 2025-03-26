@@ -1,10 +1,12 @@
+mod utils;
+
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::{quote, ToTokens};
 use rand::Rng;
 use serde_json::json;
 use std::{collections::HashSet, sync::LazyLock};
-use syn::{parse_macro_input, FnArg, ItemFn, LitStr};
+use utils::StringExt as _;
 
 static ARG_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
@@ -24,7 +26,7 @@ fn random_ident() -> Ident {
 fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> TokenStream {
     let req_name = Ident::new(req_name, Span::call_site());
     let (route_path, oauth_arg) = {
-        let mut oroute_path = syn::parse::<LitStr>(attr.clone())
+        let mut oroute_path = syn::parse::<syn::LitStr>(attr.clone())
             .ok()
             .map(|path| path.value());
         let mut oauth_arg = None;
@@ -33,7 +35,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             let http_parser = syn::meta::parser(|meta| {
                 if meta.path.is_ident("path") {
                     if let Ok(arg) = meta.value() {
-                        if let Ok(route_path) = arg.parse::<LitStr>() {
+                        if let Ok(route_path) = arg.parse::<syn::LitStr>() {
                             let route_path = route_path.value();
                             oroute_path = Some(route_path);
                         }
@@ -50,7 +52,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     Err(meta.error("unsupported annotation property"))
                 }
             });
-            parse_macro_input!(attr with http_parser);
+            syn::parse_macro_input!(attr with http_parser);
         }
         if oroute_path.is_none() {
             panic!("`path` argument is required");
@@ -61,7 +63,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
         (route_path, oauth_arg)
     };
-    let root_fn = parse_macro_input!(input as ItemFn);
+    let root_fn = syn::parse_macro_input!(input as syn::ItemFn);
     let doc_show = {
         let mut doc_show = true;
         for attr in root_fn.attrs.iter() {
@@ -105,7 +107,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let mut doc_args = vec![];
     let mut arg_auth_mark = false;
     for arg in root_fn.sig.inputs.iter() {
-        if let FnArg::Typed(arg) = arg {
+        if let syn::FnArg::Typed(arg) = arg {
             let arg_type_str = arg
                 .ty
                 .as_ref()
@@ -277,28 +279,9 @@ pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "HEAD")
 }
 
-trait StringExt {
-    fn type_simplify(&self) -> String;
-}
-
-impl StringExt for String {
-    fn type_simplify(&self) -> String {
-        let ret = self
-            .replace("potato :: ", "")
-            .replace("std :: ", "")
-            .replace("net :: ", "")
-            .replace("anyhow :: ", "")
-            .replace("-> ", "");
-        match ret.is_empty() {
-            true => "()".to_string(),
-            false => ret,
-        }
-    }
-}
-
 #[proc_macro]
 pub fn embed_dir(input: TokenStream) -> TokenStream {
-    let path = parse_macro_input!(input as LitStr).value();
+    let path = syn::parse_macro_input!(input as syn::LitStr).value();
     quote! {{
         #[derive(potato::rust_embed::Embed)]
         #[folder = #path]
@@ -306,5 +289,41 @@ pub fn embed_dir(input: TokenStream) -> TokenStream {
 
         potato::load_embed::<Asset>()
     }}
+    .into()
+}
+
+#[proc_macro_derive(StandardHeader)]
+pub fn standard_header_derive(input: TokenStream) -> TokenStream {
+    let root_enum = syn::parse_macro_input!(input as syn::ItemEnum);
+    let enum_name = root_enum.ident;
+    let mut try_from_str_items = vec![];
+    let mut to_str_items = vec![];
+    for root_field in root_enum.variants.iter() {
+        let name = root_field.ident.clone();
+        if root_field.fields.iter().next().is_some() {
+            panic!("unsupported enum type");
+        }
+        let str_name = name.to_string().http_std_case();
+        let len = str_name.len();
+        try_from_str_items
+            .push(quote! { #len if value.eq_ignore_ascii_case(#str_name) => Some(Self::#name), });
+        to_str_items.push(quote! { Self::#name => #str_name, });
+    }
+    quote! {
+        impl #enum_name {
+            pub fn try_from_str(value: &str) -> Option<Self> {
+                match value.len() {
+                    #( #try_from_str_items )*
+                    _ => None,
+                }
+            }
+
+            pub fn to_str(&self) -> &'static str {
+                match self {
+                    #( #to_str_items )*
+                }
+            }
+        }
+    }
     .into()
 }

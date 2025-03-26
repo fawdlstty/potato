@@ -323,11 +323,9 @@ impl HttpRequest {
         req.url_path = uri.path().to_ref_string();
         req.headers
             .insert("Host".into(), uri.host().unwrap_or("localhost").into());
-        Ok((
-            req,
-            uri.scheme() == Some(&Scheme::HTTPS),
-            uri.port_u16().unwrap_or(80),
-        ))
+        let use_ssl = uri.scheme() == Some(&Scheme::HTTPS);
+        let port = uri.port_u16().unwrap_or(if use_ssl { 443 } else { 80 });
+        Ok((req, use_ssl, port))
     }
 
     pub fn set_header(&mut self, key: impl Into<HeaderRefOrString>, value: impl Into<RefOrString>) {
@@ -810,7 +808,6 @@ impl HttpResponse {
                     }
                     chunked_len
                 };
-                println!("chunked_len: {chunked_len}");
                 if chunked_len == 0 {
                     bdy_len += 2;
                     break;

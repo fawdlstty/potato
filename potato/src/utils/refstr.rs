@@ -1,4 +1,5 @@
 #![allow(non_camel_case_types)]
+use potato_macro::StandardHeader;
 
 #[derive(Clone, Eq)]
 pub struct RefStr {
@@ -231,51 +232,26 @@ impl Into<HeaderRefOrString> for HeaderItem {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, StandardHeader)]
 pub enum HeaderItem {
     Date,
     Host,
     Server,
     Upgrade,
     Connection,
+    User_Agent,
     Content_Type,
     Content_Length,
     Accept_Encoding,
     Transfer_Encoding,
 }
 
-impl HeaderItem {
-    pub fn to_str(&self) -> &str {
-        match self {
-            HeaderItem::Date => "Date",
-            HeaderItem::Host => "Host",
-            HeaderItem::Server => "Server",
-            HeaderItem::Upgrade => "Upgrade",
-            HeaderItem::Connection => "Connection",
-            HeaderItem::Content_Type => "Content-Type",
-            HeaderItem::Content_Length => "Content-Length",
-            HeaderItem::Accept_Encoding => "Accept-Encoding",
-            HeaderItem::Transfer_Encoding => "Transfer-Encoding",
-            _ => "Unknown",
-        }
-    }
-}
-
 impl Into<HeaderRefOrString> for RefOrString {
     fn into(self) -> HeaderRefOrString {
-        let val = self.to_str();
-        HeaderRefOrString::HeaderItem(match val.len() {
-            4 if val.eq_ignore_ascii_case("Date") => HeaderItem::Date,
-            4 if val.eq_ignore_ascii_case("Host") => HeaderItem::Host,
-            6 if val.eq_ignore_ascii_case("Server") => HeaderItem::Server,
-            7 if val.eq_ignore_ascii_case("Upgrade") => HeaderItem::Upgrade,
-            10 if val.eq_ignore_ascii_case("Connection") => HeaderItem::Connection,
-            12 if val.eq_ignore_ascii_case("Content-Type") => HeaderItem::Content_Type,
-            14 if val.eq_ignore_ascii_case("Content-Length") => HeaderItem::Content_Length,
-            15 if val.eq_ignore_ascii_case("Accept-Encoding") => HeaderItem::Accept_Encoding,
-            17 if val.eq_ignore_ascii_case("Transfer-Encoding") => HeaderItem::Transfer_Encoding,
-            _ => return HeaderRefOrString::RefOrString(self),
-        })
+        match HeaderItem::try_from_str(self.to_str()) {
+            Some(header_item) => HeaderRefOrString::HeaderItem(header_item),
+            None => HeaderRefOrString::RefOrString(self),
+        }
     }
 }
 

@@ -1,10 +1,12 @@
+#![allow(non_camel_case_types)]
+use crate::utils::refstr::HeaderItem;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use anyhow::anyhow;
+use rustls_pki_types::ServerName;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
@@ -97,7 +99,59 @@ impl Session {
         let res = self.end_request(req).await?;
         Ok(res)
     }
+
+    pub async fn delete(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
+        let req = self.start_request(HttpMethod::DELETE, url).await?;
+        let res = self.end_request(req).await?;
+        Ok(res)
+    }
+
+    pub async fn head(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
+        let req = self.start_request(HttpMethod::HEAD, url).await?;
+        let res = self.end_request(req).await?;
+        Ok(res)
+    }
+
+    pub async fn options(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
+        let req = self.start_request(HttpMethod::OPTIONS, url).await?;
+        let res = self.end_request(req).await?;
+        Ok(res)
+    }
+
+    pub async fn connect(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
+        let req = self.start_request(HttpMethod::CONNECT, url).await?;
+        let res = self.end_request(req).await?;
+        Ok(res)
+    }
+
+    pub async fn patch(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
+        let req = self.start_request(HttpMethod::PATCH, url).await?;
+        let res = self.end_request(req).await?;
+        Ok(res)
+    }
+
+    pub async fn trace(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
+        let req = self.start_request(HttpMethod::TRACE, url).await?;
+        let res = self.end_request(req).await?;
+        Ok(res)
+    }
 }
+
+pub enum Headers {
+    User_Agent(String),
+}
+
+impl HttpRequest {
+    pub fn apply_header(&mut self, header: Headers) {
+        match header {
+            Headers::User_Agent(user_agent) => {
+                self.set_header(HeaderItem::User_Agent.to_str(), user_agent);
+            }
+        }
+    }
+}
+
+//
 
 pub async fn get(url: &str) -> anyhow::Result<HttpResponse> {
     let mut sess = Session::new();
@@ -116,3 +170,68 @@ pub async fn put(url: &str) -> anyhow::Result<HttpResponse> {
     let res = sess.put(url).await?;
     Ok(res)
 }
+pub async fn delete(url: &str) -> anyhow::Result<HttpResponse> {
+    let mut sess = Session::new();
+    let res = sess.delete(url).await?;
+    Ok(res)
+}
+
+pub async fn head(url: &str) -> anyhow::Result<HttpResponse> {
+    let mut sess = Session::new();
+    let res = sess.head(url).await?;
+    Ok(res)
+}
+
+pub async fn options(url: &str) -> anyhow::Result<HttpResponse> {
+    let mut sess = Session::new();
+    let res = sess.options(url).await?;
+    Ok(res)
+}
+
+pub async fn connect(url: &str) -> anyhow::Result<HttpResponse> {
+    let mut sess = Session::new();
+    let res = sess.connect(url).await?;
+    Ok(res)
+}
+
+pub async fn patch(url: &str) -> anyhow::Result<HttpResponse> {
+    let mut sess = Session::new();
+    let res = sess.patch(url).await?;
+    Ok(res)
+}
+
+pub async fn trace(url: &str) -> anyhow::Result<HttpResponse> {
+    let mut sess = Session::new();
+    let res = sess.trace(url).await?;
+    Ok(res)
+}
+
+//
+
+// #[async_trait]
+// pub trait SessionExt {
+//     async fn get(&mut self, url: &str, header: Headers) -> anyhow::Result<HttpResponse>;
+// }
+
+// #[async_trait]
+// impl SessionExt for Session {
+//     async fn get(&mut self, url: &str, header: Headers) -> anyhow::Result<HttpResponse> {
+//         let mut req = self.start_request(HttpMethod::GET, url).await?;
+//         req.apply_header(header);
+//         let res = self.end_request(req).await?;
+//         Ok(res)
+//     }
+// }
+
+// #[async_trait]
+// pub trait ClientExt {
+//     async fn get(&mut self, header: Headers) -> anyhow::Result<HttpResponse>;
+// }
+
+// #[async_trait]
+// impl ClientExt for &str {
+//     async fn get(&mut self, header: Headers) -> anyhow::Result<HttpResponse> {
+//         let mut sess = Session::new();
+//         sess.get(url, header).await
+//     }
+// }

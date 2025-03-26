@@ -14,7 +14,7 @@ cargo add potato
 cargo add tokio --features full
 ```
 
-### Hello World
+### Hello Server
 
 ```rust
 use potato::*;
@@ -32,15 +32,27 @@ async fn main() {
 }
 ```
 
-更多示例请参考：<https://github.com/fawdlstty/potato/tree/main/examples>
+### Hello Client
+
+```rust
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let r = potato::get("https://www.fawdlstty.com").await?;
+    println!("{}", String::from_utf8(res.body)?);
+    Ok(())
+}
+```
+
+### 更多示例
+
+请参考：<https://github.com/fawdlstty/potato/tree/main/examples>
 
 <!--
 # TODO
 
+- jemalloc
 - static path security
 - file for download
-- http client
 - cookie
-- chunked
 - CORS
 -->

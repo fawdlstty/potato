@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.1.27"
+version = "0.1.31"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -24,10 +24,11 @@ httparse = "1.9.5"
 inventory = "0.3.15"
 #jemalloc_pprof = "0.6.0"
 jsonwebtoken = "9.3.0"
-potato-macro = "0.1.27"                               # { path = "../potato-macro" }
+potato-macro = "0.1.28"                               # { path = "../potato-macro" }
 rand = "0.8.5"
 regex = "1.11.1"
 rust-embed = "8.5.0"
+rustls-pki-types = "1.11.0"
 serde = "1.0.217"
 serde_json = "1.0.134"
 sha1 = "0.10.6"
