@@ -93,6 +93,7 @@ impl StringUtil {
     }
 }
 
+#[macro_export]
 macro_rules! ssformat {
     ($len:expr, $($arg:tt)*) => {
         {

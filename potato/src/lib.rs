@@ -1,7 +1,6 @@
 pub mod client;
 pub mod global_config;
 pub mod server;
-#[macro_use]
 pub mod utils;
 
 pub use client::*;
