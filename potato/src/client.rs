@@ -1,5 +1,5 @@
 #![allow(non_camel_case_types)]
-use crate::utils::refstr::HeaderItem;
+use crate::utils::refstr::Headers;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use anyhow::anyhow;
@@ -9,6 +9,26 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
+
+macro_rules! define_session_method {
+    ($fn_name:ident, $fn_name2:ident, $method:ident) => {
+        pub async fn $fn_name(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
+            self.get_args(url, vec![]).await
+        }
+
+        pub async fn $fn_name2(
+            &mut self,
+            url: &str,
+            args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            let mut req = self.start_request(HttpMethod::$method, url).await?;
+            for arg in args.into_iter() {
+                req.apply_header(arg);
+            }
+            self.end_request(req).await
+        }
+    };
+}
 
 pub struct SessionImpl {
     unique_host: (String, bool, u16),
@@ -82,156 +102,57 @@ impl Session {
         Ok(res)
     }
 
-    pub async fn get(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
-        let req = self.start_request(HttpMethod::GET, url).await?;
-        let res = self.end_request(req).await?;
-        Ok(res)
-    }
-
-    pub async fn post(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
-        let req = self.start_request(HttpMethod::POST, url).await?;
-        let res = self.end_request(req).await?;
-        Ok(res)
-    }
-
-    pub async fn put(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
-        let req = self.start_request(HttpMethod::PUT, url).await?;
-        let res = self.end_request(req).await?;
-        Ok(res)
-    }
-
-    pub async fn delete(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
-        let req = self.start_request(HttpMethod::DELETE, url).await?;
-        let res = self.end_request(req).await?;
-        Ok(res)
-    }
-
-    pub async fn head(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
-        let req = self.start_request(HttpMethod::HEAD, url).await?;
-        let res = self.end_request(req).await?;
-        Ok(res)
-    }
-
-    pub async fn options(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
-        let req = self.start_request(HttpMethod::OPTIONS, url).await?;
-        let res = self.end_request(req).await?;
-        Ok(res)
-    }
-
-    pub async fn connect(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
-        let req = self.start_request(HttpMethod::CONNECT, url).await?;
-        let res = self.end_request(req).await?;
-        Ok(res)
-    }
-
-    pub async fn patch(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
-        let req = self.start_request(HttpMethod::PATCH, url).await?;
-        let res = self.end_request(req).await?;
-        Ok(res)
-    }
-
-    pub async fn trace(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
-        let req = self.start_request(HttpMethod::TRACE, url).await?;
-        let res = self.end_request(req).await?;
-        Ok(res)
-    }
+    define_session_method!(get, get_args, GET);
+    define_session_method!(post, post_args, POST);
+    define_session_method!(put, put_args, PUT);
+    define_session_method!(delete, delete_args, DELETE);
+    define_session_method!(head, head_args, HEAD);
+    define_session_method!(options, options_args, OPTIONS);
+    define_session_method!(connect, connect_args, CONNECT);
+    define_session_method!(patch, patch_args, PATCH);
+    define_session_method!(trace, trace_args, TRACE);
 }
 
-pub enum Headers {
-    User_Agent(String),
-}
-
-impl HttpRequest {
-    pub fn apply_header(&mut self, header: Headers) {
-        match header {
-            Headers::User_Agent(user_agent) => {
-                self.set_header(HeaderItem::User_Agent.to_str(), user_agent);
-            }
+macro_rules! define_client_method {
+    ($fn_name:ident, $fn_name2:ident) => {
+        pub async fn $fn_name(url: &str) -> anyhow::Result<HttpResponse> {
+            Session::new().$fn_name(url).await
         }
-    }
+
+        pub async fn $fn_name2(url: &str, args: Vec<Headers>) -> anyhow::Result<HttpResponse> {
+            Session::new().$fn_name2(url, args).await
+        }
+    };
 }
+define_client_method!(get, get_args);
+define_client_method!(post, post_args);
+define_client_method!(put, put_args);
+define_client_method!(delete, delete_args);
+define_client_method!(head, head_args);
+define_client_method!(options, options_args);
+define_client_method!(connect, connect_args);
+define_client_method!(patch, patch_args);
+define_client_method!(trace, trace_args);
 
 //
 
-pub async fn get(url: &str) -> anyhow::Result<HttpResponse> {
-    let mut sess = Session::new();
-    let res = sess.get(url).await?;
-    Ok(res)
-}
-
-pub async fn post(url: &str) -> anyhow::Result<HttpResponse> {
-    let mut sess = Session::new();
-    let res = sess.post(url).await?;
-    Ok(res)
-}
-
-pub async fn put(url: &str) -> anyhow::Result<HttpResponse> {
-    let mut sess = Session::new();
-    let res = sess.put(url).await?;
-    Ok(res)
-}
-pub async fn delete(url: &str) -> anyhow::Result<HttpResponse> {
-    let mut sess = Session::new();
-    let res = sess.delete(url).await?;
-    Ok(res)
-}
-
-pub async fn head(url: &str) -> anyhow::Result<HttpResponse> {
-    let mut sess = Session::new();
-    let res = sess.head(url).await?;
-    Ok(res)
-}
-
-pub async fn options(url: &str) -> anyhow::Result<HttpResponse> {
-    let mut sess = Session::new();
-    let res = sess.options(url).await?;
-    Ok(res)
-}
-
-pub async fn connect(url: &str) -> anyhow::Result<HttpResponse> {
-    let mut sess = Session::new();
-    let res = sess.connect(url).await?;
-    Ok(res)
-}
-
-pub async fn patch(url: &str) -> anyhow::Result<HttpResponse> {
-    let mut sess = Session::new();
-    let res = sess.patch(url).await?;
-    Ok(res)
-}
-
-pub async fn trace(url: &str) -> anyhow::Result<HttpResponse> {
-    let mut sess = Session::new();
-    let res = sess.trace(url).await?;
-    Ok(res)
-}
-
-//
-
-// #[async_trait]
-// pub trait SessionExt {
-//     async fn get(&mut self, url: &str, header: Headers) -> anyhow::Result<HttpResponse>;
-// }
-
-// #[async_trait]
-// impl SessionExt for Session {
-//     async fn get(&mut self, url: &str, header: Headers) -> anyhow::Result<HttpResponse> {
-//         let mut req = self.start_request(HttpMethod::GET, url).await?;
-//         req.apply_header(header);
-//         let res = self.end_request(req).await?;
-//         Ok(res)
-//     }
-// }
-
-// #[async_trait]
-// pub trait ClientExt {
-//     async fn get(&mut self, header: Headers) -> anyhow::Result<HttpResponse>;
-// }
-
-// #[async_trait]
-// impl ClientExt for &str {
-//     async fn get(&mut self, header: Headers) -> anyhow::Result<HttpResponse> {
+// #[macro_export]
+// macro_rules! get {
+//     ($url:expr) => {{
 //         let mut sess = Session::new();
-//         sess.get(url, header).await
-//     }
+//         match sess.start_request(HttpMethod::GET, url).await {
+//             Ok(req) => sess.end_request(req).await
+//             Err(err) => Err(err),
+//         }
+//     }};
+//     ($url:expr $(, $args:expr)*) => {{
+//         let mut sess = Session::new();
+//         match sess.start_request(HttpMethod::GET, url).await {
+//             Ok(req) => {
+//                 $( req.apply_header(args); )*
+//                 sess.end_request(req).await
+//             }
+//             Err(err) => Err(err),
+//         }
+//     }};
 // }

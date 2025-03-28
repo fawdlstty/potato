@@ -298,16 +298,21 @@ pub fn standard_header_derive(input: TokenStream) -> TokenStream {
     let enum_name = root_enum.ident;
     let mut try_from_str_items = vec![];
     let mut to_str_items = vec![];
+    let mut headers_items = vec![];
+    let mut headers_apply_items = vec![];
     for root_field in root_enum.variants.iter() {
         let name = root_field.ident.clone();
         if root_field.fields.iter().next().is_some() {
             panic!("unsupported enum type");
         }
-        let str_name = name.to_string().http_std_case();
+        let str_name = name.to_string().replace("_", "-");
         let len = str_name.len();
         try_from_str_items
             .push(quote! { #len if value.eq_ignore_ascii_case(#str_name) => Some(Self::#name), });
         to_str_items.push(quote! { Self::#name => #str_name, });
+        headers_items.push(quote! { #name(String), });
+        headers_apply_items
+            .push(quote! { Headers::#name(s) => self.set_header(HeaderItem::#name.to_str(), s), });
     }
     quote! {
         impl #enum_name {
@@ -321,6 +326,20 @@ pub fn standard_header_derive(input: TokenStream) -> TokenStream {
             pub fn to_str(&self) -> &'static str {
                 match self {
                     #( #to_str_items )*
+                }
+            }
+        }
+
+        pub enum Headers {
+            #( #headers_items )*
+            Custom((String, String)),
+        }
+
+        impl HttpRequest {
+            pub fn apply_header(&mut self, header: Headers) {
+                match header {
+                    #( #headers_apply_items )*
+                    Headers::Custom((k, v)) => self.set_header(&k[..], v),
                 }
             }
         }

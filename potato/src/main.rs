@@ -1,5 +1,5 @@
 use global_config::ServerConfig;
-use potato::*;
+use potato::{utils::refstr::Headers, *};
 //use tikv_jemalloc_ctl::{Access, AsName};
 
 #[http_get("/hello")]
@@ -112,20 +112,23 @@ async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Re
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // //jemalloc_active_prof(true);
-    // ServerConfig::set_jwt_secret("AAABBBCCC").await;
-    // let mut server = HttpServer::new("0.0.0.0:8080");
-    // server.configure(|ctx| {
-    //     ctx.use_dispatch();
-    //     ctx.use_doc("/doc/");
-    //     //ctx.use_embedded_route("/", embed_dir!("assets/wwwroot"));
-    //     //ctx.use_location_route("/", "/wwwroot");
-    // });
-    // println!("visit: http://127.0.0.1:8080/doc/");
-    // server.serve_http().await
-    let res = potato::get("https://www.fawdlstty.com").await?;
-    println!("{}", String::from_utf8(res.body)?);
-    Ok(())
+    //jemalloc_active_prof(true);
+    ServerConfig::set_jwt_secret("AAABBBCCC").await;
+    let mut server = HttpServer::new("0.0.0.0:8080");
+    server.configure(|ctx| {
+        ctx.use_dispatch();
+        ctx.use_doc("/doc/");
+        //ctx.use_embedded_route("/", embed_dir!("assets/wwwroot"));
+        //ctx.use_location_route("/", "/wwwroot");
+    });
+    println!("visit: http://127.0.0.1:8080/doc/");
+    server.serve_http().await
+    // let res = potato::get_args(
+    //     "https://www.fawdlstty.com",
+    //     vec![Headers::User_Agent("aaa".into())],
+    // )
+    // .await?;
+    // Ok(())
 }
 
 // cargo run -p potato
