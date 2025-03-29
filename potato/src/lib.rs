@@ -5,18 +5,19 @@ pub mod utils;
 
 pub use client::*;
 pub use global_config::*;
-use http::uri::Scheme;
-use http::Uri;
 pub use inventory;
 pub use potato_macro::*;
 pub use regex;
 pub use rust_embed;
 pub use serde_json;
 pub use server::*;
+pub use utils::refstr::Headers;
 
 use anyhow::{anyhow, Error};
 use chrono::Utc;
 use core::str;
+use http::uri::Scheme;
+use http::Uri;
 use rust_embed::Embed;
 use sha1::{Digest, Sha1};
 use std::borrow::Cow;

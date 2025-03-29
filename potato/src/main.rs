@@ -1,5 +1,5 @@
 use global_config::ServerConfig;
-use potato::{utils::refstr::Headers, *};
+use potato::*;
 //use tikv_jemalloc_ctl::{Access, AsName};
 
 #[http_get("/hello")]
@@ -123,12 +123,12 @@ async fn main() -> anyhow::Result<()> {
     });
     println!("visit: http://127.0.0.1:8080/doc/");
     server.serve_http().await
-    // let res = potato::get_args(
-    //     "https://www.fawdlstty.com",
-    //     vec![Headers::User_Agent("aaa".into())],
-    // )
-    // .await?;
-    // Ok(())
+    let res = potato::get(
+        "https://www.fawdlstty.com",
+        vec![Headers::User_Agent("aaa".into())],
+    )
+    .await?;
+    Ok(())
 }
 
 // cargo run -p potato
