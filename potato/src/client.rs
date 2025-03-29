@@ -1,7 +1,7 @@
 #![allow(non_camel_case_types)]
 use crate::utils::refstr::Headers;
 use crate::utils::tcp_stream::TcpStreamExt;
-use crate::{HttpMethod, HttpRequest, HttpResponse};
+use crate::{HttpMethod, HttpRequest, HttpResponse, SERVER_STR};
 use anyhow::anyhow;
 use rustls_pki_types::ServerName;
 use std::sync::Arc;
@@ -108,7 +108,7 @@ impl Session {
         method: HttpMethod,
         url: &str,
     ) -> anyhow::Result<HttpRequest> {
-        let (req, use_ssl, port) = HttpRequest::from_url(url, method)?;
+        let (mut req, use_ssl, port) = HttpRequest::from_url(url, method)?;
         let host = req.get_header_host().to_string();
         let mut is_same_host = false;
         if let Some(sess_impl) = &mut self.sess_impl {
@@ -118,8 +118,10 @@ impl Session {
             }
         }
         if !is_same_host {
-            self.sess_impl = Some(SessionImpl::new(host, use_ssl, port).await?);
+            self.sess_impl = Some(SessionImpl::new(host.clone(), use_ssl, port).await?);
         }
+        req.apply_header(Headers::Host(host));
+        req.apply_header(Headers::User_Agent(SERVER_STR.clone()));
         Ok(req)
     }
 
