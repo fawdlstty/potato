@@ -22,9 +22,8 @@ flate2 = "1.0.35"
 http = "1.2.0"
 httparse = "1.9.5"
 inventory = "0.3.15"
-#jemalloc_pprof = "0.6.0"
 jsonwebtoken = "9.3.0"
-potato-macro = "0.1.32"                               # { path = "../potato-macro" }
+potato-macro = "0.1.32"                                                                       # { path = "../potato-macro" }
 rand = "0.8.5"
 regex = "1.11.1"
 rust-embed = "8.5.0"
@@ -35,13 +34,15 @@ sha1 = "0.10.6"
 smallstr = "0.3.0"
 smallvec = "1.14.0"
 strum = { version = "0.26.3", features = ["derive"] }
-#tikv-jemalloc-ctl = "0.6.0"
-#tikv-jemallocator = { version = "0.6.0", features = [
-#    "profiling",
-#    "stats",
-#    "unprefixed_malloc_on_supported_platforms",
-#    "background_threads",
-#] }
 tokio = { version = "1.44.1", features = ["full"] }
 tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "0.26.8"
+
+jemalloc_pprof = { version = "0.7.0", optional = true }
+tikv-jemalloc-ctl = { version = "0.6.0", optional = true }
+tikv-jemalloc-sys = { version = "0.6.0", features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms", "background_threads"], optional = true }
+tikv-jemallocator = { version = "0.6.0", features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms", "background_threads"], optional = true }
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:jemalloc_pprof", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:tikv-jemallocator"]

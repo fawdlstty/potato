@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
     server.configure(|ctx| {
         ctx.use_dispatch();
         ctx.use_doc("/doc/");
+        ctx.use_jemalloc("/heap.pb.gz");
         //ctx.use_embedded_route("/", embed_dir!("assets/wwwroot"));
         //ctx.use_location_route("/", "/wwwroot");
     });

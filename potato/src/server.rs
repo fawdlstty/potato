@@ -14,6 +14,13 @@ use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "jemalloc")]
+const PROF_ACTIVE: &'static [u8] = b"prof.active\0";
+
 static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static RequestHandlerFlag>>> =
     LazyLock::new(|| {
         let mut handlers = HashMap::with_capacity(16);
@@ -32,6 +39,8 @@ pub enum PipeContextItem {
     LocationRoute((String, String)),
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
+    #[cfg(feature = "jemalloc")]
+    Jemalloc(String),
 }
 
 pub struct PipeContext {
@@ -256,6 +265,11 @@ impl PipeContext {
         }
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
     }
+
+    #[cfg(feature = "jemalloc")]
+    pub fn use_jemalloc(&mut self, url_path: impl Into<String>) {
+        self.items.push(PipeContextItem::Jemalloc(url_path.into()));
+    }
 }
 
 pub struct PipeHandlerContext {
@@ -367,6 +381,31 @@ impl PipeHandlerContext {
                     continue;
                 }
                 PipeContextItem::FinalRoute(res) => return res.clone(),
+                #[cfg(feature = "jemalloc")]
+                PipeContextItem::Jemalloc(path) => {
+                    if path == req.url_path.to_str() {
+                        let err_msg = match jemalloc_pprof::PROF_CTL.as_ref() {
+                            Some(prof_ctl) => {
+                                let mut prof_ctl = prof_ctl.lock().await;
+                                match prof_ctl.activated() {
+                                    true => match prof_ctl.dump_pprof() {
+                                        Ok(data) => {
+                                            return HttpResponse::from_mem_file(
+                                                "heap.pb.gz",
+                                                data,
+                                                true,
+                                            )
+                                        }
+                                        Err(err) => format!("{err}"),
+                                    },
+                                    false => format!("PROF_CTL is not activated"),
+                                }
+                            }
+                            None => format!("PROF_CTL is empty"),
+                        };
+                        return HttpResponse::error(err_msg);
+                    }
+                }
             }
         }
 
@@ -393,7 +432,25 @@ impl HttpServer {
         self.pipe_ctx = Arc::new(ctx);
     }
 
+    #[cfg(feature = "jemalloc")]
+    fn init_jemalloc(&self) -> anyhow::Result<()> {
+        if let Ok(conf) = std::env::var("MALLOC_CONF") {
+            if &conf == "prof:true" {
+                use tikv_jemalloc_ctl::*;
+                let name = PROF_ACTIVE.name();
+                return Ok(name.write(true)?);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "run `MALLOC_CONF=prof:true {}` for enable jemalloc",
+            env!("CARGO_PKG_NAME")
+        ))
+    }
+
     pub async fn serve_http(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "jemalloc")]
+        self.init_jemalloc()?;
+
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;
 
@@ -430,6 +487,9 @@ impl HttpServer {
     }
 
     pub async fn serve_https(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
+        #[cfg(feature = "jemalloc")]
+        self.init_jemalloc()?;
+
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;
 
