@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utils::bytes::CompressExt;
 use utils::enums::{HttpConnection, HttpContentType};
 use utils::number::HttpCodeExt;
-use utils::refbuf::{RefBuf, ToRefBufExt};
+use utils::refbuf::{RefOrBuffer, ToRefBufExt};
 use utils::refstr::{HeaderItem, HeaderRefOrString, RefOrString, ToRefStrExt};
 use utils::string::StringExt;
 use utils::tcp_stream::{TcpStreamExt, VecU8Ext};
@@ -281,7 +281,7 @@ pub enum WsFrameImpl {
 #[derive(Clone, Debug)]
 pub struct PostFile {
     pub filename: RefOrString,
-    pub data: RefBuf,
+    pub data: RefOrBuffer,
 }
 
 unsafe impl Send for PostFile {}
@@ -293,7 +293,7 @@ pub struct HttpRequest {
     pub url_query: HashMap<RefOrString, RefOrString>,
     pub version: u8,
     pub headers: HashMap<HeaderRefOrString, RefOrString>,
-    pub body: RefBuf,
+    pub body: RefOrBuffer,
     pub body_pairs: HashMap<RefOrString, RefOrString>,
     pub body_files: HashMap<RefOrString, PostFile>,
 }
@@ -309,7 +309,7 @@ impl HttpRequest {
             url_query: HashMap::with_capacity(16),
             version: 11,
             headers: HashMap::with_capacity(16),
-            body: [].to_ref_buf(),
+            body: [].to_ref_buffer(),
             body_pairs: HashMap::with_capacity(16),
             body_files: HashMap::with_capacity(4),
         }
@@ -428,7 +428,7 @@ impl HttpRequest {
             }
             buf.extend(&tmp_buf[0..t]);
         }
-        req.body = buf[hdr_len..hdr_len + bdy_len].to_ref_buf();
+        req.body = buf[hdr_len..hdr_len + bdy_len].to_ref_buffer();
         if let Some(cnt_type) = req.get_header_content_type() {
             match cnt_type {
                 HttpContentType::ApplicationJson => {
@@ -484,7 +484,7 @@ impl HttpRequest {
                                 }
                                 if let Some(name) = name {
                                     if let Some(filename) = filename {
-                                        let data = content.as_bytes().to_ref_buf();
+                                        let data = content.as_bytes().to_ref_buffer();
                                         req.body_files.insert(name, PostFile { filename, data });
                                     } else {
                                         req.body_pairs.insert(name, content.to_ref_string());

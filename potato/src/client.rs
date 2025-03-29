@@ -11,12 +11,8 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
 macro_rules! define_session_method {
-    ($fn_name:ident, $fn_name2:ident, $method:ident) => {
-        pub async fn $fn_name(&mut self, url: &str) -> anyhow::Result<HttpResponse> {
-            self.get_args(url, vec![]).await
-        }
-
-        pub async fn $fn_name2(
+    ($fn_name:ident, $method:ident) => {
+        pub async fn $fn_name(
             &mut self,
             url: &str,
             args: Vec<Headers>,
@@ -26,6 +22,42 @@ macro_rules! define_session_method {
                 req.apply_header(arg);
             }
             self.end_request(req).await
+        }
+    };
+
+    ($fn_name:ident, $fn_name2:ident, $fn_name3:ident, $method:ident) => {
+        pub async fn $fn_name(
+            &mut self,
+            url: &str,
+            body: Vec<u8>,
+            args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            let mut req = self.start_request(HttpMethod::$method, url).await?;
+            req.body = body.into();
+            for arg in args.into_iter() {
+                req.apply_header(arg);
+            }
+            self.end_request(req).await
+        }
+
+        pub async fn $fn_name2(
+            &mut self,
+            url: &str,
+            body: serde_json::Value,
+            mut args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            args.push(Headers::Content_Type("application/json".into()));
+            self.$fn_name(url, serde_json::to_vec(&body)?, args).await
+        }
+
+        pub async fn $fn_name3(
+            &mut self,
+            url: &str,
+            body: String,
+            mut args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            args.push(Headers::Content_Type("application/json".into()));
+            self.$fn_name(url, body.into_bytes(), args).await
         }
     };
 }
@@ -102,37 +134,58 @@ impl Session {
         Ok(res)
     }
 
-    define_session_method!(get, get_args, GET);
-    define_session_method!(post, post_args, POST);
-    define_session_method!(put, put_args, PUT);
-    define_session_method!(delete, delete_args, DELETE);
-    define_session_method!(head, head_args, HEAD);
-    define_session_method!(options, options_args, OPTIONS);
-    define_session_method!(connect, connect_args, CONNECT);
-    define_session_method!(patch, patch_args, PATCH);
-    define_session_method!(trace, trace_args, TRACE);
+    define_session_method!(get, GET);
+    define_session_method!(post, post_json, post_json_str, POST);
+    define_session_method!(put, put_json, put_json_str, PUT);
+    define_session_method!(delete, DELETE);
+    define_session_method!(head, HEAD);
+    define_session_method!(options, OPTIONS);
+    define_session_method!(connect, CONNECT);
+    define_session_method!(patch, PATCH);
+    define_session_method!(trace, TRACE);
 }
 
 macro_rules! define_client_method {
-    ($fn_name:ident, $fn_name2:ident) => {
-        pub async fn $fn_name(url: &str) -> anyhow::Result<HttpResponse> {
-            Session::new().$fn_name(url).await
+    ($fn_name:ident) => {
+        pub async fn $fn_name(url: &str, args: Vec<Headers>) -> anyhow::Result<HttpResponse> {
+            Session::new().$fn_name(url, args).await
+        }
+    };
+    ($fn_name:ident, $fn_name2:ident, $fn_name3:ident) => {
+        pub async fn $fn_name(
+            url: &str,
+            body: Vec<u8>,
+            args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            Session::new().$fn_name(url, body, args).await
         }
 
-        pub async fn $fn_name2(url: &str, args: Vec<Headers>) -> anyhow::Result<HttpResponse> {
-            Session::new().$fn_name2(url, args).await
+        pub async fn $fn_name2(
+            url: &str,
+            body: serde_json::Value,
+            args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            Session::new().$fn_name2(url, body, args).await
+        }
+
+        pub async fn $fn_name3(
+            url: &str,
+            body: String,
+            args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            Session::new().$fn_name3(url, body, args).await
         }
     };
 }
-define_client_method!(get, get_args);
-define_client_method!(post, post_args);
-define_client_method!(put, put_args);
-define_client_method!(delete, delete_args);
-define_client_method!(head, head_args);
-define_client_method!(options, options_args);
-define_client_method!(connect, connect_args);
-define_client_method!(patch, patch_args);
-define_client_method!(trace, trace_args);
+define_client_method!(get);
+define_client_method!(post, post_json, post_json_str);
+define_client_method!(put, put_json, put_json_str);
+define_client_method!(delete);
+define_client_method!(head);
+define_client_method!(options);
+define_client_method!(connect);
+define_client_method!(patch);
+define_client_method!(trace);
 
 //
 
