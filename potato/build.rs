@@ -13,14 +13,16 @@ fn generated_protobuf() -> anyhow::Result<()> {
         }
     }
     //
-    std::env::set_var("PROTOC", format!("/usr/bin/protoc"));
-    std::env::set_var("OUT_DIR", format!("src/generated/protobuf/"));
-    let proto_path = format!("../pprof/");
-    tonic_build::configure()
-        .build_client(false)
-        .build_server(false)
-        .compile_protos(&[Path::new("profile.proto")], &[Path::new(&proto_path)])?;
-    println!("cargo:rerun-if-changed=../pprof/profile.proto");
+    if !std::fs::exists("src/generated/protobuf/perftools.profiles.rs")? {
+        std::env::set_var("PROTOC", format!("/usr/bin/protoc"));
+        std::env::set_var("OUT_DIR", format!("src/generated/protobuf/"));
+        let proto_path = format!("../pprof/");
+        tonic_build::configure()
+            .build_client(false)
+            .build_server(false)
+            .compile_protos(&[Path::new("profile.proto")], &[Path::new(&proto_path)])?;
+        println!("cargo:rerun-if-changed=../pprof/profile.proto");
+    }
     Ok(())
 }
 
