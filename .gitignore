@@ -1,4 +1,5 @@
-/target
+target/
+tmp/
 
 *.lock
 potato/src/main.rs
