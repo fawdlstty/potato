@@ -1,4 +1,5 @@
 pub mod client;
+pub mod generated;
 pub mod global_config;
 pub mod server;
 pub mod utils;
