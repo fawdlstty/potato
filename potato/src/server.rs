@@ -3,6 +3,7 @@ use crate::utils::number::HttpCodeExt;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use crate::{RequestHandlerFlag, WebsocketContext};
+use serde_json::json;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -104,7 +105,8 @@ impl PipeContext {
                 None => serde_json::json!({}),
             }
         };
-        let paths = {
+        let (tags, paths) = {
+            let mut tags = HashMap::with_capacity(16);
             let mut paths = std::collections::HashMap::with_capacity(16);
             for flag in inventory::iter::<RequestHandlerFlag> {
                 if !flag.doc.show {
@@ -115,6 +117,10 @@ impl PipeContext {
                     "summary": flag.doc.summary,
                     "description": flag.doc.desp,
                 });
+                if let Some((tag, _)) = (flag.path[1..]).split_once('/') {
+                    tags.insert(tag, "");
+                    root_cur_path["tags"] = serde_json::json!([tag]);
+                };
                 let arg_pairs = {
                     let mut arg_pairs = vec![];
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(flag.doc.args) {
@@ -187,7 +193,11 @@ impl PipeContext {
                     .or_insert_with(|| HashMap::with_capacity(16))
                     .insert(flag.method.to_string().to_lowercase(), root_cur_path);
             }
-            paths
+            let tags: Vec<_> = tags
+                .into_iter()
+                .map(|(k, v)| json!({"name": k, "description": v}))
+                .collect();
+            (tags, paths)
         };
         let mut root = serde_json::json!({
             "openapi": "3.1.0",
@@ -198,6 +208,7 @@ impl PipeContext {
                 "contact": contact,
             },
             "paths": paths,
+            "tags": tags,
         });
         if any_use_auth {
             root["components"]["securitySchemes"]["bearerAuth"] = serde_json::json!({
