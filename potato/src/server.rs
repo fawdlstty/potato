@@ -36,7 +36,7 @@ static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static Req
 
 #[derive(Clone)]
 pub enum PipeContextItem {
-    Dispatch,
+    Handlers,
     LocationRoute((String, String)),
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
@@ -51,7 +51,7 @@ pub struct PipeContext {
 impl PipeContext {
     pub fn new() -> Self {
         Self {
-            items: vec![PipeContextItem::Dispatch],
+            items: vec![PipeContextItem::Handlers],
         }
     }
 
@@ -63,8 +63,8 @@ impl PipeContext {
         self.items.clone()
     }
 
-    pub fn use_dispatch(&mut self) {
-        self.items.push(PipeContextItem::Dispatch);
+    pub fn use_handlers(&mut self) {
+        self.items.push(PipeContextItem::Handlers);
     }
 
     pub fn use_location_route(&mut self, url_path: impl Into<String>, loc_path: impl Into<String>) {
@@ -305,7 +305,7 @@ impl PipeHandlerContext {
     pub async fn handle_request(&mut self, req: HttpRequest) -> HttpResponse {
         for item in self.pipe_ctx.items.iter() {
             match item {
-                PipeContextItem::Dispatch => {
+                PipeContextItem::Handlers => {
                     let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
                         Some(handlers) => handlers.get(&req.method).map(|p| p.handler),
                         None => None,
