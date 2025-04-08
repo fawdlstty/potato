@@ -117,8 +117,17 @@ impl PipeContext {
                     "summary": flag.doc.summary,
                     "description": flag.doc.desp,
                 });
-                if let Some((tag, _)) = (flag.path[1..]).split_once('/') {
-                    tags.insert(tag, "");
+                let otag = {
+                    let mut otag = None;
+                    if let Some(idx) = flag.path.rfind('/') {
+                        if idx > 0 {
+                            otag = Some(flag.path[1..idx].replace('/', "_"));
+                        }
+                    }
+                    otag
+                };
+                if let Some(tag) = otag {
+                    tags.insert(tag.clone(), "");
                     root_cur_path["tags"] = serde_json::json!([tag]);
                 };
                 let arg_pairs = {
@@ -193,6 +202,8 @@ impl PipeContext {
                     .or_insert_with(|| HashMap::with_capacity(16))
                     .insert(flag.method.to_string().to_lowercase(), root_cur_path);
             }
+            let mut tags: Vec<_> = tags.into_iter().collect::<Vec<_>>();
+            tags.sort_by(|a, b| a.0.cmp(&b.0));
             let tags: Vec<_> = tags
                 .into_iter()
                 .map(|(k, v)| json!({"name": k, "description": v}))
