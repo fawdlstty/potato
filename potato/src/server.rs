@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::select;
+use tokio::sync::oneshot;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
@@ -438,6 +440,7 @@ impl PipeHandlerContext {
 pub struct HttpServer {
     addr: String,
     pipe_ctx: Arc<PipeContext>,
+    shutdown_signal: Option<oneshot::Receiver<()>>,
 }
 
 impl HttpServer {
@@ -445,6 +448,7 @@ impl HttpServer {
         HttpServer {
             addr: addr.into(),
             pipe_ctx: Arc::new(PipeContext::new()),
+            shutdown_signal: None,
         }
     }
 
@@ -469,7 +473,42 @@ impl HttpServer {
         ))
     }
 
+    pub fn shutdown_signal(&mut self) -> oneshot::Sender<()> {
+        let (tx, rx) = oneshot::channel();
+        if self.shutdown_signal.is_some() {
+            panic!("shutdown signal already set");
+        }
+        self.shutdown_signal = Some(rx);
+        tx
+    }
+
     pub async fn serve_http(&mut self) -> anyhow::Result<()> {
+        let shutdown_signal = self.shutdown_signal.take();
+        match shutdown_signal {
+            Some(shutdown_signal) => {
+                select! {
+                    result = self.serve_http_impl() => result,
+                    _ = shutdown_signal => Ok(()),
+                }
+            }
+            None => self.serve_http_impl().await,
+        }
+    }
+
+    pub async fn serve_https(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
+        let shutdown_signal = self.shutdown_signal.take();
+        match shutdown_signal {
+            Some(shutdown_signal) => {
+                select! {
+                    result = self.serve_https_impl(cert_file, key_file) => result,
+                    _ = shutdown_signal => Ok(()),
+                }
+            }
+            None => self.serve_https_impl(cert_file, key_file).await,
+        }
+    }
+
+    async fn serve_http_impl(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "jemalloc")]
         self.init_jemalloc()?;
 
@@ -508,7 +547,7 @@ impl HttpServer {
         }
     }
 
-    pub async fn serve_https(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
+    async fn serve_https_impl(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
         #[cfg(feature = "jemalloc")]
         self.init_jemalloc()?;
 
