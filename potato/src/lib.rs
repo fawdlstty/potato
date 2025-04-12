@@ -669,11 +669,12 @@ impl HttpResponse {
     pub fn from_mem_file(path: &str, data: Vec<u8>, download: bool) -> Self {
         let mut ret = Self::empty();
         let mime_type = match path.split('.').last() {
+            Some("css") => "text/css",
             Some("htm") => "text/html",
             Some("html") => "text/html",
             Some("js") => "application/javascript",
-            Some("css") => "text/css",
             Some("json") => "application/json",
+            Some("pdf") => "application/pdf",
             Some("xml") => "application/xml",
             _ if path.ends_with('/') => "text/html",
             _ => "application/octet-stream",
@@ -872,3 +873,6 @@ pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
     }
     ret
 }
+
+// cargo publish -p potato-macro --allow-dirty
+// cargo publish -p potato --allow-dirty
