@@ -3,3 +3,8 @@ tmp/
 
 *.lock
 potato/src/main.rs
+
+docs/node_modules
+docs/docs/.vuepress/.cache
+docs/docs/.vuepress/.temp
+docs/docs/.vuepress/dist
