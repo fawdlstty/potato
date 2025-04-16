@@ -11,12 +11,11 @@ export default defineUserConfig({
   theme: defaultTheme({
     //logo: 'https://vuejs.press/images/hero.png',
 
-    navbar: ['/', '/guide/00_introduction'],
+    navbar: ['/', '/guide/01_hello_world'],
     sidebar: {
       '/guide/': [
-        "00_introduction", "01_method_annotation",
-        "02_method_declare", "03_server_route",
-        "04_graceful_shutdown", "05_client"
+        "00_introduction", "01_hello_world", "02_method_annotation", "03_method_declare",
+        "04_server_route", "05_graceful_shutdown", "06_client"
       ]
     }
   }),

@@ -4,9 +4,8 @@ title: Home
 #heroImage: https://vuejs.press/images/hero.png
 actions:
   - text: 入门示例
-    link: /guide/00_introduction.html
+    link: /guide/01_hello_world.md
     type: primary
-
   - text: 查看源码
     link: https://github.com/fawdlstty/potato
     type: secondary

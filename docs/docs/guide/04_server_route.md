@@ -17,7 +17,11 @@ server.configure(|ctx| {
 在configure函数里加入如下代码：
 
 ```rust
-ctx.use_doc("/doc/");
+server.configure(|ctx| {
+    // ...
+    ctx.use_doc("/doc/");
+    // ...
+});
 ```
 
 其中路径指的是请求文档的地址。对于生产而言尽量不使用文档接口或改为复杂的路径，避免接口暴漏
@@ -27,7 +31,11 @@ ctx.use_doc("/doc/");
 在configure函数里加入如下代码：
 
 ```rust
-ctx.use_location_route("/", "/wwwroot");
+server.configure(|ctx| {
+    // ...
+    ctx.use_location_route("/", "/wwwroot");
+    // ...
+});
 ```
 
 第一个参数为请求路径，第二个参数为本地目录地址。假如存在 `/wwwroot/a.json` 文件，那么通过请求 `/a.json` 即可访问此json文件
@@ -37,17 +45,31 @@ ctx.use_location_route("/", "/wwwroot");
 在configure函数里加入如下代码：
 
 ```rust
-ctx.use_embedded_route("/", embed_dir!("assets/wwwroot"));
+server.configure(|ctx| {
+    // ...
+    ctx.use_embedded_route("/", embed_dir!("assets/wwwroot"));
+    // ...
+});
 ```
 
 内建资源含义为编译期将 `embed_dir` 宏指定的目录内置进可执行程序，后续运行时可以不要求本地路径存在，也能提供相应的文件请求响应
 
 ## 内存泄露调试路由
 
-启用potato库的jemalloc特性，然后在configure函数里加入如下代码：
+启用potato库的jemalloc特性：
+
+```shell
+cargo add potato --features jemalloc
+```
+
+然后在configure函数里加入如下代码：
 
 ```rust
-ctx.use_jemalloc("/profile.pdf");
+server.configure(|ctx| {
+    // ...
+    ctx.use_jemalloc("/profile.pdf");
+    // ...
+});
 ```
 
 此方法要求函数的运行环境为linux，且安装完如下库：

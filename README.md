@@ -7,6 +7,8 @@
 
 # 用法
 
+[在线文档](https://potato.fawdlstty.com)
+
 加入库的引用：
 
 ```sh
