@@ -17,10 +17,6 @@ use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
 
-#[cfg(feature = "jemalloc")]
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static RequestHandlerFlag>>> =
     LazyLock::new(|| {
         let mut handlers = HashMap::with_capacity(16);
@@ -405,7 +401,7 @@ impl PipeHandlerContext {
                 #[cfg(feature = "jemalloc")]
                 PipeContextItem::Jemalloc(path) => {
                     if path == req.url_path.to_str() {
-                        return match HttpServer::dump_jemalloc_profile().await {
+                        return match crate::dump_jemalloc_profile().await {
                             Ok(data) => HttpResponse::from_mem_file("profile.pdf", data, false),
                             Err(err) => HttpResponse::error(format!("{err}")),
                         };
@@ -437,72 +433,6 @@ impl HttpServer {
         let mut ctx = PipeContext::empty();
         callback(&mut ctx);
         self.pipe_ctx = Arc::new(ctx);
-    }
-
-    #[cfg(feature = "jemalloc")]
-    fn init_jemalloc() -> anyhow::Result<()> {
-        if let Ok(conf) = std::env::var("MALLOC_CONF") {
-            if &conf == "prof:true" {
-                use tikv_jemalloc_ctl::*;
-                const PROF_ACTIVE: &'static [u8] = b"prof.active\0";
-                let name = PROF_ACTIVE.name();
-                return Ok(name.write(true)?);
-            }
-        }
-        Err(anyhow::anyhow!(
-            "run `MALLOC_CONF=prof:true {}` for enable jemalloc, or disable jemalloc features",
-            env!("CARGO_PKG_NAME")
-        ))
-    }
-
-    #[cfg(feature = "jemalloc")]
-    async fn dump_jemalloc_profile() -> anyhow::Result<Vec<u8>> {
-        use crate::utils::process::ProgramRunner;
-        use anyhow::anyhow;
-        use tikv_jemalloc_ctl::*;
-        use tokio::fs::{self, File};
-        use tokio::io::AsyncReadExt;
-
-        let prof_ctl = jemalloc_pprof::PROF_CTL
-            .as_ref()
-            .ok_or(anyhow!("PROF_CTL is empty"))?;
-        let prof_ctl = prof_ctl.lock().await;
-        if !prof_ctl.activated() {
-            Err(anyhow!("PROF_CTL is not activated"))?;
-        }
-        // prof_ctl.dump_pprof()
-
-        const PROF_DUMP: &'static [u8] = b"prof.dump\0";
-        let prof_file = format!("/tmp/prof_{}.dump", env!("CARGO_PKG_NAME"));
-        let pdf_file = format!("{prof_file}.pdf");
-        _ = fs::remove_file(&prof_file).await;
-        _ = fs::remove_file(&pdf_file).await;
-        let prof_name = format!("{prof_file}\0").into_boxed_str();
-        let prof_name_ptr: &'static [u8] = unsafe { std::mem::transmute(prof_name) };
-        let name = PROF_DUMP.name();
-        name.write(prof_name_ptr)?;
-        let cur_path = {
-            let cur_path = std::env::current_exe()?;
-            cur_path
-                .to_str()
-                .ok_or(anyhow!("path convert failed"))?
-                .to_string()
-        };
-        let cmd_str = format!("jeprof --show_bytes --pdf {cur_path} {prof_file} > {pdf_file}");
-        let out = ProgramRunner::run_until_exit(&cmd_str).await;
-        let buf = {
-            let mut buf = Vec::with_capacity(4096);
-            let mut f = File::open(&pdf_file).await?;
-            f.read_to_end(&mut buf).await?;
-            buf
-        };
-        if buf.is_empty() {
-            let out = out?;
-            Err(anyhow!("{out}"))?;
-        }
-        _ = fs::remove_file(&prof_file).await;
-        _ = fs::remove_file(&pdf_file).await;
-        Ok(buf)
     }
 
     pub fn shutdown_signal(&mut self) -> oneshot::Sender<()> {
@@ -542,7 +472,7 @@ impl HttpServer {
 
     async fn serve_http_impl(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "jemalloc")]
-        Self::init_jemalloc()?;
+        crate::init_jemalloc()?;
 
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;
@@ -581,7 +511,7 @@ impl HttpServer {
 
     async fn serve_https_impl(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
         #[cfg(feature = "jemalloc")]
-        Self::init_jemalloc()?;
+        crate::init_jemalloc()?;
 
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;

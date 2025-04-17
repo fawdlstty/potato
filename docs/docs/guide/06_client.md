@@ -21,3 +21,17 @@ let mut sess = Session::new();
 let res1 = sess.get("https://www.fawdlstty.com/1", vec![]).await?;
 let res2 = sess.get("https://www.fawdlstty.com/2", vec![]).await?;
 ```
+
+另外。即使是纯客户端模式，也可以使用jemalloc获取详细内存分配报告。需要在程序入口点（main函数开始位置）加入如下代码：
+
+```rust
+potato::init_jemalloc()?;
+```
+
+然后在需要时，调用如下代码：
+
+```rust
+let pdf_data = crate::dump_jemalloc_profile()?;
+```
+
+此时`pdf_data`变量里就存了pdf内存分析报告原始内容，将其存储为文件即可查看。

@@ -1,5 +1,4 @@
 pub mod client;
-pub mod generated;
 pub mod global_config;
 pub mod server;
 pub mod utils;
@@ -13,6 +12,9 @@ pub use rust_embed;
 pub use serde_json;
 pub use server::*;
 pub use utils::refstr::Headers;
+
+#[cfg(feature = "jemalloc")]
+pub use utils::jemalloc_helper::*;
 
 use anyhow::{anyhow, Error};
 use chrono::Utc;
