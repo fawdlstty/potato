@@ -19,7 +19,7 @@ server.configure(|ctx| {
 ```rust
 server.configure(|ctx| {
     // ...
-    ctx.use_doc("/doc/");
+    ctx.use_openapi("/doc/");
     // ...
 });
 ```

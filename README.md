@@ -52,9 +52,6 @@ async fn main() -> anyhow::Result<()> {
 <!--
 # TODO
 
-- jemalloc
-- static path security
-- file for download
 - cookie
 - CORS
 -->

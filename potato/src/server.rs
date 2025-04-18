@@ -1,13 +1,11 @@
 use crate::utils::enums::HttpConnection;
-use crate::utils::number::HttpCodeExt;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use crate::{RequestHandlerFlag, WebsocketContext};
-use serde_json::json;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -87,7 +85,9 @@ impl PipeContext {
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
     }
 
-    fn doc_index_json() -> String {
+    #[cfg(feature = "openapi")]
+    fn openapi_index_json() -> String {
+        use crate::utils::number::HttpCodeExt;
         let mut any_use_auth = false;
         let contact = {
             let re = regex::Regex::new(r"([[:word:]]+)\s*<([^>]+)>").unwrap();
@@ -201,7 +201,7 @@ impl PipeContext {
             tags.sort_by(|a, b| a.0.cmp(&b.0));
             let tags: Vec<_> = tags
                 .into_iter()
-                .map(|(k, v)| json!({"name": k, "description": v}))
+                .map(|(k, v)| serde_json::json!({"name": k, "description": v}))
                 .collect();
             (tags, paths)
         };
@@ -227,7 +227,8 @@ impl PipeContext {
         serde_json::to_string(&root).unwrap_or("{}".to_string())
     }
 
-    pub fn use_doc(&mut self, url_path: impl Into<String>) {
+    #[cfg(feature = "openapi")]
+    pub fn use_openapi(&mut self, url_path: impl Into<String>) {
         #[derive(rust_embed::Embed)]
         #[folder = "swagger_res"]
         struct DocAsset;
@@ -242,7 +243,7 @@ impl PipeContext {
         };
         //
         ret.insert(format!("{url_path}index.json"), {
-            let bytes = Self::doc_index_json().into_bytes();
+            let bytes = Self::openapi_index_json().into_bytes();
             let static_bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
             Cow::Borrowed(static_bytes)
         });
@@ -267,7 +268,8 @@ impl PipeContext {
                 );
             } else if let Some(file) = DocAsset::get(&name) {
                 if name.ends_with("index.htm") || name.ends_with("index.html") {
-                    if let Some(path) = Path::new(&format!("{url_path}{name}")).parent() {
+                    if let Some(path) = std::path::Path::new(&format!("{url_path}{name}")).parent()
+                    {
                         if let Some(path) = path.to_str() {
                             let mut path = path.to_string();
                             if !path.ends_with('/') {

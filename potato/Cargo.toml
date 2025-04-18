@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -53,5 +53,6 @@ tikv-jemallocator = { version = "0.6.0", features = [
 ], optional = true }
 
 [features]
-default = []
+default = ["openapi"]
+openapi = []
 jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:tikv-jemallocator"]
