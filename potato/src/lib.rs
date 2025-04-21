@@ -876,5 +876,5 @@ pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
     ret
 }
 
-// cargo publish -p potato-macro --allow-dirty
-// cargo publish -p potato --allow-dirty
+// cargo publish -p potato-macro --allow-dirty --registry crates-io
+// cargo publish -p potato --allow-dirty --registry crates-io

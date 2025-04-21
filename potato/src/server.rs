@@ -2,6 +2,7 @@ use crate::utils::enums::HttpConnection;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use crate::{RequestHandlerFlag, WebsocketContext};
+use futures_util::StreamExt;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -35,6 +36,8 @@ pub enum PipeContextItem {
     FinalRoute(HttpResponse),
     #[cfg(feature = "jemalloc")]
     Jemalloc(String),
+    #[cfg(feature = "webdav")]
+    Webdav((String, dav_server::DavHandler)),
 }
 
 pub struct PipeContext {
@@ -83,6 +86,11 @@ impl PipeContext {
             ret.insert(format!("{url_path}/{key}"), value);
         }
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
+    }
+
+    #[cfg(feature = "jemalloc")]
+    pub fn use_jemalloc(&mut self, url_path: impl Into<String>) {
+        self.items.push(PipeContextItem::Jemalloc(url_path.into()));
     }
 
     #[cfg(feature = "openapi")]
@@ -285,9 +293,19 @@ impl PipeContext {
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
     }
 
-    #[cfg(feature = "jemalloc")]
-    pub fn use_jemalloc(&mut self, url_path: impl Into<String>) {
-        self.items.push(PipeContextItem::Jemalloc(url_path.into()));
+    #[cfg(feature = "webdav")]
+    pub fn use_webdav(&mut self, url_path: impl Into<String>, local_path: impl Into<String>) {
+        let dav_server = dav_server::DavHandler::builder()
+            .filesystem(dav_server::localfs::LocalFs::new(
+                local_path.into(),
+                false,
+                false,
+                false,
+            ))
+            .locksystem(dav_server::fakels::FakeLs::new())
+            .build_handler();
+        self.items
+            .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
 }
 
@@ -408,6 +426,32 @@ impl PipeHandlerContext {
                             Err(err) => HttpResponse::error(format!("{err}")),
                         };
                     }
+                }
+                #[cfg(feature = "webdav")]
+                PipeContextItem::Webdav((path, dav_server)) => {
+                    if !req.url_path.to_str().starts_with(path) {
+                        continue;
+                    }
+                    let new_req = http::Request::new(match req.body.to_buf().len() {
+                        0 => dav_server::body::Body::empty(),
+                        _ => {
+                            let bytes = bytes::Bytes::copy_from_slice(req.body.to_buf());
+                            dav_server::body::Body::from(bytes)
+                        }
+                    });
+                    let mut new_res = dav_server.handle(new_req).await;
+                    let res = {
+                        let mut res = HttpResponse::empty();
+                        for (k, v) in new_res.headers().iter() {
+                            res.add_header(k.as_str(), v.to_str().unwrap_or(""));
+                        }
+                        let body = new_res.body_mut();
+                        while let Some(Ok(part)) = body.next().await {
+                            res.body.extend(part.iter());
+                        }
+                        res
+                    };
+                    return res;
                 }
             }
         }
