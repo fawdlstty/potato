@@ -102,17 +102,24 @@ inventory::collect!(RequestHandlerFlag);
 #[derive(Clone, Copy, Debug, Display, Eq, Hash, PartialEq)]
 pub enum HttpMethod {
     GET,
-    POST,
     PUT,
-    DELETE,
+    COPY,
     HEAD,
-    OPTIONS,
-    CONNECT,
+    LOCK,
+    MOVE,
+    POST,
+    MKCOL,
     PATCH,
     TRACE,
+    DELETE,
+    UNLOCK,
+    CONNECT,
+    OPTIONS,
+    PROPFIND,
+    PROPPATCH,
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum CompressMode {
     None,
     Gzip,
@@ -319,6 +326,27 @@ impl HttpRequest {
         }
     }
 
+    pub fn get_uri(&self, is_https: bool) -> anyhow::Result<http::Uri> {
+        let mut q = self.url_path.to_string();
+        let mut is_first = true;
+        for (k, v) in self.url_query.iter() {
+            match is_first {
+                true => {
+                    is_first = false;
+                    q.push('?');
+                }
+                false => q.push('&'),
+            }
+            q.push_str(k.to_str());
+            q.push('=');
+            q.push_str(v.to_str());
+        }
+        Ok(http::uri::Builder::new()
+            .scheme(if is_https { "https" } else { "http" })
+            .path_and_query(q)
+            .build()?)
+    }
+
     pub fn from_url(url: &str, method: HttpMethod) -> anyhow::Result<(Self, bool, u16)> {
         let uri = url.parse::<Uri>()?;
         let mut req = Self::new();
@@ -359,8 +387,8 @@ impl HttpRequest {
         CompressMode::None
     }
 
-    pub fn get_header_host(&self) -> &str {
-        self.get_header_key(HeaderItem::Host).unwrap_or("")
+    pub fn get_header_host(&self) -> Option<&str> {
+        self.get_header_key(HeaderItem::Host)
     }
 
     pub fn get_header_connection(&self) -> HttpConnection {
@@ -520,13 +548,20 @@ impl HttpRequest {
             match method.len() {
                 3 if method == "GET" => HttpMethod::GET,
                 3 if method == "PUT" => HttpMethod::PUT,
+                4 if method == "COPY" => HttpMethod::COPY,
                 4 if method == "HEAD" => HttpMethod::HEAD,
+                4 if method == "LOCK" => HttpMethod::LOCK,
+                4 if method == "MOVE" => HttpMethod::MOVE,
                 4 if method == "POST" => HttpMethod::POST,
+                5 if method == "MKCOL" => HttpMethod::MKCOL,
                 5 if method == "PATCH" => HttpMethod::PATCH,
                 5 if method == "TRACE" => HttpMethod::TRACE,
                 6 if method == "DELETE" => HttpMethod::DELETE,
+                6 if method == "UNLOCK" => HttpMethod::UNLOCK,
                 7 if method == "OPTIONS" => HttpMethod::OPTIONS,
                 7 if method == "CONNECT" => HttpMethod::CONNECT,
+                8 if method == "PROPFIND" => HttpMethod::PROPFIND,
+                9 if method == "PROPPATCH" => HttpMethod::PROPPATCH,
                 _ => return Err(Error::msg(format!("unrecognized method: {method}"))),
             }
         };
@@ -722,25 +757,20 @@ impl HttpResponse {
     }
 
     pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {
-        #[allow(unused_assignments)]
         let mut payload_tmp = vec![];
-        let payload_ref = match cmode {
-            CompressMode::Gzip if self.body.len() >= 32 => match self.body.compress() {
-                Ok(data) => {
-                    payload_tmp = data;
-                    &payload_tmp
-                }
-                Err(_) => {
-                    cmode = CompressMode::None;
-                    &self.body
-                }
-            },
-            CompressMode::Gzip => {
-                cmode = CompressMode::None;
-                &self.body
+        let mut payload_ref = &self.body;
+        if cmode == CompressMode::Gzip
+            && self.body.len() >= 32
+            && self.get_header("Content-Encoding").is_none()
+        {
+            if let Ok(data) = self.body.compress() {
+                payload_tmp = data;
+                payload_ref = &payload_tmp;
             }
-            _ => &self.body,
-        };
+        }
+        if payload_tmp.len() == 0 {
+            cmode = CompressMode::None;
+        }
         //
         let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
         let status_str = self.http_code.http_code_to_desp();
@@ -751,6 +781,9 @@ impl HttpResponse {
             self.http_code
         ));
         for (key, value) in self.headers.iter() {
+            if key == "Content-Length" {
+                continue;
+            }
             ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
         }
         if self.http_code != 101 {
@@ -855,7 +888,7 @@ impl HttpResponse {
     }
 
     pub fn get_header(&self, key: &str) -> Option<&str> {
-        self.headers.get(key).map(|a| a.as_str())
+        self.headers.get(&key.http_std_case()).map(|a| a.as_str())
     }
 }
 

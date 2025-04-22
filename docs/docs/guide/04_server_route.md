@@ -56,7 +56,7 @@ server.configure(|ctx| {
 
 ## 内存泄露调试路由
 
-启用potato库的jemalloc特性：
+此功能的实现机制是接管程序的内存分配动作，每次分配时记录内存分配位置，然后在dump的地方遍历所有未释放的内存，打印内存分配信息。启用potato库的jemalloc特性：
 
 ```shell
 cargo add potato --features jemalloc
@@ -80,3 +80,22 @@ sudo apt install libjemalloc-dev graphviz ghostscript
 ```
 
 此后运行服务，请求 `/profile.pdf`，即可看到程序栈详细内存分配记录，如果存在内存泄露问题，找到报告里占比较大的函数重点排查
+
+## WebDAV 路由
+
+启用potato库的webdav特性：
+
+```shell
+cargo add potato --features webdav
+```
+
+然后在configure函数里加入如下代码：
+
+```rust
+server.configure(|ctx| {
+    // ...
+    ctx.use_webdav_localfs("/webdav", "/tmp");
+    // ctx.use_webdav_memfs("/webdav");
+    // ...
+});
+```

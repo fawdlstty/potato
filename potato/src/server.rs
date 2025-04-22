@@ -2,7 +2,6 @@ use crate::utils::enums::HttpConnection;
 use crate::utils::tcp_stream::TcpStreamExt;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use crate::{RequestHandlerFlag, WebsocketContext};
-use futures_util::StreamExt;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -294,14 +293,28 @@ impl PipeContext {
     }
 
     #[cfg(feature = "webdav")]
-    pub fn use_webdav(&mut self, url_path: impl Into<String>, local_path: impl Into<String>) {
+    pub fn use_webdav_localfs(
+        &mut self,
+        url_path: impl Into<String>,
+        local_path: impl Into<String>,
+    ) {
         let dav_server = dav_server::DavHandler::builder()
             .filesystem(dav_server::localfs::LocalFs::new(
                 local_path.into(),
-                false,
+                true,
                 false,
                 false,
             ))
+            .locksystem(dav_server::fakels::FakeLs::new())
+            .build_handler();
+        self.items
+            .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
+    }
+
+    #[cfg(feature = "webdav")]
+    pub fn use_webdav_memfs(&mut self, url_path: impl Into<String>) {
+        let dav_server = dav_server::DavHandler::builder()
+            .filesystem(dav_server::memfs::MemFs::new())
             .locksystem(dav_server::fakels::FakeLs::new())
             .build_handler();
         self.items
@@ -429,22 +442,52 @@ impl PipeHandlerContext {
                 }
                 #[cfg(feature = "webdav")]
                 PipeContextItem::Webdav((path, dav_server)) => {
+                    use crate::utils::string::StringExt;
+                    use futures_util::StreamExt;
                     if !req.url_path.to_str().starts_with(path) {
                         continue;
                     }
-                    let new_req = http::Request::new(match req.body.to_buf().len() {
-                        0 => dav_server::body::Body::empty(),
-                        _ => {
-                            let bytes = bytes::Bytes::copy_from_slice(req.body.to_buf());
-                            dav_server::body::Body::from(bytes)
+                    let new_req = {
+                        let mut new_req = http::Request::new(match req.body.to_buf().len() {
+                            0 => dav_server::body::Body::empty(),
+                            _ => {
+                                let bytes = bytes::Bytes::copy_from_slice(req.body.to_buf());
+                                dav_server::body::Body::from(bytes)
+                            }
+                        });
+
+                        if let Ok(method) =
+                            http::Method::from_bytes(req.method.to_string().as_bytes())
+                        {
+                            *new_req.method_mut() = method;
                         }
-                    });
-                    let mut new_res = dav_server.handle(new_req).await;
+                        *new_req.version_mut() = match req.version {
+                            9 => http::Version::HTTP_09,
+                            10 => http::Version::HTTP_10,
+                            11 => http::Version::HTTP_11,
+                            20 => http::Version::HTTP_2,
+                            30 => http::Version::HTTP_3,
+                            _ => http::Version::HTTP_11,
+                        };
+                        if let Ok(uri) = req.get_uri(false) {
+                            *new_req.uri_mut() = uri;
+                        }
+                        for (k, v) in req.headers.iter() {
+                            if let Ok(v) = http::HeaderValue::from_str(v.to_str()) {
+                                let k: &'static str = unsafe { std::mem::transmute(k.to_str()) };
+                                new_req.headers_mut().append(k, v);
+                            }
+                        }
+                        new_req
+                    };
                     let res = {
+                        let mut new_res = dav_server.handle(new_req).await;
                         let mut res = HttpResponse::empty();
                         for (k, v) in new_res.headers().iter() {
-                            res.add_header(k.as_str(), v.to_str().unwrap_or(""));
+                            res.add_header(k.as_str().http_std_case(), v.to_str().unwrap_or(""));
                         }
+                        res.http_code = new_res.status().as_u16();
+                        res.version = format!("{:?}", new_res.version());
                         let body = new_res.body_mut();
                         while let Some(Ok(part)) = body.next().await {
                             res.body.extend(part.iter());
@@ -542,9 +585,9 @@ impl HttpServer {
                     let conn = req.get_header_connection();
                     let res = pipe_ctx.handle_request(req).await;
                     if let Some(stream) = pipe_ctx.stream.as_mut() {
-                        if stream.write_all(&res.as_bytes(cmode)).await.is_ok() {
-                            buf.drain(..n);
-                            continue;
+                        match stream.write_all(&res.as_bytes(cmode)).await {
+                            Ok(()) => _ = buf.drain(..n),
+                            Err(_) => break,
                         }
                     }
                     if conn != HttpConnection::KeepAlive {
@@ -594,9 +637,9 @@ impl HttpServer {
                     let conn = req.get_header_connection();
                     let res = pipe_ctx.handle_request(req).await;
                     if let Some(stream) = pipe_ctx.stream.as_mut() {
-                        if stream.write_all(&res.as_bytes(cmode)).await.is_ok() {
-                            buf.drain(..n);
-                            continue;
+                        match stream.write_all(&res.as_bytes(cmode)).await {
+                            Ok(()) => _ = buf.drain(..n),
+                            Err(_) => break,
                         }
                     }
                     if conn != HttpConnection::KeepAlive {

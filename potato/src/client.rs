@@ -109,7 +109,7 @@ impl Session {
         url: &str,
     ) -> anyhow::Result<HttpRequest> {
         let (mut req, use_ssl, port) = HttpRequest::from_url(url, method)?;
-        let host = req.get_header_host().to_string();
+        let host = req.get_header_host().unwrap_or("127.0.0.1").to_string();
         let mut is_same_host = false;
         if let Some(sess_impl) = &mut self.sess_impl {
             let (host1, use_ssl1, port1) = &sess_impl.unique_host;

@@ -19,7 +19,7 @@ pub fn init_jemalloc() -> anyhow::Result<()> {
     INIT_JEMALLOC.store(false, Ordering::SeqCst);
     //
     if let Ok(conf) = std::env::var("MALLOC_CONF") {
-        if &conf == "prof:true" {
+        if conf.contains("prof:true") {
             const PROF_ACTIVE: &'static [u8] = b"prof.active\0";
             let name = PROF_ACTIVE.name();
             match name.write(true) {
