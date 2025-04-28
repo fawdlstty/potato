@@ -1,7 +1,7 @@
 use crate::utils::enums::HttpConnection;
-use crate::utils::tcp_stream::TcpStreamExt;
+use crate::utils::tcp_stream::{HttpStream, TcpStreamExt, TcpStreamExt2};
+use crate::RequestHandlerFlag;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
-use crate::{RequestHandlerFlag, WebsocketContext};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::select;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
@@ -320,29 +320,9 @@ impl PipeContext {
         self.items
             .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
-}
 
-pub struct PipeHandlerContext {
-    pipe_ctx: Arc<PipeContext>,
-    client_addr: SocketAddr,
-    pub stream: Option<Box<dyn TcpStreamExt>>,
-}
-
-impl PipeHandlerContext {
-    pub fn new(
-        pipe_ctx: Arc<PipeContext>,
-        client_addr: SocketAddr,
-        stream: Box<dyn TcpStreamExt>,
-    ) -> Self {
-        Self {
-            pipe_ctx,
-            client_addr,
-            stream: Some(stream),
-        }
-    }
-
-    pub async fn handle_request(&mut self, req: HttpRequest) -> HttpResponse {
-        for item in self.pipe_ctx.items.iter() {
+    pub async fn handle_request(&self, req: &mut HttpRequest) -> HttpResponse {
+        for item in self.items.iter() {
             match item {
                 PipeContextItem::Handlers => {
                     let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
@@ -350,15 +330,7 @@ impl PipeHandlerContext {
                         None => None,
                     };
                     if let Some(handler_ref) = handler_ref {
-                        let mut wsctx = WebsocketContext {
-                            stream: self.stream.take().unwrap(),
-                            upgrade_ws: false,
-                        };
-                        let res = handler_ref(req, self.client_addr, &mut wsctx).await;
-                        if !wsctx.is_upgraded_websocket() {
-                            self.stream = Some(wsctx.stream);
-                        }
-                        return res;
+                        return handler_ref(req).await;
                     } else {
                         if req.method == HttpMethod::HEAD {
                             return HttpResponse::empty();
@@ -565,26 +537,30 @@ impl HttpServer {
 
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
 
         loop {
+            let pipe_ctx2 = Arc::clone(&pipe_ctx);
             // accept connection
             let (stream, client_addr) = listener.accept().await?;
-            let mut pipe_ctx =
-                PipeHandlerContext::new(Arc::clone(&self.pipe_ctx), client_addr, Box::new(stream));
+            let stream = Arc::new(Mutex::new(HttpStream::from_tcp(stream)));
             _ = tokio::task::spawn(async move {
+                let client_addr = Arc::new(client_addr);
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
                 loop {
-                    let (req, n) = {
-                        let stream = pipe_ctx.stream.as_mut().unwrap();
-                        match HttpRequest::from_stream(&mut buf, stream).await {
+                    let (mut req, n) = {
+                        match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
                             Ok((req, n)) => (req, n),
                             Err(_) => break,
                         }
                     };
+                    req.add_ext(Arc::clone(&client_addr));
+                    req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res = pipe_ctx.handle_request(req).await;
-                    if let Some(stream) = pipe_ctx.stream.as_mut() {
+                    let res = pipe_ctx2.handle_request(&mut req).await;
+                    {
+                        let mut stream = stream.lock().await;
                         match stream.write_all(&res.as_bytes(cmode)).await {
                             Ok(()) => _ = buf.drain(..n),
                             Err(_) => break,
@@ -611,8 +587,10 @@ impl HttpServer {
             .with_no_client_auth()
             .with_single_cert(certs, key)?;
         let acceptor = TlsAcceptor::from(Arc::new(config));
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
 
         loop {
+            let pipe_ctx2 = Arc::clone(&pipe_ctx);
             // accept connection
             let (stream, client_addr) = listener.accept().await?;
             let acceptor = acceptor.clone();
@@ -620,23 +598,24 @@ impl HttpServer {
                 Ok(stream) => stream,
                 Err(_) => continue,
             };
-            let stream: Box<dyn TcpStreamExt> = Box::new(stream);
-            let mut pipe_ctx =
-                PipeHandlerContext::new(Arc::clone(&self.pipe_ctx), client_addr, stream);
+            let stream = Arc::new(Mutex::new(HttpStream::from_tls(stream)));
             _ = tokio::task::spawn(async move {
+                let client_addr = Arc::new(client_addr);
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
                 loop {
-                    let (req, n) = {
-                        let stream = pipe_ctx.stream.as_mut().unwrap();
-                        match HttpRequest::from_stream(&mut buf, stream).await {
+                    let (mut req, n) = {
+                        match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
                             Ok((req, n)) => (req, n),
                             Err(_) => break,
                         }
                     };
+                    req.add_ext(Arc::clone(&client_addr));
+                    req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res = pipe_ctx.handle_request(req).await;
-                    if let Some(stream) = pipe_ctx.stream.as_mut() {
+                    let res = pipe_ctx2.handle_request(&mut req).await;
+                    {
+                        let mut stream = stream.lock().await;
                         match stream.write_all(&res.as_bytes(cmode)).await {
                             Ok(()) => _ = buf.drain(..n),
                             Err(_) => break,

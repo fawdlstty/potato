@@ -11,6 +11,7 @@ pub use regex;
 pub use rust_embed;
 pub use serde_json;
 pub use server::*;
+use tokio::sync::Mutex;
 pub use utils::refstr::Headers;
 
 #[cfg(feature = "jemalloc")]
@@ -23,12 +24,13 @@ use http::uri::Scheme;
 use http::Uri;
 use rust_embed::Embed;
 use sha1::{Digest, Sha1};
+use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::sync::LazyLock;
-use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin};
+use std::sync::{Arc, LazyLock};
+use std::{collections::HashMap, future::Future, pin::Pin};
 use strum::Display;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use utils::bytes::CompressExt;
@@ -37,16 +39,12 @@ use utils::number::HttpCodeExt;
 use utils::refbuf::{RefOrBuffer, ToRefBufExt};
 use utils::refstr::{HeaderItem, HeaderRefOrString, RefOrString, ToRefStrExt};
 use utils::string::StringExt;
-use utils::tcp_stream::{TcpStreamExt, VecU8Ext};
+use utils::tcp_stream::{HttpStream, TcpStreamExt, VecU8Ext};
 
 static SERVER_STR: LazyLock<String> =
     LazyLock::new(|| format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
 
-type HttpHandler = fn(
-    HttpRequest,
-    SocketAddr,
-    &mut WebsocketContext,
-) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>;
+type HttpHandler = fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>;
 
 pub struct RequestHandlerFlagDoc {
     pub show: bool,
@@ -125,45 +123,16 @@ pub enum CompressMode {
     Gzip,
 }
 
-pub struct WebsocketContext {
-    stream: Box<dyn TcpStreamExt>,
-    upgrade_ws: bool,
+pub struct WebsocketConnection {
+    stream: Arc<Mutex<HttpStream>>,
 }
 
-impl WebsocketContext {
-    pub fn is_upgraded_websocket(&self) -> bool {
-        self.upgrade_ws
-    }
-
-    pub async fn upgrade_websocket(
-        &mut self,
-        req: &HttpRequest,
-    ) -> anyhow::Result<WebsocketConnection> {
-        if !req.is_websocket() {
-            return Err(anyhow::Error::msg("is not a websocket request"));
-        }
-        let ws_key = req.get_header("Sec-WebSocket-Key").unwrap();
-        // let ws_ext = req.get_header("Sec-WebSocket-Extensions").unwrap_or("".to_string());
-        let res = HttpResponse::from_websocket(ws_key);
-        self.stream
-            .write_all(&res.as_bytes(CompressMode::None))
-            .await?;
-        self.upgrade_ws = true;
-        Ok(WebsocketConnection {
-            stream: &mut self.stream,
-        })
-    }
-}
-
-pub struct WebsocketConnection<'a> {
-    stream: &'a mut Box<dyn TcpStreamExt>,
-}
-
-impl<'a> WebsocketConnection<'_> {
+impl WebsocketConnection {
     pub async fn recv_frame_impl(&mut self) -> anyhow::Result<WsFrameImpl> {
+        let mut stream = self.stream.lock().await;
         let buf = {
             let mut buf = [0u8; 2];
-            self.stream.read_exact(&mut buf).await?;
+            stream.read_exact(&mut buf).await?;
             buf
         };
         //let fin = buf[0] & 0b1000_0000 != 0;
@@ -173,12 +142,12 @@ impl<'a> WebsocketConnection<'_> {
             match payload_len {
                 126 => {
                     let mut buf = [0u8; 2];
-                    self.stream.read_exact(&mut buf).await?;
+                    stream.read_exact(&mut buf).await?;
                     u16::from_be_bytes(buf) as usize
                 }
                 127 => {
                     let mut buf = [0u8; 8];
-                    self.stream.read_exact(&mut buf).await?;
+                    stream.read_exact(&mut buf).await?;
                     u64::from_be_bytes(buf) as usize
                 }
                 _ => payload_len as usize,
@@ -187,13 +156,13 @@ impl<'a> WebsocketConnection<'_> {
         let omask_key = match buf[1] & 0b1000_0000 != 0 {
             true => {
                 let mut mask_key = [0u8; 4];
-                self.stream.read_exact(&mut mask_key).await?;
+                stream.read_exact(&mut mask_key).await?;
                 Some(mask_key)
             }
             false => None,
         };
         let mut payload = vec![0u8; payload_len];
-        self.stream.read_exact(&mut payload).await?;
+        stream.read_exact(&mut payload).await?;
         if let Some(mask_key) = omask_key {
             for i in 0..payload.len() {
                 payload[i] ^= mask_key[i % 4];
@@ -256,8 +225,9 @@ impl<'a> WebsocketConnection<'_> {
             buf.push(127);
             buf.extend((payload_len as u64).to_be_bytes().iter());
         }
-        self.stream.write_all(&buf).await?;
-        self.stream.write_all(&payload).await?;
+        let mut stream = self.stream.lock().await;
+        stream.write_all(&buf).await?;
+        stream.write_all(&payload).await?;
         Ok(())
     }
 
@@ -307,6 +277,7 @@ pub struct HttpRequest {
     pub body: RefOrBuffer,
     pub body_pairs: HashMap<RefOrString, RefOrString>,
     pub body_files: HashMap<RefOrString, PostFile>,
+    pub exts: HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>>,
 }
 
 unsafe impl Send for HttpRequest {}
@@ -323,7 +294,25 @@ impl HttpRequest {
             body: [].to_ref_buffer(),
             body_pairs: HashMap::with_capacity(16),
             body_files: HashMap::with_capacity(4),
+            exts: HashMap::new(),
         }
+    }
+
+    fn add_ext<T: Any + Send + Sync + 'static>(&mut self, item: Arc<T>) {
+        let type_id = TypeId::of::<T>();
+        self.exts.insert(type_id, item);
+    }
+
+    fn get_ext<T: Any + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
+        self.exts
+            .get(&TypeId::of::<T>())
+            .and_then(|any| any.clone().downcast().ok())
+    }
+
+    fn remove_ext<T: Any + Send + Sync + 'static>(&mut self) -> Option<Arc<T>> {
+        self.exts
+            .remove(&TypeId::of::<T>())
+            .and_then(|any| any.clone().downcast().ok())
     }
 
     pub fn get_uri(&self, is_https: bool) -> anyhow::Result<http::Uri> {
@@ -436,10 +425,32 @@ impl HttpRequest {
         true
     }
 
+    pub async fn upgrade_websocket(&mut self) -> anyhow::Result<WebsocketConnection> {
+        if !self.is_websocket() {
+            Err(anyhow!("it is not a websocket request"))?;
+        }
+        let ws_key = self
+            .get_header("Sec-WebSocket-Key")
+            .unwrap_or("")
+            .to_string();
+        // let ws_ext = req.get_header("Sec-WebSocket-Extensions").unwrap_or("".to_string());
+        let stream = match self.remove_ext::<Mutex<HttpStream>>() {
+            Some(stream) => stream,
+            None => Err(anyhow!("connot get stream"))?,
+        };
+        {
+            let mut stream = stream.lock().await;
+            let res = HttpResponse::from_websocket(&ws_key);
+            stream.write_all(&res.as_bytes(CompressMode::None)).await?;
+        }
+        Ok(WebsocketConnection { stream })
+    }
+
     pub async fn from_stream(
         buf: &mut Vec<u8>,
-        stream: &mut Box<dyn TcpStreamExt>,
+        stream: Arc<Mutex<HttpStream>>,
     ) -> anyhow::Result<(Self, usize)> {
+        let mut stream = stream.lock().await;
         let mut tmp_buf = [0u8; 1024];
         let (mut req, hdr_len) = loop {
             let n = stream.read(&mut tmp_buf).await?;

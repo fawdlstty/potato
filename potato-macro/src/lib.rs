@@ -117,8 +117,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             let arg_name_str = arg.pat.to_token_stream().to_string();
             args.push(match &arg_type_str[..] {
                 "HttpRequest" => quote! { req },
-                "SocketAddr" => quote! { client },
-                "& mut WebsocketContext" => quote! { wsctx },
                 "PostFile" => {
                     doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                     quote! {
@@ -148,7 +146,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                                     }
                                     match potato::ServerAuth::jwt_check(&auth).await {
                                         Ok(payload) => payload,
-                                        Err(err) => return HttpResponse::error(format!("auth failed: {:?}", err)),
+                                        Err(err) => return HttpResponse::error(format!("auth failed: {err:?}")),
                                     }
                                 }
                                 None => return HttpResponse::error("miss header : Authorization"),
@@ -224,17 +222,13 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         #root_fn
 
         #[doc(hidden)]
-        async fn #wrap_func_name2(
-            req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &mut potato::WebsocketContext
-        ) -> potato::HttpResponse {
+        async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
             #wrap_func_body
         }
 
         #[doc(hidden)]
-        fn #wrap_func_name<'a>(
-            req: potato::HttpRequest, client: std::net::SocketAddr, wsctx: &'a mut potato::WebsocketContext
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + 'a>> {
-            Box::pin(#wrap_func_name2(req, client, wsctx))
+        fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
+            Box::pin(#wrap_func_name2(req))
         }
 
         potato::inventory::submit!{potato::RequestHandlerFlag::new(

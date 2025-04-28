@@ -23,7 +23,7 @@ http = "1.2.0"
 httparse = "1.9.5"
 inventory = "0.3.15"
 jsonwebtoken = "9.3.0"
-potato-macro = "0.2.0"                                                                        # { path = "../potato-macro" }
+potato-macro =  { path = "../potato-macro" } # "0.2.0"
 rand = "0.8.5"
 regex = "1.11.1"
 rust-embed = "8.5.0"
