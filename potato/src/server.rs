@@ -1,5 +1,5 @@
 use crate::utils::enums::HttpConnection;
-use crate::utils::tcp_stream::{HttpStream, TcpStreamExt, TcpStreamExt2};
+use crate::utils::tcp_stream::HttpStream;
 use crate::RequestHandlerFlag;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use std::borrow::Cow;
@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::sync::{oneshot, Mutex};
@@ -566,6 +565,9 @@ impl HttpServer {
                             Err(_) => break,
                         }
                     }
+                    if req.get_ext::<Mutex<HttpStream>>().is_none() {
+                        break;
+                    }
                     if conn != HttpConnection::KeepAlive {
                         break;
                     }
@@ -620,6 +622,9 @@ impl HttpServer {
                             Ok(()) => _ = buf.drain(..n),
                             Err(_) => break,
                         }
+                    }
+                    if req.get_ext::<Mutex<HttpStream>>().is_none() {
+                        break;
                     }
                     if conn != HttpConnection::KeepAlive {
                         break;
