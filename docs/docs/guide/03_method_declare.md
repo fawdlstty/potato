@@ -2,14 +2,18 @@
 
 ## 参数
 
-参数参数有两类，一类是获取请求相关对象，一类是定义请求参数。
-
-请求相关对象有三个，分别用于获取请求对象、获取客户端socket地址、获取websocket上下文
+参数可以直接接受请求对象，也可以定义自定义请求参数，这请求参数将要求HTTP请求的query string或者body附带此值。示例请求对象：
 
 ```rust
 #[http_get("/hello")]
-async fn hello(req: HttpRequest, client: std::net::SocketAddr, wsctx: &mut WebsocketContext) -> HttpResponse {
+async fn hello(req: &mut HttpRequest) -> HttpResponse {
     HttpResponse::html("hello world")
+}
+
+#[http_get("/hello")]
+async fn hello2(req: &mut HttpRequest) -> anyhow::Result<HttpResponse> {
+    let addr = req.get_client_addr().await?;
+    Ok(HttpResponse::html(format!("hello client: {addr:?}")))
 }
 ```
 
@@ -17,8 +21,8 @@ async fn hello(req: HttpRequest, client: std::net::SocketAddr, wsctx: &mut Webso
 
 ```rust
 #[http_get("/ws")]
-async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Result<()> {
-    let mut ws = wsctx.upgrade_websocket(&req).await?;
+async fn websocket(req: &mut HttpRequest) -> anyhow::Result<()> {
+    let mut ws = req.upgrade_websocket().await?;
     ws.send_ping().await?;
     loop {
         match ws.recv_frame().await? {

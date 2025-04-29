@@ -28,6 +28,7 @@ use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::Read;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::{collections::HashMap, future::Future, pin::Pin};
@@ -443,6 +444,13 @@ impl HttpRequest {
             stream.write_all(&res.as_bytes(CompressMode::None)).await?;
         }
         Ok(WebsocketConnection { stream })
+    }
+
+    pub async fn get_client_addr(&self) -> anyhow::Result<SocketAddr> {
+        match self.get_ext::<SocketAddr>() {
+            Some(addr) => Ok((*addr).clone()),
+            None => Err(anyhow!("no addr info")),
+        }
     }
 
     pub async fn from_stream(

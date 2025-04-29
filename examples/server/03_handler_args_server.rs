@@ -1,8 +1,9 @@
 use potato::*;
 
 #[http_get("/hello")]
-async fn hello(req: &mut HttpRequest) -> HttpResponse {
-    HttpResponse::html("hello world")
+async fn hello(req: &mut HttpRequest) -> anyhow::Result<HttpResponse> {
+    let addr = req.get_client_addr().await?;
+    Ok(HttpResponse::html(format!("hello client: {addr:?}")))
 }
 
 #[http_get("/hello_user")]
