@@ -400,7 +400,7 @@ impl HttpRequest {
         if self.method != HttpMethod::GET {
             return false;
         }
-        if self.get_header_connection() == HttpConnection::Upgrade {
+        if self.get_header_connection() != HttpConnection::Upgrade {
             return false;
         }
         if self

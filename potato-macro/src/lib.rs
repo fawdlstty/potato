@@ -116,7 +116,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 .type_simplify();
             let arg_name_str = arg.pat.to_token_stream().to_string();
             args.push(match &arg_type_str[..] {
-                "HttpRequest" => quote! { req },
+                "& mut HttpRequest" => quote! { req },
                 "PostFile" => {
                     doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                     quote! {

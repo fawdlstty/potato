@@ -2,7 +2,8 @@ use potato::*;
 
 #[http_get("/")]
 async fn index() -> HttpResponse {
-    HttpResponse::html(r#"<!DOCTYPE html><html>
+    HttpResponse::html(
+        r#"<!DOCTYPE html><html>
         <head><title>Websocket Test</title></head>
         <body>
             <h1>Websocket Test</h1>
@@ -12,15 +13,19 @@ async fn index() -> HttpResponse {
                 const ws = new WebSocket(`ws://${location.host}/ws`);
                 ws.onopen = function() {
                     status.innerHTML = '<p><em>Connected!</em></p>';
+                    ws.send('hello world1');
+                    ws.send('hello world2');
+                    ws.send('hello world3');
                 };
             </script>
         </body>
-    </html>"#)
+    </html>"#,
+    )
 }
 
 #[http_get("/ws")]
-async fn websocket(req: HttpRequest, wsctx: &mut WebsocketContext) -> anyhow::Result<()> {
-    let mut ws = wsctx.upgrade_websocket(&req).await?;
+async fn websocket(req: &mut HttpRequest) -> anyhow::Result<()> {
+    let mut ws = req.upgrade_websocket().await?;
     ws.send_ping().await?;
     loop {
         match ws.recv_frame().await? {
