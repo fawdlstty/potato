@@ -14,15 +14,15 @@ features:
   - title: 高性能、极简
     details: 纯Rust语言实现，速度快，几行代码即可实现HTTP服务器/客户端
   - title: OpenAPI支持
-    details: 支持OpenAPI规范，原生支持生成API文档
+    details: 支持OpenAPI规范，支持生成API文档
   - title: 静态资源打包
     details: 支持静态HTTP资源文件打包，方便部署
   - title: JwtAuth校验支持
     details: 内置JwtAuth校验功能，方便API鉴权
-  - title: 支持广泛
-    details: 支持HTTP1.1 Client/Server、支持Websocket、支持TLS
   - title: 内存泄露排查
     details: 内置jemalloc内存泄露检测功能，方便排查内存泄露
+  - title: WebDAV支持
+    details: 支持服务器端WebDAV协议
 
 footer: MIT Licensed | Copyright © 2025 potato
 ---
