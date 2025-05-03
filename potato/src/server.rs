@@ -1,11 +1,13 @@
 use crate::utils::enums::HttpConnection;
 use crate::utils::tcp_stream::HttpStream;
-use crate::RequestHandlerFlag;
+use crate::{HttpHandler, RequestHandlerFlag};
 use crate::{HttpMethod, HttpRequest, HttpResponse};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::net::TcpListener;
 use tokio::select;
@@ -13,6 +15,16 @@ use tokio::sync::{oneshot, Mutex};
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
+
+type CustomNextHandler =
+    Box<dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>>;
+
+type CustomHandler = dyn Fn(
+        &mut HttpRequest,
+        CustomNextHandler,
+    ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
+    + Send
+    + Sync;
 
 static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static RequestHandlerFlag>>> =
     LazyLock::new(|| {
@@ -32,6 +44,7 @@ pub enum PipeContextItem {
     LocationRoute((String, String)),
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
+    Custom(Arc<CustomHandler>),
     #[cfg(feature = "jemalloc")]
     Jemalloc(String),
     #[cfg(feature = "webdav")]
@@ -84,6 +97,19 @@ impl PipeContext {
             ret.insert(format!("{url_path}/{key}"), value);
         }
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
+    }
+
+    pub fn use_custom<F>(&mut self, callback: F)
+    where
+        F: Fn(
+                &mut HttpRequest,
+                CustomNextHandler,
+            ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.items.push(PipeContextItem::Custom(Arc::new(callback)));
     }
 
     #[cfg(feature = "jemalloc")]
@@ -320,8 +346,12 @@ impl PipeContext {
             .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
 
-    pub async fn handle_request(&self, req: &mut HttpRequest) -> HttpResponse {
-        for item in self.items.iter() {
+    pub async fn handle_request(
+        self2: Arc<PipeContext>,
+        req: &mut HttpRequest,
+        skip: usize,
+    ) -> HttpResponse {
+        for (idx, item) in self2.items.iter().enumerate().skip(skip) {
             match item {
                 PipeContextItem::Handlers => {
                     let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
@@ -402,6 +432,12 @@ impl PipeContext {
                     continue;
                 }
                 PipeContextItem::FinalRoute(res) => return res.clone(),
+                PipeContextItem::Custom(handler) => {
+                    let next = Box::new(|r| {
+                        Box::pin(async move { Self::handle_request(self2, r, idx + 1).await })
+                    }) as CustomNextHandler;
+                    return handler.as_ref()(req, next).await;
+                }
                 #[cfg(feature = "jemalloc")]
                 PipeContextItem::Jemalloc(path) => {
                     if path == req.url_path.to_str() {
@@ -557,7 +593,8 @@ impl HttpServer {
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res = pipe_ctx2.handle_request(&mut req).await;
+                    let res =
+                        PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
                         match stream.write_all(&res.as_bytes(cmode)).await {
@@ -615,7 +652,8 @@ impl HttpServer {
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res = pipe_ctx2.handle_request(&mut req).await;
+                    let res =
+                        PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
                         match stream.write_all(&res.as_bytes(cmode)).await {
