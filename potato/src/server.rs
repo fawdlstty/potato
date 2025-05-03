@@ -100,17 +100,15 @@ impl PipeContext {
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
     }
 
-    pub fn use_custom<F>(&mut self, callback: F)
+    pub fn use_custom<F, R>(&mut self, callback: F)
     where
-        F: Fn(
-                &mut HttpRequest,
-                CustomNextHandler,
-            ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
-            + Send
-            + Sync
-            + 'static,
+        F: for<'a> Fn(&'a mut HttpRequest, CustomNextHandler) -> R + Send + Sync + 'static,
+        R: Future<Output = HttpResponse> + Send + Sync + 'static,
     {
-        self.items.push(PipeContextItem::Custom(Arc::new(callback)));
+        self.items
+            .push(PipeContextItem::Custom(Arc::new(|req, next| {
+                Box::pin(async move { callback(req, next).await })
+            })));
     }
 
     #[cfg(feature = "jemalloc")]
@@ -348,8 +346,13 @@ impl PipeContext {
     }
 
     #[async_recursion]
-    pub async fn handle_request(&self, req: &mut HttpRequest, skip: usize) -> HttpResponse {
-        for (idx, item) in self.items.iter().enumerate().skip(skip) {
+    pub async fn handle_request(
+        self2: Arc<PipeContext>,
+        req: &mut HttpRequest,
+        skip: usize,
+    ) -> HttpResponse {
+        let self3 = Arc::clone(&self2);
+        for (idx, item) in self2.items.iter().enumerate().skip(skip) {
             match item {
                 PipeContextItem::Handlers => {
                     let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
@@ -431,8 +434,11 @@ impl PipeContext {
                 }
                 PipeContextItem::FinalRoute(res) => return res.clone(),
                 PipeContextItem::Custom(handler) => {
-                    let next = Box::new(|r| Box::pin(self.handle_request(r, idx + 1)))
-                        as CustomNextHandler;
+                    //let next = Box::new(|r| self.handle_request(r, idx + 1)) as CustomNextHandler;
+                    let next: CustomNextHandler = Box::new(move |r: &mut HttpRequest| {
+                        let self4 = Arc::clone(&self3);
+                        Box::pin(async move { Self::handle_request(self4, r, idx + 1).await })
+                    });
                     return handler.as_ref()(req, next).await;
                 }
                 #[cfg(feature = "jemalloc")]
@@ -590,7 +596,7 @@ impl HttpServer {
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res = pipe_ctx2.handle_request(&mut req, 0).await;
+                    let res = PipeContext::handle_request(pipe_ctx2.clone(), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
                         match stream.write_all(&res.as_bytes(cmode)).await {
@@ -648,7 +654,7 @@ impl HttpServer {
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res = pipe_ctx2.handle_request(&mut req, 0).await;
+                    let res = PipeContext::handle_request(pipe_ctx2.clone(), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
                         match stream.write_all(&res.as_bytes(cmode)).await {
