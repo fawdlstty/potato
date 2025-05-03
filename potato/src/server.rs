@@ -1,7 +1,8 @@
 use crate::utils::enums::HttpConnection;
 use crate::utils::tcp_stream::HttpStream;
-use crate::{HttpHandler, RequestHandlerFlag};
+use crate::RequestHandlerFlag;
 use crate::{HttpMethod, HttpRequest, HttpResponse};
+use async_recursion::async_recursion;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -346,12 +347,9 @@ impl PipeContext {
             .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
 
-    pub async fn handle_request(
-        self2: Arc<PipeContext>,
-        req: &mut HttpRequest,
-        skip: usize,
-    ) -> HttpResponse {
-        for (idx, item) in self2.items.iter().enumerate().skip(skip) {
+    #[async_recursion]
+    pub async fn handle_request(&self, req: &mut HttpRequest, skip: usize) -> HttpResponse {
+        for (idx, item) in self.items.iter().enumerate().skip(skip) {
             match item {
                 PipeContextItem::Handlers => {
                     let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
@@ -433,9 +431,8 @@ impl PipeContext {
                 }
                 PipeContextItem::FinalRoute(res) => return res.clone(),
                 PipeContextItem::Custom(handler) => {
-                    let next = Box::new(|r| {
-                        Box::pin(async move { Self::handle_request(self2, r, idx + 1).await })
-                    }) as CustomNextHandler;
+                    let next = Box::new(|r| Box::pin(self.handle_request(r, idx + 1)))
+                        as CustomNextHandler;
                     return handler.as_ref()(req, next).await;
                 }
                 #[cfg(feature = "jemalloc")]
@@ -593,8 +590,7 @@ impl HttpServer {
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res =
-                        PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
+                    let res = pipe_ctx2.handle_request(&mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
                         match stream.write_all(&res.as_bytes(cmode)).await {
@@ -652,8 +648,7 @@ impl HttpServer {
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res =
-                        PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
+                    let res = pipe_ctx2.handle_request(&mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
                         match stream.write_all(&res.as_bytes(cmode)).await {
