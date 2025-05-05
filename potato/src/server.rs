@@ -106,8 +106,8 @@ impl PipeContext {
         R: Future<Output = HttpResponse> + Send + Sync + 'static,
     {
         self.items
-            .push(PipeContextItem::Custom(Arc::new(|req, next| {
-                Box::pin(async move { callback(req, next).await })
+            .push(PipeContextItem::Custom(Arc::new(move |req, next| {
+                Box::pin(callback(req, next))
             })));
     }
 

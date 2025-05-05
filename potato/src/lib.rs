@@ -635,6 +635,7 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 unsafe impl Send for HttpResponse {}
+unsafe impl Sync for HttpResponse {}
 
 macro_rules! make_resp_by_text {
     ($fn_name:ident, $cnt_type:expr) => {
