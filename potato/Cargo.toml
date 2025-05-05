@@ -24,7 +24,7 @@ http = "1.2.0"
 httparse = "1.9.5"
 inventory = "0.3.15"
 jsonwebtoken = "9.3.0"
-potato-macro = "0.2.6" # { path = "../potato-macro" }
+potato-macro = { path = "../potato-macro" }                                                   # "0.2.6"
 rand = "0.8.5"
 regex = "1.11.1"
 rust-embed = "8.5.0"
@@ -36,10 +36,7 @@ smallstr = "0.3.0"
 smallvec = "1.14.0"
 strum = { version = "0.26.3", features = ["derive"] }
 tokio = { version = "1.44.1", features = ["full"] }
-tokio-rustls = { version = "0.26.2", default-features = false, features = [
-    "ring",
-    "tls12",
-] }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "0.26.8"
 
 # jemalloc
@@ -63,10 +60,6 @@ futures-util = { version = "0.3.31", optional = true }
 
 [features]
 default = ["openapi"]
-jemalloc = [
-    "dep:tikv-jemalloc-ctl",
-    "dep:tikv-jemalloc-sys",
-    "dep:tikv-jemallocator",
-]
+jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:tikv-jemallocator"]
 openapi = []
 webdav = ["dep:bytes", "dep:dav-server", "dep:futures-util"]

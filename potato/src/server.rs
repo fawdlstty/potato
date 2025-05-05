@@ -17,13 +17,16 @@ use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
 
-type CustomNextHandler =
-    Box<dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>> + Send>;
+type CustomNextHandler = Box<
+    dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
+        + Send
+        + Sync,
+>;
 
 type CustomHandler = dyn Fn(
         &mut HttpRequest,
         CustomNextHandler,
-    ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>
+    ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
     + Send
     + Sync;
 
@@ -345,13 +348,12 @@ impl PipeContext {
             .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
 
-    #[async_recursion]
+    #[async_recursion(Sync)]
     pub async fn handle_request(
         self2: Arc<PipeContext>,
         req: &mut HttpRequest,
         skip: usize,
     ) -> HttpResponse {
-        let self3 = Arc::clone(&self2);
         for (idx, item) in self2.items.iter().enumerate().skip(skip) {
             match item {
                 PipeContextItem::Handlers => {
@@ -434,9 +436,10 @@ impl PipeContext {
                 }
                 PipeContextItem::FinalRoute(res) => return res.clone(),
                 PipeContextItem::Custom(handler) => {
+                    let self3 = Arc::clone(&self2);
                     let next: CustomNextHandler = Box::new(move |r: &mut HttpRequest| {
                         let self4 = Arc::clone(&self3);
-                        Box::pin(Self::handle_request(self4, r, idx + 1))
+                        Self::handle_request(self4, r, idx + 1)
                     });
                     return handler.as_ref()(req, next).await;
                 }

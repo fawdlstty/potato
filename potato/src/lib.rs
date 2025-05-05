@@ -44,7 +44,8 @@ use utils::tcp_stream::{HttpStream, TcpStreamExt, VecU8Ext};
 static SERVER_STR: LazyLock<String> =
     LazyLock::new(|| format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
 
-type HttpHandler = fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>;
+type HttpHandler =
+    fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>;
 
 pub struct RequestHandlerFlagDoc {
     pub show: bool,
