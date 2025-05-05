@@ -18,12 +18,12 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
 
 type CustomNextHandler =
-    Box<dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>>;
+    Box<dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>> + Send>;
 
 type CustomHandler = dyn Fn(
         &mut HttpRequest,
         CustomNextHandler,
-    ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
+    ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>
     + Send
     + Sync;
 
@@ -434,10 +434,9 @@ impl PipeContext {
                 }
                 PipeContextItem::FinalRoute(res) => return res.clone(),
                 PipeContextItem::Custom(handler) => {
-                    //let next = Box::new(|r| self.handle_request(r, idx + 1)) as CustomNextHandler;
                     let next: CustomNextHandler = Box::new(move |r: &mut HttpRequest| {
                         let self4 = Arc::clone(&self3);
-                        Box::pin(async move { Self::handle_request(self4, r, idx + 1).await })
+                        Box::pin(Self::handle_request(self4, r, idx + 1))
                     });
                     return handler.as_ref()(req, next).await;
                 }
