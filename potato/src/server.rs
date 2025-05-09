@@ -17,18 +17,18 @@ use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
 
-type CustomNextHandler = Box<
-    dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
-        + Send
-        + Sync,
->;
+// type CustomNextHandler = Box<
+//     dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
+//         + Send
+//         + Sync,
+// >;
 
-type CustomHandler = dyn Fn(
-        &mut HttpRequest,
-        CustomNextHandler,
-    ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
-    + Send
-    + Sync;
+// type CustomHandler = dyn Fn(
+//         &mut HttpRequest,
+//         CustomNextHandler,
+//     ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
+//     + Send
+//     + Sync;
 
 static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static RequestHandlerFlag>>> =
     LazyLock::new(|| {
@@ -48,7 +48,7 @@ pub enum PipeContextItem {
     LocationRoute((String, String)),
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
-    Custom(Arc<CustomHandler>),
+    // Custom(Arc<CustomHandler>),
     #[cfg(feature = "jemalloc")]
     Jemalloc(String),
     #[cfg(feature = "webdav")]
@@ -103,16 +103,16 @@ impl PipeContext {
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
     }
 
-    pub fn use_custom<F, R>(&mut self, callback: F)
-    where
-        F: for<'a> Fn(&'a mut HttpRequest, CustomNextHandler) -> R + Send + Sync + 'static,
-        R: Future<Output = HttpResponse> + Send + Sync + 'static,
-    {
-        self.items
-            .push(PipeContextItem::Custom(Arc::new(move |req, next| {
-                Box::pin(callback(req, next))
-            })));
-    }
+    // pub fn use_custom<F, R>(&mut self, callback: F)
+    // where
+    //     F: for<'a> Fn(&'a mut HttpRequest, CustomNextHandler) -> R + Send + Sync + 'static,
+    //     R: Future<Output = HttpResponse> + Send + Sync + 'static,
+    // {
+    //     self.items
+    //         .push(PipeContextItem::Custom(Arc::new(move |req, next| {
+    //             Box::pin(callback(req, next))
+    //         })));
+    // }
 
     #[cfg(feature = "jemalloc")]
     pub fn use_jemalloc(&mut self, url_path: impl Into<String>) {
@@ -348,13 +348,13 @@ impl PipeContext {
             .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
 
-    #[async_recursion(Sync)]
+    #[async_recursion]
     pub async fn handle_request(
         self2: Arc<PipeContext>,
         req: &mut HttpRequest,
         skip: usize,
     ) -> HttpResponse {
-        for (idx, item) in self2.items.iter().enumerate().skip(skip) {
+        for (_idx, item) in self2.items.iter().enumerate().skip(skip) {
             match item {
                 PipeContextItem::Handlers => {
                     let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
@@ -435,14 +435,14 @@ impl PipeContext {
                     continue;
                 }
                 PipeContextItem::FinalRoute(res) => return res.clone(),
-                PipeContextItem::Custom(handler) => {
-                    let self3 = Arc::clone(&self2);
-                    let next: CustomNextHandler = Box::new(move |r: &mut HttpRequest| {
-                        let self4 = Arc::clone(&self3);
-                        Self::handle_request(self4, r, idx + 1)
-                    });
-                    return handler.as_ref()(req, next).await;
-                }
+                // PipeContextItem::Custom(handler) => {
+                //     let self3 = Arc::clone(&self2);
+                //     let next: CustomNextHandler = Box::new(move |r: &mut HttpRequest| {
+                //         let self4 = Arc::clone(&self3);
+                //         Self::handle_request(self4, r, idx + 1)
+                //     });
+                //     return handler.as_ref()(req, next).await;
+                // }
                 #[cfg(feature = "jemalloc")]
                 PipeContextItem::Jemalloc(path) => {
                     if path == req.url_path.to_str() {
@@ -456,6 +456,7 @@ impl PipeContext {
                 PipeContextItem::Webdav((path, dav_server)) => {
                     use crate::utils::string::StringExt;
                     use futures_util::StreamExt;
+                    println!("handle request:[{path}]");
                     if !req.url_path.to_str().starts_with(path) {
                         continue;
                     }
