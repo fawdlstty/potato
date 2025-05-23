@@ -456,7 +456,6 @@ impl PipeContext {
                 PipeContextItem::Webdav((path, dav_server)) => {
                     use crate::utils::string::StringExt;
                     use futures_util::StreamExt;
-                    println!("handle request:[{path}]");
                     if !req.url_path.to_str().starts_with(path) {
                         continue;
                     }
