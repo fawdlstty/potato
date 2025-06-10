@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[derive(Clone, Debug)]
 pub struct RefBuf {
     ptr: *const u8,
@@ -5,7 +7,7 @@ pub struct RefBuf {
 }
 
 impl RefBuf {
-    pub fn from_buf(buf: &[u8]) -> Self {
+    pub(crate) fn from_buf(buf: &[u8]) -> Self {
         let (ptr, len) = (buf.as_ptr(), buf.len());
         Self { ptr, len }
     }
@@ -37,12 +39,12 @@ pub enum RefOrBuffer {
 }
 
 impl RefOrBuffer {
-    pub fn from_ref_buf(buf: &[u8]) -> Self {
+    pub(crate) fn from_ref_buf(buf: &[u8]) -> Self {
         let (ptr, len) = (buf.as_ptr(), buf.len());
         Self::RefBuf(RefBuf { ptr, len })
     }
 
-    pub fn from_buffer(buf: Vec<u8>) -> Self {
+    pub(crate) fn from_buffer(buf: Vec<u8>) -> Self {
         Self::Buffer(buf)
     }
 

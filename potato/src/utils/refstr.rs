@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #![allow(non_camel_case_types)]
 use crate::HttpRequest;
 use potato_macro::StandardHeader;
@@ -9,12 +10,12 @@ pub struct RefStr {
 }
 
 impl RefStr {
-    pub fn from_slice(data: &[u8], start: usize, len: usize) -> Self {
+    pub(crate) fn from_slice(data: &[u8], start: usize, len: usize) -> Self {
         let ptr = unsafe { data.get_unchecked(start) };
         Self { ptr, len }
     }
 
-    pub fn from_str(data: &str) -> Self {
+    pub(crate) fn from_str(data: &str) -> Self {
         let (ptr, len) = (data.as_ptr(), data.len());
         Self { ptr, len }
     }
@@ -114,7 +115,7 @@ pub enum RefOrString {
 }
 
 impl RefOrString {
-    pub fn from_str(val: &str) -> Self {
+    pub(crate) fn from_str(val: &str) -> Self {
         RefOrString::RefStr(RefStr::from_str(val))
     }
 
@@ -211,7 +212,7 @@ pub enum HeaderRefOrString {
 }
 
 impl HeaderRefOrString {
-    pub fn from_str(val: &str) -> Self {
+    pub(crate) fn from_str(val: &str) -> Self {
         val.to_ref_string().into()
     }
 
