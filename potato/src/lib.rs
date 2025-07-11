@@ -39,7 +39,7 @@ use utils::number::HttpCodeExt;
 use utils::refbuf::{RefOrBuffer, ToRefBufExt};
 use utils::refstr::{HeaderItem, HeaderRefOrString, RefOrString, ToRefStrExt};
 use utils::string::StringExt;
-use utils::tcp_stream::{HttpStream, TcpStreamExt, VecU8Ext};
+use utils::tcp_stream::{HttpStream, VecU8Ext};
 
 static SERVER_STR: LazyLock<String> =
     LazyLock::new(|| format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
@@ -124,12 +124,38 @@ pub enum CompressMode {
     Gzip,
 }
 
-pub struct WebsocketConnection {
+pub struct Websocket {
     stream: Arc<Mutex<HttpStream>>,
 }
 
-impl WebsocketConnection {
-    pub async fn recv_frame_impl(&mut self) -> anyhow::Result<WsFrameImpl> {
+impl Websocket {
+    pub async fn connect(url: &str, args: Vec<Headers>) -> anyhow::Result<Self> {
+        let mut sess = Session::new();
+        let mut req = sess.start_request(HttpMethod::GET, url).await?;
+        for arg in args.into_iter() {
+            req.apply_header(arg);
+        }
+        req.apply_header(Headers::Connection("Upgrade".to_string()));
+        req.apply_header(Headers::Upgrade("Websocket".to_string()));
+        req.apply_header(Headers::Sec_WebSocket_Version("13".to_string()));
+        req.apply_header(Headers::Sec_WebSocket_Key("VerySecurity".to_string()));
+        let res = sess.end_request(req).await?;
+        if res.http_code != 101 {
+            Err(anyhow!(
+                "Server return code[{}]: {}",
+                res.http_code,
+                str::from_utf8(&res.body)?
+            ))?;
+        }
+        let stream = sess
+            .sess_impl
+            .ok_or_else(|| anyhow!("session impl is null"))?
+            .stream;
+        let stream = Arc::new(Mutex::new(stream));
+        Ok(Self { stream })
+    }
+
+    async fn recv_impl(&mut self) -> anyhow::Result<WsFrameImpl> {
         let mut stream = self.stream.lock().await;
         let buf = {
             let mut buf = [0u8; 2];
@@ -180,14 +206,14 @@ impl WebsocketConnection {
         }
     }
 
-    pub async fn recv_frame(&mut self) -> anyhow::Result<WsFrame> {
+    pub async fn recv(&mut self) -> anyhow::Result<WsFrame> {
         let mut tmp = vec![];
         loop {
             let timeout = ServerConfig::get_ws_ping_duration().await;
-            match tokio::time::timeout(timeout, self.recv_frame_impl()).await {
+            match tokio::time::timeout(timeout, self.recv_impl()).await {
                 Ok(ws_frame) => match ws_frame? {
                     WsFrameImpl::Close => return Err(anyhow::Error::msg("close frame")),
-                    WsFrameImpl::Ping => self.write_frame_impl(WsFrameImpl::Pong).await?,
+                    WsFrameImpl::Ping => self.send_impl(WsFrameImpl::Pong).await?,
                     WsFrameImpl::Pong => (),
                     WsFrameImpl::Binary(data) => {
                         tmp.extend(data);
@@ -200,12 +226,12 @@ impl WebsocketConnection {
                     }
                     WsFrameImpl::PartData(data) => tmp.extend(data),
                 },
-                Err(_) => self.write_frame_impl(WsFrameImpl::Ping).await?,
+                Err(_) => self.send_impl(WsFrameImpl::Ping).await?,
             }
         }
     }
 
-    pub async fn write_frame_impl(&mut self, frame: WsFrameImpl) -> anyhow::Result<()> {
+    async fn send_impl(&mut self, frame: WsFrameImpl) -> anyhow::Result<()> {
         let (fin, opcode, payload) = match frame {
             WsFrameImpl::Close => (true, 0x8, vec![]),
             WsFrameImpl::Ping => (true, 0x9, vec![]),
@@ -233,19 +259,30 @@ impl WebsocketConnection {
     }
 
     pub async fn send_ping(&mut self) -> anyhow::Result<()> {
-        self.write_frame_impl(WsFrameImpl::Ping).await
+        self.send_impl(WsFrameImpl::Ping).await
+    }
+
+    pub async fn send(&mut self, frame: WsFrame) -> anyhow::Result<()> {
+        match frame {
+            WsFrame::Binary(data) => self.send_impl(WsFrameImpl::Binary(data)).await,
+            WsFrame::Text(text) => {
+                self.send_impl(WsFrameImpl::Text(text.as_bytes().to_vec()))
+                    .await
+            }
+        }
     }
 
     pub async fn send_binary(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
-        self.write_frame_impl(WsFrameImpl::Binary(data)).await
+        self.send_impl(WsFrameImpl::Binary(data)).await
     }
 
     pub async fn send_text(&mut self, data: &str) -> anyhow::Result<()> {
-        self.write_frame_impl(WsFrameImpl::Text(data.as_bytes().to_vec()))
+        self.send_impl(WsFrameImpl::Text(data.as_bytes().to_vec()))
             .await
     }
 }
 
+#[derive(Debug)]
 pub enum WsFrame {
     Binary(Vec<u8>),
     Text(String),
@@ -426,7 +463,7 @@ impl HttpRequest {
         true
     }
 
-    pub async fn upgrade_websocket(&mut self) -> anyhow::Result<WebsocketConnection> {
+    pub async fn upgrade_websocket(&mut self) -> anyhow::Result<Websocket> {
         if !self.is_websocket() {
             Err(anyhow!("it is not a websocket request"))?;
         }
@@ -444,7 +481,7 @@ impl HttpRequest {
             let res = HttpResponse::from_websocket(&ws_key);
             stream.write_all(&res.as_bytes(CompressMode::None)).await?;
         }
-        Ok(WebsocketConnection { stream })
+        Ok(Websocket { stream })
     }
 
     pub async fn get_client_addr(&self) -> anyhow::Result<SocketAddr> {
@@ -820,7 +857,7 @@ impl HttpResponse {
 
     pub async fn from_stream(
         buf: &mut Vec<u8>,
-        stream: &mut Box<dyn TcpStreamExt>,
+        stream: &mut HttpStream,
     ) -> anyhow::Result<(Self, usize)> {
         let (mut res, hdr_len) = loop {
             buf.extend_by_streams(stream).await?;
@@ -928,6 +965,3 @@ pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
     }
     ret
 }
-
-// cargo publish -p potato-macro --allow-dirty --registry crates-io
-// cargo publish -p potato --allow-dirty --registry crates-io

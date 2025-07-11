@@ -1,11 +1,10 @@
 #![allow(non_camel_case_types)]
 use crate::utils::refstr::Headers;
-use crate::utils::tcp_stream::TcpStreamExt;
+use crate::utils::tcp_stream::HttpStream;
 use crate::{HttpMethod, HttpRequest, HttpResponse, SERVER_STR};
 use anyhow::anyhow;
 use rustls_pki_types::ServerName;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
@@ -63,13 +62,13 @@ macro_rules! define_session_method {
 }
 
 pub struct SessionImpl {
-    unique_host: (String, bool, u16),
-    stream: Box<dyn TcpStreamExt>,
+    pub unique_host: (String, bool, u16),
+    pub stream: HttpStream,
 }
 
 impl SessionImpl {
     pub async fn new(host: String, use_ssl: bool, port: u16) -> anyhow::Result<Self> {
-        let stream: Box<dyn TcpStreamExt> = match use_ssl {
+        let stream: HttpStream = match use_ssl {
             true => {
                 let mut root_cert = RootCertStore::empty();
                 root_cert.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -80,11 +79,11 @@ impl SessionImpl {
                 let dnsname = ServerName::try_from(host.clone())?;
                 let stream = TcpStream::connect(format!("{host}:{port}")).await?;
                 let stream = connector.connect(dnsname, stream).await?;
-                Box::new(stream)
+                HttpStream::from_client_tls(stream)
             }
             false => {
                 let stream = TcpStream::connect(format!("{host}:{port}")).await?;
-                Box::new(stream)
+                HttpStream::from_tcp(stream)
             }
         };
         Ok(SessionImpl {
@@ -95,7 +94,7 @@ impl SessionImpl {
 }
 
 pub struct Session {
-    sess_impl: Option<SessionImpl>,
+    pub sess_impl: Option<SessionImpl>,
 }
 
 impl Session {
@@ -103,7 +102,7 @@ impl Session {
         Self { sess_impl: None }
     }
 
-    async fn start_request(
+    pub async fn start_request(
         &mut self,
         method: HttpMethod,
         url: &str,
@@ -125,15 +124,18 @@ impl Session {
         Ok(req)
     }
 
-    async fn end_request(&mut self, req: HttpRequest) -> anyhow::Result<HttpResponse> {
-        let sess_impl = self
-            .sess_impl
-            .as_mut()
-            .ok_or_else(|| anyhow!("session impl is null"))?;
+    pub async fn end_request(&mut self, req: HttpRequest) -> anyhow::Result<HttpResponse> {
+        let sess_impl = self.session_impl()?;
         sess_impl.stream.write_all(&req.as_bytes()).await?;
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
         let (res, _) = HttpResponse::from_stream(&mut buf, &mut sess_impl.stream).await?;
         Ok(res)
+    }
+
+    fn session_impl(&mut self) -> anyhow::Result<&mut SessionImpl> {
+        self.sess_impl
+            .as_mut()
+            .ok_or_else(|| anyhow!("session impl is null"))
     }
 
     define_session_method!(get, GET);

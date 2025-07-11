@@ -639,7 +639,7 @@ impl HttpServer {
                 Ok(stream) => stream,
                 Err(_) => continue,
             };
-            let stream = Arc::new(Mutex::new(HttpStream::from_tls(stream)));
+            let stream = Arc::new(Mutex::new(HttpStream::from_server_tls(stream)));
             _ = tokio::task::spawn(async move {
                 let client_addr = Arc::new(client_addr);
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);

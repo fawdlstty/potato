@@ -8,7 +8,8 @@ use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 pub enum HttpStream {
     Tcp(TcpStream),
-    Tls(ServerTlsStream<TcpStream>),
+    ServerTls(ServerTlsStream<TcpStream>),
+    ClientTls(ClientTlsStream<TcpStream>),
 }
 unsafe impl Send for HttpStream {}
 
@@ -17,28 +18,35 @@ impl HttpStream {
         Self::Tcp(s)
     }
 
-    pub fn from_tls(s: ServerTlsStream<TcpStream>) -> Self {
-        Self::Tls(s)
+    pub fn from_server_tls(s: ServerTlsStream<TcpStream>) -> Self {
+        Self::ServerTls(s)
+    }
+
+    pub fn from_client_tls(s: ClientTlsStream<TcpStream>) -> Self {
+        Self::ClientTls(s)
     }
 
     pub async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
         Ok(match self {
             HttpStream::Tcp(s) => s.read(buf).await?,
-            HttpStream::Tls(s) => s.read(buf).await?,
+            HttpStream::ServerTls(s) => s.read(buf).await?,
+            HttpStream::ClientTls(s) => s.read(buf).await?,
         })
     }
 
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
         Ok(match self {
             HttpStream::Tcp(s) => s.read_exact(buf).await?,
-            HttpStream::Tls(s) => s.read_exact(buf).await?,
+            HttpStream::ServerTls(s) => s.read_exact(buf).await?,
+            HttpStream::ClientTls(s) => s.read_exact(buf).await?,
         })
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> anyhow::Result<()> {
         match self {
             HttpStream::Tcp(s) => s.write_all(buf).await?,
-            HttpStream::Tls(s) => s.write_all(buf).await?,
+            HttpStream::ServerTls(s) => s.write_all(buf).await?,
+            HttpStream::ClientTls(s) => s.write_all(buf).await?,
         }
         Ok(())
     }
@@ -82,18 +90,12 @@ impl TcpStreamExt2 for *mut dyn TcpStreamExt {
 
 #[async_trait]
 pub trait VecU8Ext {
-    async fn extend_by_streams(
-        &mut self,
-        stream: &mut Box<dyn TcpStreamExt>,
-    ) -> anyhow::Result<usize>;
+    async fn extend_by_streams(&mut self, stream: &mut HttpStream) -> anyhow::Result<usize>;
 }
 
 #[async_trait]
 impl VecU8Ext for Vec<u8> {
-    async fn extend_by_streams(
-        &mut self,
-        stream: &mut Box<dyn TcpStreamExt>,
-    ) -> anyhow::Result<usize> {
+    async fn extend_by_streams(&mut self, stream: &mut HttpStream) -> anyhow::Result<usize> {
         let mut tmp_buf = [0u8; 1024];
         let n = stream.read(&mut tmp_buf).await?;
         if n == 0 {
