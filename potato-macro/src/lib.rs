@@ -122,7 +122,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     quote! {
                         match req.body_files.get(&potato::utils::refstr::RefOrString::from_str(#arg_name_str)).cloned() {
                             Some(file) => file,
-                            None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
+                            None => return potato::HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
                         }
                     }
                 },
@@ -146,10 +146,10 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                                     }
                                     match potato::ServerAuth::jwt_check(&auth).await {
                                         Ok(payload) => payload,
-                                        Err(err) => return HttpResponse::error(format!("auth failed: {err:?}")),
+                                        Err(err) => return potato::HttpResponse::error(format!("auth failed: {err:?}")),
                                     }
                                 }
-                                None => return HttpResponse::error("miss header : Authorization"),
+                                None => return potato::HttpResponse::error("miss header : Authorization"),
                             }
                         }
                     } else {
@@ -163,7 +163,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                                     .get(&potato::utils::refstr::RefOrString::from_str(#arg_name_str))
                                     .map(|p| p.to_str().to_string()) {
                                     Some(val) => val,
-                                    None => return HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
+                                    None => return potato::HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
                                 },
                             }
                         };
@@ -171,7 +171,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                             arg_value = quote! {
                                 match #arg_value.parse() {
                                     Ok(val) => val,
-                                    Err(err) => return HttpResponse::error(format!("arg[{}] is not {} type", #arg_name_str, #arg_type_str)),
+                                    Err(err) => return potato::HttpResponse::error(format!("arg[{}] is not {} type", #arg_name_str, #arg_type_str)),
                                 }
                             }
                         }
@@ -197,21 +197,21 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let wrap_func_body = match &ret_type[..] {
         "Result < () >" => quote! {
             match #fn_name(#(#args),*).await {
-                Ok(ret) => HttpResponse::text("ok"),
-                Err(err) => HttpResponse::error(format!("{err:?}")),
+                Ok(ret) => potato::HttpResponse::text("ok"),
+                Err(err) => potato::HttpResponse::error(format!("{err:?}")),
             }
         },
-        "Result < HttpResponse >" => quote! {
+        "Result < HttpResponse >" | "Result < potato :: HttpResponse >" => quote! {
             match #fn_name(#(#args),*).await {
                 Ok(ret) => ret,
-                Err(err) => HttpResponse::error(format!("{err:?}")),
+                Err(err) => potato::HttpResponse::error(format!("{err:?}")),
             }
         },
         "()" => quote! {
             #fn_name(#(#args),*).await;
-            HttpResponse::text("ok")
+            potato::HttpResponse::text("ok")
         },
-        "HttpResponse" => quote! {
+        "HttpResponse" | "potato :: HttpResponse" => quote! {
             #fn_name(#(#args),*).await
         },
         _ => panic!("unsupported ret type: {ret_type}"),

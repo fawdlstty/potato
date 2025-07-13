@@ -22,6 +22,15 @@ let res1 = sess.get("https://www.fawdlstty.com/1", vec![]).await?;
 let res2 = sess.get("https://www.fawdlstty.com/2", vec![]).await?;
 ```
 
+发起Websocket连接请求通过如下形式：
+
+```rust
+let mut ws = Websocket::connect("ws://127.0.0.1:8080/ws", vec![]).await?;
+ws.send_ping().await?;
+ws.send_text("aaa").await?;
+let frame = ws.recv().await?;
+```
+
 另外。即使是纯客户端模式，也可以使用jemalloc获取详细内存分配报告。需要在程序入口点（main函数开始位置）加入如下代码：
 
 ```rust
