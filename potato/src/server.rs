@@ -393,7 +393,11 @@ impl PipeContext {
                     path.push(loc_path);
                     path.push(&req.url_path.to_str()[url_path.len()..]);
                     if let Ok(path) = path.canonicalize() {
-                        if !path.starts_with(loc_path) {
+                        let mut temp_path = path.to_string_lossy().to_string();
+                        if temp_path.starts_with("\\\\?\\") {
+                            temp_path.drain(..4);
+                        }
+                        if !temp_path.starts_with(loc_path) {
                             return HttpResponse::error("url path over directory");
                         }
                         if let Ok(meta) = std::fs::metadata(&path) {
