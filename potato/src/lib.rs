@@ -26,11 +26,12 @@ use rust_embed::Embed;
 use sha1::{Digest, Sha1};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
+use std::time::UNIX_EPOCH;
 use std::{collections::HashMap, future::Future, pin::Pin};
 use strum::Display;
 use utils::bytes::CompressExt;
@@ -40,6 +41,82 @@ use utils::refbuf::{RefOrBuffer, ToRefBufExt};
 use utils::refstr::{HeaderItem, HeaderRefOrString, RefOrString, ToRefStrExt};
 use utils::string::StringExt;
 use utils::tcp_stream::{HttpStream, VecU8Ext};
+
+/// HTTP conditional preflight result
+#[derive(Debug, PartialEq)]
+pub enum PreflightResult {
+    /// Pass preflight check, can continue processing
+    Proceed,
+    /// Return 304 Not Modified
+    NotModified,
+    /// Return 412 Precondition Failed
+    PreconditionFailed,
+}
+
+/// Parse HTTP date format to Unix timestamp
+/// Supports RFC 7231 standard HTTP date formats:
+/// - RFC 1123: "Mon, 06 Nov 1994 08:49:37 GMT"
+/// - RFC 850: "Monday, 06-Nov-94 08:49:37 GMT"
+/// - ANSI C asctime(): "Mon Nov  6 08:49:37 1994"
+pub fn parse_http_date(date_str: &str) -> Result<u64, ()> {
+    // Use simple manual parsing method to handle RFC 1123 format
+    // Format: "Fri, 12 Sep 2025 00:00:00 GMT"
+    if let Some(caps) =
+        regex::Regex::new(r"^\w+, (\d{1,2}) (\w+) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$")
+            .unwrap()
+            .captures(date_str)
+    {
+        let day: u32 = caps[1].parse().map_err(|_| ())?;
+        let month_str = &caps[2];
+        let year: i32 = caps[3].parse().map_err(|_| ())?;
+        let hour: u32 = caps[4].parse().map_err(|_| ())?;
+        let minute: u32 = caps[5].parse().map_err(|_| ())?;
+        let second: u32 = caps[6].parse().map_err(|_| ())?;
+
+        let month = match month_str {
+            "Jan" => 1,
+            "Feb" => 2,
+            "Mar" => 3,
+            "Apr" => 4,
+            "May" => 5,
+            "Jun" => 6,
+            "Jul" => 7,
+            "Aug" => 8,
+            "Sep" => 9,
+            "Oct" => 10,
+            "Nov" => 11,
+            "Dec" => 12,
+            _ => return Err(()),
+        };
+
+        if let Some(dt) = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|d| d.and_hms_opt(hour, minute, second))
+        {
+            let timestamp = dt.and_utc().timestamp() as u64;
+            return Ok(timestamp);
+        }
+    }
+
+    // Try RFC 1123 format
+    if let Ok(dt) = chrono::DateTime::parse_from_str(date_str, "%a, %d %b %Y %H:%M:%S GMT") {
+        let timestamp = dt.timestamp() as u64;
+        return Ok(timestamp);
+    }
+
+    // Try RFC 850 format
+    if let Ok(dt) = chrono::DateTime::parse_from_str(date_str, "%A, %d-%b-%y %H:%M:%S GMT") {
+        let timestamp = dt.timestamp() as u64;
+        return Ok(timestamp);
+    }
+
+    // Try ANSI C asctime() format
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(date_str, "%a %b %e %H:%M:%S %Y") {
+        let timestamp = dt.and_utc().timestamp() as u64;
+        return Ok(timestamp);
+    }
+
+    Err(())
+}
 
 static SERVER_STR: LazyLock<String> =
     LazyLock::new(|| format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
@@ -645,6 +722,104 @@ impl HttpRequest {
         Ok(Some((req, n)))
     }
 
+    /// Check HTTP conditional preflight headers to determine if special status codes should be returned
+    ///
+    /// This method handles the following HTTP conditional headers:
+    /// - If-Modified-Since: Return 304 if resource is not modified
+    /// - If-None-Match: Return 304 if ETag matches
+    /// - If-Match: Return 412 if ETag doesn't match
+    /// - If-Unmodified-Since: Return 412 if resource is modified
+    ///
+    /// # Parameters
+    /// - `meta`: File metadata (optional)
+    /// - `etag`: Resource's ETag value (optional)
+    ///
+    /// # Return Values
+    /// - `PreflightResult::Proceed`: Pass preflight check, can continue processing
+    /// - `PreflightResult::NotModified`: Should return 304 status code
+    /// - `PreflightResult::PreconditionFailed`: Should return 412 status code
+    pub fn check_precondition_headers(
+        &self,
+        meta: Option<&Metadata>,
+        etag: Option<&str>,
+    ) -> PreflightResult {
+        use crate::utils::refstr::HeaderItem;
+        use std::time::UNIX_EPOCH;
+
+        // Get file's last modified time (Unix timestamp in seconds)
+        let last_modified_timestamp = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+
+        // Check If-Match header (if exists and doesn't match, return 412)
+        if let Some(if_match) = self.get_header_key(HeaderItem::If_Match) {
+            if if_match != "*" {
+                if let Some(current_etag) = etag {
+                    // Parse ETag list in If-Match
+                    let match_found = if_match
+                        .split(',')
+                        .map(|s| s.trim())
+                        .any(|expected_etag| expected_etag == current_etag);
+
+                    if !match_found {
+                        return PreflightResult::PreconditionFailed;
+                    }
+                } else {
+                    // No ETag but client requires match, return 412
+                    return PreflightResult::PreconditionFailed;
+                }
+            }
+        }
+
+        // Check If-Unmodified-Since header (if resource is modified, return 412)
+        if let Some(if_unmodified_since) = self.get_header_key(HeaderItem::If_Unmodified_Since) {
+            if let Some(last_modified) = last_modified_timestamp {
+                if let Ok(since_timestamp) = parse_http_date(if_unmodified_since) {
+                    if last_modified > since_timestamp {
+                        return PreflightResult::PreconditionFailed;
+                    }
+                }
+            }
+        }
+
+        // Check If-None-Match header (if ETag matches, return 304)
+        if let Some(if_none_match) = self.get_header_key(HeaderItem::If_None_Match) {
+            if if_none_match == "*" {
+                // If "*" and resource exists, return 304
+                if etag.is_some() || meta.is_some() {
+                    return PreflightResult::NotModified;
+                }
+            } else if let Some(current_etag) = etag {
+                // Check if ETag is in If-None-Match list
+                let match_found = if_none_match
+                    .split(',')
+                    .map(|s| s.trim())
+                    .any(|expected_etag| expected_etag == current_etag);
+
+                if match_found {
+                    return PreflightResult::NotModified;
+                }
+            }
+        }
+
+        // Check If-Modified-Since header (if resource is not modified, return 304)
+        // Note: Only check If-Modified-Since when there's no If-None-Match header
+        if self.get_header_key(HeaderItem::If_None_Match).is_none() {
+            if let Some(if_modified_since) = self.get_header_key(HeaderItem::If_Modified_Since) {
+                if let Some(last_modified) = last_modified_timestamp {
+                    if let Ok(since_timestamp) = parse_http_date(if_modified_since) {
+                        if last_modified <= since_timestamp {
+                            return PreflightResult::NotModified;
+                        }
+                    }
+                }
+            }
+        }
+
+        PreflightResult::Proceed
+    }
+
     pub fn as_bytes(&self) -> Vec<u8> {
         let mut req_str = format!("{} {} HTTP/1.1\r\n", self.method, self.url_path.to_str());
         for (k, v) in self.headers.iter() {
@@ -682,13 +857,7 @@ macro_rules! make_resp_by_text {
             Self {
                 version: "HTTP/1.1".into(),
                 http_code: 200,
-                headers: [
-                    ("Date".into(), Utc::now().to_rfc2822()),
-                    ("Server".into(), SERVER_STR.clone()),
-                    ("Connection".into(), "keep-alive".into()),
-                    ("Content-Type".into(), $cnt_type.into()),
-                ]
-                .into(),
+                headers: Self::default_headers($cnt_type),
                 body: body.as_bytes().to_vec(),
             }
         }
@@ -701,13 +870,7 @@ macro_rules! make_resp_by_binary {
             Self {
                 version: "HTTP/1.1".into(),
                 http_code: 200,
-                headers: [
-                    ("Date".into(), Utc::now().to_rfc2822()),
-                    ("Server".into(), SERVER_STR.clone()),
-                    ("Connection".into(), "keep-alive".into()),
-                    ("Content-Type".into(), $cnt_type.into()),
-                ]
-                .into(),
+                headers: Self::default_headers($cnt_type),
                 body: body.to_vec(),
             }
         }
@@ -723,6 +886,21 @@ impl HttpResponse {
     make_resp_by_text!(json, "application/json");
     make_resp_by_text!(xml, "application/xml");
     make_resp_by_binary!(png, "image/png");
+
+    fn default_headers(cnt_type: impl Into<String>) -> HashMap<String, String> {
+        [
+            (
+                "Date".into(),
+                Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+            ),
+            ("Server".into(), SERVER_STR.clone()),
+            ("Connection".into(), "keep-alive".into()),
+            ("Content-Type".into(), cnt_type.into()),
+            ("Pragma".into(), "no-cache".into()),
+            ("Cache-Control".into(), "no-cache".into()),
+        ]
+        .into()
+    }
 
     pub fn new() -> Self {
         Self {
@@ -753,43 +931,76 @@ impl HttpResponse {
         Self::html("")
     }
 
-    pub fn from_file(path: &str, download: bool) -> Self {
+    pub fn from_file(path: &str, download: bool, meta: Option<Metadata>) -> Self {
         let mut buffer = vec![];
         if let Ok(mut file) = File::open(path) {
             _ = file.read_to_end(&mut buffer);
         }
-        Self::from_mem_file(path, buffer, download)
+        Self::from_mem_file(path, buffer, download, meta)
     }
 
-    pub fn from_mem_file(path: &str, data: Vec<u8>, download: bool) -> Self {
-        let mut ret = Self::empty();
-        let mime_type = match path.split('.').last() {
-            Some("css") => "text/css",
-            Some("csv") => "text/csv",
-            Some("htm") => "text/html",
-            Some("html") => "text/html",
-            Some("js") => "application/javascript",
-            Some("json") => "application/json",
-            Some("pdf") => "application/pdf",
-            Some("xml") => "application/xml",
-            _ if path.ends_with('/') => "text/html",
-            _ => "application/octet-stream",
-        };
-        ret.add_header("Content-Type", mime_type);
-        if download {
-            let file = match path.rfind('/') {
-                Some(p) => &path[p + 1..],
-                None => path,
-            };
-            if file.len() > 0 {
-                ret.add_header(
-                    "Content-Disposition",
-                    format!("attachment; filename={file}"),
-                );
+    pub fn from_mem_file(
+        path: &str,
+        data: Vec<u8>,
+        download: bool,
+        meta: Option<Metadata>,
+    ) -> Self {
+        if let Some(meta) = meta {
+            let mut ret = Self::from_mem_file(path, data, download, None);
+            // Add Last-Modified header
+            if let Ok(modified) = meta.modified() {
+                if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                    let modified_time =
+                        chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + duration);
+                    ret.add_header(
+                        "Last-Modified",
+                        modified_time
+                            .format("%a, %d %b %Y %H:%M:%S GMT")
+                            .to_string(),
+                    );
+                }
             }
+
+            // Add ETag header (format: "hex-file-modified-time-hex-file-size")
+            if let Ok(modified) = meta.modified() {
+                if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                    let modified_secs = duration.as_secs();
+                    let file_size = meta.len();
+                    let etag = format!("\"{:x}-{:x}\"", modified_secs, file_size);
+                    ret.add_header("ETag", etag);
+                }
+            }
+            ret
+        } else {
+            let mut ret = Self::empty();
+            let mime_type = match path.split('.').last() {
+                Some("css") => "text/css",
+                Some("csv") => "text/csv",
+                Some("htm") => "text/html",
+                Some("html") => "text/html",
+                Some("js") => "application/javascript",
+                Some("json") => "application/json",
+                Some("pdf") => "application/pdf",
+                Some("xml") => "application/xml",
+                _ if path.ends_with('/') => "text/html",
+                _ => "application/octet-stream",
+            };
+            ret.add_header("Content-Type", mime_type);
+            if download {
+                let file = match path.rfind('/') {
+                    Some(p) => &path[p + 1..],
+                    None => path,
+                };
+                if file.len() > 0 {
+                    ret.add_header(
+                        "Content-Disposition",
+                        format!("attachment; filename={file}"),
+                    );
+                }
+            }
+            ret.body = data;
+            ret
         }
-        ret.body = data;
-        ret
     }
 
     pub fn from_websocket(ws_key: &str) -> Self {
@@ -804,7 +1015,10 @@ impl HttpResponse {
             version: "HTTP/1.1".into(),
             http_code: 101,
             headers: [
-                ("Date".into(), Utc::now().to_rfc2822()),
+                (
+                    "Date".into(),
+                    Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+                ),
                 ("Server".into(), SERVER_STR.clone()),
                 ("Connection".into(), "Upgrade".into()),
                 ("Upgrade".into(), "websocket".into()),

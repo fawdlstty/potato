@@ -1,13 +1,14 @@
 use crate::utils::enums::HttpConnection;
 use crate::utils::tcp_stream::HttpStream;
 use crate::RequestHandlerFlag;
-use crate::{HttpMethod, HttpRequest, HttpResponse};
+use crate::{HttpMethod, HttpRequest, HttpResponse, PreflightResult};
 use async_recursion::async_recursion;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
+use std::time::UNIX_EPOCH;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::sync::{oneshot, Mutex};
@@ -403,22 +404,143 @@ impl PipeContext {
                         if let Ok(meta) = std::fs::metadata(&path) {
                             if meta.is_file() {
                                 if let Some(path) = path.to_str() {
-                                    return HttpResponse::from_file(path, false);
+                                    // Generate ETag
+                                    let etag = if let Ok(modified) = meta.modified() {
+                                        if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                                            let modified_secs = duration.as_secs();
+                                            let file_size = meta.len();
+                                            Some(format!("\"{:x}-{:x}\"", modified_secs, file_size))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    // Execute preflight check
+                                    match req
+                                        .check_precondition_headers(Some(&meta), etag.as_deref())
+                                    {
+                                        PreflightResult::NotModified => {
+                                            let mut res = HttpResponse::empty();
+                                            res.http_code = 304;
+                                            return res;
+                                        }
+                                        PreflightResult::PreconditionFailed => {
+                                            let mut res =
+                                                HttpResponse::error("Precondition Failed");
+                                            res.http_code = 412;
+                                            return res;
+                                        }
+                                        PreflightResult::Proceed => {
+                                            return HttpResponse::from_file(
+                                                path,
+                                                false,
+                                                Some(meta),
+                                            );
+                                        }
+                                    }
                                 }
                             } else if meta.is_dir() {
                                 let mut tmp_path = path.clone();
                                 tmp_path.push("index.htm");
-                                if let Ok(tmp) = std::fs::metadata(&tmp_path) {
-                                    if tmp.is_file() {
+                                if let Ok(tmp_meta) = std::fs::metadata(&tmp_path) {
+                                    if tmp_meta.is_file() {
                                         if let Some(path) = tmp_path.to_str() {
-                                            return HttpResponse::from_file(path, false);
+                                            // Generate ETag
+                                            let etag = if let Ok(modified) = tmp_meta.modified() {
+                                                if let Ok(duration) =
+                                                    modified.duration_since(UNIX_EPOCH)
+                                                {
+                                                    let modified_secs = duration.as_secs();
+                                                    let file_size = tmp_meta.len();
+                                                    Some(format!(
+                                                        "\"{:x}-{:x}\"",
+                                                        modified_secs, file_size
+                                                    ))
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            };
+
+                                            // Execute preflight check
+                                            match req.check_precondition_headers(
+                                                Some(&tmp_meta),
+                                                etag.as_deref(),
+                                            ) {
+                                                PreflightResult::NotModified => {
+                                                    let mut res = HttpResponse::empty();
+                                                    res.http_code = 304;
+                                                    return res;
+                                                }
+                                                PreflightResult::PreconditionFailed => {
+                                                    let mut res =
+                                                        HttpResponse::error("Precondition Failed");
+                                                    res.http_code = 412;
+                                                    return res;
+                                                }
+                                                PreflightResult::Proceed => {
+                                                    return HttpResponse::from_file(
+                                                        path,
+                                                        false,
+                                                        Some(tmp_meta),
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                 }
                                 let mut tmp_path = path.clone();
                                 tmp_path.push("index.html");
-                                if let Some(path) = tmp_path.to_str() {
-                                    return HttpResponse::from_file(path, false);
+                                if let Ok(tmp_meta) = std::fs::metadata(&tmp_path) {
+                                    if tmp_meta.is_file() {
+                                        if let Some(path) = tmp_path.to_str() {
+                                            // Generate ETag
+                                            let etag = if let Ok(modified) = tmp_meta.modified() {
+                                                if let Ok(duration) =
+                                                    modified.duration_since(UNIX_EPOCH)
+                                                {
+                                                    let modified_secs = duration.as_secs();
+                                                    let file_size = tmp_meta.len();
+                                                    Some(format!(
+                                                        "\"{:x}-{:x}\"",
+                                                        modified_secs, file_size
+                                                    ))
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            };
+
+                                            // Execute preflight check
+                                            match req.check_precondition_headers(
+                                                Some(&tmp_meta),
+                                                etag.as_deref(),
+                                            ) {
+                                                PreflightResult::NotModified => {
+                                                    let mut res = HttpResponse::empty();
+                                                    res.http_code = 304;
+                                                    return res;
+                                                }
+                                                PreflightResult::PreconditionFailed => {
+                                                    let mut res =
+                                                        HttpResponse::error("Precondition Failed");
+                                                    res.http_code = 412;
+                                                    return res;
+                                                }
+                                                PreflightResult::Proceed => {
+                                                    return HttpResponse::from_file(
+                                                        path,
+                                                        false,
+                                                        Some(tmp_meta),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -427,10 +549,43 @@ impl PipeContext {
                 }
                 PipeContextItem::EmbeddedRoute(embedded_items) => {
                     if let Some(item) = embedded_items.get(req.url_path.to_str()) {
+                        let meta = std::env::current_exe()
+                            .ok()
+                            .map(|p| std::fs::metadata(&p).ok())
+                            .flatten();
+
+                        // Generate ETag (based on content hash and file size)
+                        let etag = {
+                            use std::collections::hash_map::DefaultHasher;
+                            use std::hash::{Hash, Hasher};
+                            let mut hasher = DefaultHasher::new();
+                            item.hash(&mut hasher);
+                            let content_hash = hasher.finish();
+                            Some(format!("\"{:x}-{:x}\"", content_hash, item.len()))
+                        };
+
+                        // Execute preflight check
+                        match req.check_precondition_headers(meta.as_ref(), etag.as_deref()) {
+                            PreflightResult::NotModified => {
+                                let mut res = HttpResponse::empty();
+                                res.http_code = 304;
+                                return res;
+                            }
+                            PreflightResult::PreconditionFailed => {
+                                let mut res = HttpResponse::error("Precondition Failed");
+                                res.http_code = 412;
+                                return res;
+                            }
+                            PreflightResult::Proceed => {
+                                // Continue processing
+                            }
+                        }
+
                         let ret = HttpResponse::from_mem_file(
                             req.url_path.to_str(),
                             item.to_vec(),
                             false,
+                            meta,
                         );
                         return ret;
                     }
@@ -449,7 +604,37 @@ impl PipeContext {
                 PipeContextItem::Jemalloc(path) => {
                     if path == req.url_path.to_str() {
                         return match crate::dump_jemalloc_profile().await {
-                            Ok(data) => HttpResponse::from_mem_file("profile.pdf", data, false),
+                            Ok(data) => {
+                                // Generate ETag (based on content hash and file size)
+                                let etag = {
+                                    use std::collections::hash_map::DefaultHasher;
+                                    use std::hash::{Hash, Hasher};
+                                    let mut hasher = DefaultHasher::new();
+                                    data.hash(&mut hasher);
+                                    let content_hash = hasher.finish();
+                                    Some(format!("\"{:x}-{:x}\"", content_hash, data.len()))
+                                };
+
+                                // Execute preflight check
+                                match req.check_precondition_headers(None, etag.as_deref()) {
+                                    PreflightResult::NotModified => {
+                                        let mut res = HttpResponse::empty();
+                                        res.http_code = 304;
+                                        res
+                                    }
+                                    PreflightResult::PreconditionFailed => {
+                                        let mut res = HttpResponse::error("Precondition Failed");
+                                        res.http_code = 412;
+                                        res
+                                    }
+                                    PreflightResult::Proceed => HttpResponse::from_mem_file(
+                                        "profile.pdf",
+                                        data,
+                                        false,
+                                        None,
+                                    ),
+                                }
+                            }
                             Err(err) => HttpResponse::error(format!("{err}")),
                         };
                     }
