@@ -7,7 +7,7 @@ pub struct RefBuf {
 }
 
 impl RefBuf {
-    pub(crate) fn from_buf(buf: &[u8]) -> Self {
+    pub fn from_buf(buf: &[u8]) -> Self {
         let (ptr, len) = (buf.as_ptr(), buf.len());
         Self { ptr, len }
     }
@@ -16,6 +16,9 @@ impl RefBuf {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
+
+unsafe impl Send for RefBuf {}
+unsafe impl Sync for RefBuf {}
 
 pub trait ToRefBufExt {
     fn to_ref_buf(&self) -> RefBuf;
@@ -39,12 +42,12 @@ pub enum RefOrBuffer {
 }
 
 impl RefOrBuffer {
-    pub(crate) fn from_ref_buf(buf: &[u8]) -> Self {
+    pub fn from_ref_buf(buf: &[u8]) -> Self {
         let (ptr, len) = (buf.as_ptr(), buf.len());
         Self::RefBuf(RefBuf { ptr, len })
     }
 
-    pub(crate) fn from_buffer(buf: Vec<u8>) -> Self {
+    pub fn from_buffer(buf: Vec<u8>) -> Self {
         Self::Buffer(buf)
     }
 

@@ -104,6 +104,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let fn_name = root_fn.sig.ident.clone();
     let wrap_func_name = random_ident();
     let mut args = vec![];
+    let mut arg_names = vec![];
     let mut doc_args = vec![];
     let mut arg_auth_mark = false;
     for arg in root_fn.sig.inputs.iter() {
@@ -180,6 +181,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 },
                 _ => panic!("unsupported arg type: [{arg_type_str}]"),
             });
+            arg_names.push(random_ident());
         } else {
             panic!("unsupported: {}", arg.to_token_stream().to_string());
         }
@@ -194,30 +196,84 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         .to_token_stream()
         .to_string()
         .type_simplify();
-    let wrap_func_body = match &ret_type[..] {
-        "Result < () >" => quote! {
-            match #fn_name(#(#args),*).await {
-                Ok(ret) => potato::HttpResponse::text("ok"),
-                Err(err) => potato::HttpResponse::error(format!("{err:?}")),
-            }
+    let wrap_func_body = match args.len() {
+        0 => match &ret_type[..] {
+            "Result < () >" => quote! {
+                match #fn_name().await {
+                    Ok(ret) => potato::HttpResponse::text("ok"),
+                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
+                }
+            },
+            "Result < HttpResponse >" | "Result < potato :: HttpResponse >" => quote! {
+                match #fn_name().await {
+                    Ok(ret) => ret,
+                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
+                }
+            },
+            "()" => quote! {
+                #fn_name().await;
+                potato::HttpResponse::text("ok")
+            },
+            "HttpResponse" | "potato :: HttpResponse" => quote! {
+                #fn_name().await
+            },
+            _ => panic!("unsupported ret type: {ret_type}"),
         },
-        "Result < HttpResponse >" | "Result < potato :: HttpResponse >" => quote! {
-            match #fn_name(#(#args),*).await {
-                Ok(ret) => ret,
-                Err(err) => potato::HttpResponse::error(format!("{err:?}")),
-            }
+        1 => match &ret_type[..] {
+            "Result < () >" => quote! {
+                let #(#arg_names),* = #(#args),*;
+                match #fn_name(#(#arg_names),*).await {
+                    Ok(ret) => potato::HttpResponse::text("ok"),
+                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
+                }
+            },
+            "Result < HttpResponse >" | "Result < potato :: HttpResponse >" => quote! {
+                let #(#arg_names),* = #(#args),*;
+                match #fn_name(#(#arg_names),*).await {
+                    Ok(ret) => ret,
+                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
+                }
+            },
+            "()" => quote! {
+                let #(#arg_names),* = #(#args),*;
+                #fn_name(#(#arg_names),*).await;
+                potato::HttpResponse::text("ok")
+            },
+            "HttpResponse" | "potato :: HttpResponse" => quote! {
+                let #(#arg_names),* = #(#args),*;
+                #fn_name(#(#arg_names),*).await
+            },
+            _ => panic!("unsupported ret type: {ret_type}"),
         },
-        "()" => quote! {
-            #fn_name(#(#args),*).await;
-            potato::HttpResponse::text("ok")
+        _ => match &ret_type[..] {
+            "Result < () >" => quote! {
+                let (#(#arg_names),*) = (#(#args),*);
+                match #fn_name(#(#arg_names),*).await {
+                    Ok(ret) => potato::HttpResponse::text("ok"),
+                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
+                }
+            },
+            "Result < HttpResponse >" | "Result < potato :: HttpResponse >" => quote! {
+                let (#(#arg_names),*) = (#(#args),*);
+                match #fn_name(#(#arg_names),*).await {
+                    Ok(ret) => ret,
+                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
+                }
+            },
+            "()" => quote! {
+                let (#(#arg_names),*) = (#(#args),*);
+                #fn_name(#(#arg_names),*).await;
+                potato::HttpResponse::text("ok")
+            },
+            "HttpResponse" | "potato :: HttpResponse" => quote! {
+                let (#(#arg_names),*) = (#(#args),*);
+                #fn_name(#(#arg_names),*).await
+            },
+            _ => panic!("unsupported ret type: {ret_type}"),
         },
-        "HttpResponse" | "potato :: HttpResponse" => quote! {
-            #fn_name(#(#args),*).await
-        },
-        _ => panic!("unsupported ret type: {ret_type}"),
     };
     let doc_args = serde_json::to_string(&doc_args).unwrap();
-    // let mut content =
+    //let mut content =
     quote! {
         #root_fn
 
@@ -238,9 +294,9 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args)
         )}
     }.into()
-    // }.to_string();
-    // panic!("{content}");
-    // todo!()
+    //}.to_string();
+    //panic!("{content}");
+    //todo!()
 }
 
 #[proc_macro_attribute]

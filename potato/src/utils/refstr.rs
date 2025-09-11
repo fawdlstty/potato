@@ -10,12 +10,12 @@ pub struct RefStr {
 }
 
 impl RefStr {
-    pub(crate) fn from_slice(data: &[u8], start: usize, len: usize) -> Self {
+    pub fn from_slice(data: &[u8], start: usize, len: usize) -> Self {
         let ptr = unsafe { data.get_unchecked(start) };
         Self { ptr, len }
     }
 
-    pub(crate) fn from_str(data: &str) -> Self {
+    pub fn from_str(data: &str) -> Self {
         let (ptr, len) = (data.as_ptr(), data.len());
         Self { ptr, len }
     }
@@ -30,6 +30,7 @@ impl RefStr {
 }
 
 unsafe impl Send for RefStr {}
+unsafe impl Sync for RefStr {}
 
 impl std::fmt::Display for RefStr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -115,7 +116,7 @@ pub enum RefOrString {
 }
 
 impl RefOrString {
-    pub(crate) fn from_str(val: &str) -> Self {
+    pub fn from_str(val: &str) -> Self {
         RefOrString::RefStr(RefStr::from_str(val))
     }
 
@@ -142,6 +143,7 @@ impl RefOrString {
 }
 
 unsafe impl Send for RefOrString {}
+unsafe impl Sync for RefOrString {}
 
 impl std::fmt::Display for RefOrString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -212,7 +214,7 @@ pub enum HeaderRefOrString {
 }
 
 impl HeaderRefOrString {
-    pub(crate) fn from_str(val: &str) -> Self {
+    pub fn from_str(val: &str) -> Self {
         val.to_ref_string().into()
     }
 

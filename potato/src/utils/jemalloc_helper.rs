@@ -1,7 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::utils::process::ProgramRunner;
 use anyhow::anyhow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tikv_jemalloc_ctl::*;
 use tokio::fs::{self, File};
 use tokio::io::AsyncReadExt;

@@ -717,6 +717,7 @@ macro_rules! make_resp_by_binary {
 impl HttpResponse {
     make_resp_by_text!(html, "text/html");
     make_resp_by_text!(css, "text/css");
+    make_resp_by_text!(csv, "text/csv");
     make_resp_by_text!(js, "text/javascript");
     make_resp_by_text!(text, "text/plain");
     make_resp_by_text!(json, "application/json");
@@ -764,6 +765,7 @@ impl HttpResponse {
         let mut ret = Self::empty();
         let mime_type = match path.split('.').last() {
             Some("css") => "text/css",
+            Some("csv") => "text/csv",
             Some("htm") => "text/html",
             Some("html") => "text/html",
             Some("js") => "application/javascript",
