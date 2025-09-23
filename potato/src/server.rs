@@ -17,17 +17,15 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{rustls, TlsAcceptor};
 
 // type CustomNextHandler = Box<
-//     dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
-//         + Send
-//         + Sync,
+//     dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>
+//         + Send,
 // >;
 
 // type CustomHandler = dyn Fn(
 //         &mut HttpRequest,
 //         CustomNextHandler,
-//     ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>
-//     + Send
-//     + Sync;
+//     ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>
+//     + Send;
 
 static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static RequestHandlerFlag>>> =
     LazyLock::new(|| {
@@ -104,8 +102,8 @@ impl PipeContext {
 
     // pub fn use_custom<F, R>(&mut self, callback: F)
     // where
-    //     F: for<'a> Fn(&'a mut HttpRequest, CustomNextHandler) -> R + Send + Sync + 'static,
-    //     R: Future<Output = HttpResponse> + Send + Sync + 'static,
+    //     F: for<'a> Fn(&'a mut HttpRequest, CustomNextHandler) -> R + Send + 'static,
+    //     R: Future<Output = HttpResponse> + Send + 'static,
     // {
     //     self.items
     //         .push(PipeContextItem::Custom(Arc::new(move |req, next| {

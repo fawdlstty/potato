@@ -121,8 +121,7 @@ pub fn parse_http_date(date_str: &str) -> Result<u64, ()> {
 static SERVER_STR: LazyLock<String> =
     LazyLock::new(|| format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
 
-type HttpHandler =
-    fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + Sync + '_>>;
+type HttpHandler = fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>;
 
 pub struct RequestHandlerFlagDoc {
     pub show: bool,

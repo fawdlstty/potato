@@ -2,7 +2,7 @@ mod utils;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
-use quote::{quote, ToTokens};
+use quote::{ToTokens, quote};
 use rand::Rng;
 use serde_json::json;
 use std::{collections::HashSet, sync::LazyLock};
@@ -19,7 +19,7 @@ static ARG_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 
 fn random_ident() -> Ident {
     let mut rng = rand::thread_rng();
-    let value = format!("__potato_id_{}", rng.gen::<u64>());
+    let value = format!("__potato_id_{}", rng.r#gen::<u64>());
     Ident::new(&value, Span::call_site())
 }
 
@@ -283,7 +283,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
 
         #[doc(hidden)]
-        fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + Sync + '_>> {
+        fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
             Box::pin(#wrap_func_name2(req))
         }
 

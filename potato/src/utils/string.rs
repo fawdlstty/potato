@@ -80,7 +80,7 @@ impl StringUtil {
     pub fn rand(num: usize) -> String {
         let mut rng = rand::thread_rng();
         std::iter::repeat(())
-            .map(|()| ALPHANUM_CHARS[rng.gen::<usize>() % ALPHANUM_CHARS.len()])
+            .map(|()| ALPHANUM_CHARS[rng.r#gen::<usize>() % ALPHANUM_CHARS.len()])
             .take(num)
             .collect()
     }
