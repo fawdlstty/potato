@@ -3,11 +3,7 @@ use crate::utils::refstr::Headers;
 use crate::utils::tcp_stream::HttpStream;
 use crate::{HttpMethod, HttpRequest, HttpResponse, SERVER_STR};
 use anyhow::anyhow;
-use rustls_pki_types::ServerName;
-use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::TlsConnector;
 
 macro_rules! define_session_method {
     ($fn_name:ident, $method:ident) => {
@@ -69,7 +65,12 @@ pub struct SessionImpl {
 impl SessionImpl {
     pub async fn new(host: String, use_ssl: bool, port: u16) -> anyhow::Result<Self> {
         let stream: HttpStream = match use_ssl {
+            #[cfg(feature = "tls")]
             true => {
+                use rustls_pki_types::ServerName;
+                use std::sync::Arc;
+                use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+                use tokio_rustls::TlsConnector;
                 let mut root_cert = RootCertStore::empty();
                 root_cert.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 let config = ClientConfig::builder()
@@ -81,6 +82,8 @@ impl SessionImpl {
                 let stream = connector.connect(dnsname, stream).await?;
                 HttpStream::from_client_tls(stream)
             }
+            #[cfg(not(feature = "tls"))]
+            true => Err(anyhow!("unsupported tls during non-tls build"))?,
             false => {
                 let stream = TcpStream::connect(format!("{host}:{port}")).await?;
                 HttpStream::from_tcp(stream)

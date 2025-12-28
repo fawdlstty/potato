@@ -3,12 +3,16 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
+#[cfg(feature = "tls")]
 use tokio_rustls::client::TlsStream as ClientTlsStream;
+#[cfg(feature = "tls")]
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 pub enum HttpStream {
     Tcp(TcpStream),
+    #[cfg(feature = "tls")]
     ServerTls(ServerTlsStream<TcpStream>),
+    #[cfg(feature = "tls")]
     ClientTls(ClientTlsStream<TcpStream>),
 }
 unsafe impl Send for HttpStream {}
@@ -18,10 +22,12 @@ impl HttpStream {
         Self::Tcp(s)
     }
 
+    #[cfg(feature = "tls")]
     pub fn from_server_tls(s: ServerTlsStream<TcpStream>) -> Self {
         Self::ServerTls(s)
     }
 
+    #[cfg(feature = "tls")]
     pub fn from_client_tls(s: ClientTlsStream<TcpStream>) -> Self {
         Self::ClientTls(s)
     }
@@ -29,7 +35,9 @@ impl HttpStream {
     pub async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
         Ok(match self {
             HttpStream::Tcp(s) => s.read(buf).await?,
+            #[cfg(feature = "tls")]
             HttpStream::ServerTls(s) => s.read(buf).await?,
+            #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => s.read(buf).await?,
         })
     }
@@ -37,7 +45,9 @@ impl HttpStream {
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
         Ok(match self {
             HttpStream::Tcp(s) => s.read_exact(buf).await?,
+            #[cfg(feature = "tls")]
             HttpStream::ServerTls(s) => s.read_exact(buf).await?,
+            #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => s.read_exact(buf).await?,
         })
     }
@@ -45,7 +55,9 @@ impl HttpStream {
     pub async fn write_all(&mut self, buf: &[u8]) -> anyhow::Result<()> {
         match self {
             HttpStream::Tcp(s) => s.write_all(buf).await?,
+            #[cfg(feature = "tls")]
             HttpStream::ServerTls(s) => s.write_all(buf).await?,
+            #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => s.write_all(buf).await?,
         }
         Ok(())
@@ -75,7 +87,9 @@ pub trait TcpStreamExt: AsyncRead + AsyncWrite + Unpin + Send {
 }
 
 impl TcpStreamExt for TcpStream {}
+#[cfg(feature = "tls")]
 impl TcpStreamExt for ClientTlsStream<TcpStream> {}
+#[cfg(feature = "tls")]
 impl TcpStreamExt for ServerTlsStream<TcpStream> {}
 
 pub trait TcpStreamExt2 {

@@ -12,8 +12,9 @@ use std::time::UNIX_EPOCH;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::sync::{oneshot, Mutex};
-use tokio_rustls::rustls::pki_types::pem::PemObject;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+#[cfg(feature = "tls")]
+use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+#[cfg(feature = "tls")]
 use tokio_rustls::{rustls, TlsAcceptor};
 
 // type CustomNextHandler = Box<
@@ -666,9 +667,48 @@ impl PipeContext {
                             30 => http::Version::HTTP_3,
                             _ => http::Version::HTTP_11,
                         };
-                        if let Ok(uri) = req.get_uri(false) {
-                            *new_req.uri_mut() = uri;
-                        }
+                        // Modify URI to remove the specified path prefix and preserve original scheme and authority
+                        use std::str::FromStr;
+                        let original_path = req.url_path.to_str();
+                        let adjusted_path = if original_path.starts_with(path) {
+                            // Remove the path prefix from the original path
+                            &original_path[path.len()..]
+                        } else {
+                            original_path
+                        };
+
+                        // Ensure the path starts with / for valid URI
+                        let final_path = if adjusted_path.is_empty() {
+                            "/"
+                        } else {
+                            adjusted_path
+                        };
+
+                        // Try to get original URI and preserve scheme/authority if available
+                        match req.get_uri(false) {
+                            Ok(original_uri) => {
+                                *new_req.uri_mut() = http::uri::Builder::new()
+                                    .scheme(
+                                        original_uri.scheme().map(|s| s.as_str()).unwrap_or("http"),
+                                    )
+                                    .authority(
+                                        original_uri
+                                            .authority()
+                                            .map(|a| a.as_str())
+                                            .unwrap_or("127.0.0.1"),
+                                    )
+                                    .path_and_query(final_path)
+                                    .build()
+                                    .unwrap_or_else(|_| http::Uri::from_str(final_path).unwrap());
+                            }
+                            Err(_) => {
+                                // If original URI is not available, construct with path only
+                                *new_req.uri_mut() = http::uri::Builder::new()
+                                    .path_and_query(final_path)
+                                    .build()
+                                    .unwrap_or_else(|_| http::Uri::from_str(final_path).unwrap());
+                            }
+                        };
                         for (k, v) in req.headers.iter() {
                             if let Ok(v) = http::HeaderValue::from_str(v.to_str()) {
                                 let k: &'static str = unsafe { std::mem::transmute(k.to_str()) };
@@ -743,6 +783,7 @@ impl HttpServer {
         }
     }
 
+    #[cfg(feature = "tls")]
     pub async fn serve_https(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
         let shutdown_signal = self.shutdown_signal.take();
         match shutdown_signal {
@@ -802,6 +843,7 @@ impl HttpServer {
         }
     }
 
+    #[cfg(feature = "tls")]
     async fn serve_https_impl(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
         #[cfg(feature = "jemalloc")]
         crate::init_jemalloc()?;
