@@ -65,6 +65,7 @@ jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:tikv-jemalloc
 openapi = []
 tls = ["dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
 webdav = ["dep:bytes", "dep:dav-server", "dep:futures-util", "dep:webpki-roots"]
+full = ["jemalloc", "openapi", "tls", "webdav"]
 
 # cargo publish -p potato-macro --allow-dirty --registry crates-io
 # cargo publish -p potato --allow-dirty --registry crates-io
