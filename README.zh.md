@@ -3,15 +3,15 @@
 ![version](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Ffawdlstty%2Fpotato%2Fmain%2F/potato/Cargo.toml&query=package.version&label=version)
 ![status](https://img.shields.io/github/actions/workflow/status/fawdlstty/potato/rust.yml)
 
-English | [简体中文](README.zh.md)
+[English](README.md) | 简体中文
 
-High-performance, concise syntax HTTP framework.
+高性能、简洁语法的HTTP框架。
 
-# Usage
+# 用法
 
-[Online Documentation](https://potato.fawdlstty.com)
+[在线文档](https://potato.fawdlstty.com)
 
-Add the library reference:
+加入库的引用：
 
 ```sh
 cargo add potato
@@ -47,9 +47,9 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-### More Examples
+### 更多示例
 
-Please refer to: <https://github.com/fawdlstty/potato/tree/main/examples>
+请参考：<https://github.com/fawdlstty/potato/tree/main/examples>
 
 <!--
 # TODO
