@@ -81,6 +81,20 @@ sudo apt install libjemalloc-dev graphviz ghostscript
 
 After running the service, request `/profile.pdf` to see the detailed memory allocation records of the program stack. If memory leak issues exist, focus on examining the functions with larger reports for troubleshooting.
 
+## Custom Routing
+
+Add the following code in the configure function:
+
+```rust
+server.configure(|ctx| {
+    // ...
+    ctx.use_custom(|req| async { Some(HttpResponse::text("hello")) });
+    // ...
+});
+```
+
+The `use_custom` function allows you to insert custom request processing logic. It takes an asynchronous closure that receives a request and returns an optional response. If it returns Some(response), the response is returned directly without executing subsequent middleware or handlers; if it returns None, subsequent middleware or handlers continue to execute.
+
 ## WebDAV Routing
 
 Enable the webdav feature of the potato library:

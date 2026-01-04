@@ -5,8 +5,10 @@ use crate::{HttpMethod, HttpRequest, HttpResponse, PreflightResult};
 use async_recursion::async_recursion;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 use tokio::net::TcpListener;
@@ -17,16 +19,9 @@ use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKey
 #[cfg(feature = "tls")]
 use tokio_rustls::{rustls, TlsAcceptor};
 
-// type CustomNextHandler = Box<
-//     dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>
-//         + Send,
-// >;
-
-// type CustomHandler = dyn Fn(
-//         &mut HttpRequest,
-//         CustomNextHandler,
-//     ) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>
-//     + Send;
+type CustomHandler = dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = Option<HttpResponse>> + Send + '_>>
+    + Send
+    + Sync;
 
 static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static RequestHandlerFlag>>> =
     LazyLock::new(|| {
@@ -46,7 +41,7 @@ pub enum PipeContextItem {
     LocationRoute((String, String)),
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
-    // Custom(Arc<CustomHandler>),
+    Custom(Arc<CustomHandler>),
     #[cfg(feature = "jemalloc")]
     Jemalloc(String),
     #[cfg(feature = "webdav")]
@@ -101,16 +96,16 @@ impl PipeContext {
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
     }
 
-    // pub fn use_custom<F, R>(&mut self, callback: F)
-    // where
-    //     F: for<'a> Fn(&'a mut HttpRequest, CustomNextHandler) -> R + Send + 'static,
-    //     R: Future<Output = HttpResponse> + Send + 'static,
-    // {
-    //     self.items
-    //         .push(PipeContextItem::Custom(Arc::new(move |req, next| {
-    //             Box::pin(callback(req, next))
-    //         })));
-    // }
+    pub fn use_custom<F, R>(&mut self, callback: F)
+    where
+        F: for<'a> Fn(&'a mut HttpRequest) -> R + Send + Sync + 'static,
+        R: Future<Output = Option<HttpResponse>> + Send + 'static,
+    {
+        self.items
+            .push(PipeContextItem::Custom(Arc::new(move |req| {
+                Box::pin(callback(req))
+            })));
+    }
 
     #[cfg(feature = "jemalloc")]
     pub fn use_jemalloc(&mut self, url_path: impl Into<String>) {
@@ -352,392 +347,385 @@ impl PipeContext {
         req: &mut HttpRequest,
         skip: usize,
     ) -> HttpResponse {
-        for (_idx, item) in self2.items.iter().enumerate().skip(skip) {
-            match item {
-                PipeContextItem::Handlers => {
-                    let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
-                        Some(handlers) => handlers.get(&req.method).map(|p| p.handler),
-                        None => None,
-                    };
-                    if let Some(handler_ref) = handler_ref {
-                        return handler_ref(req).await;
-                    } else {
-                        if req.method == HttpMethod::HEAD {
-                            return HttpResponse::empty();
-                        } else if req.method == HttpMethod::OPTIONS {
-                            let mut res2 = HttpResponse::html("");
-                            let mut options: HashSet<_> = [HttpMethod::HEAD, HttpMethod::OPTIONS]
-                                .into_iter()
-                                .collect();
-                            if let Some(handlers) = HANDLERS.get(req.url_path.to_str()) {
-                                options.extend(handlers.keys().map(|p| *p));
-                            }
-                            res2.add_header("Allow", {
-                                options
-                                    .into_iter()
-                                    .map(|m| m.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            });
-                            return res2;
-                        } else {
-                            continue;
+        handle_request_impl(self2, req, skip).await
+    }
+}
+
+#[async_recursion]
+async fn handle_request_impl(
+    self2: Arc<PipeContext>,
+    req: &mut HttpRequest,
+    skip: usize,
+) -> HttpResponse {
+    for (idx, item) in self2.items.iter().enumerate().skip(skip) {
+        match item {
+            PipeContextItem::Handlers => {
+                let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
+                    Some(handlers) => handlers.get(&req.method).map(|p| p.handler),
+                    None => None,
+                };
+                if let Some(handler_ref) = handler_ref {
+                    return handler_ref(req).await;
+                } else {
+                    if req.method == HttpMethod::HEAD {
+                        return HttpResponse::empty();
+                    } else if req.method == HttpMethod::OPTIONS {
+                        let mut res2 = HttpResponse::html("");
+                        let mut options: HashSet<_> = [HttpMethod::HEAD, HttpMethod::OPTIONS]
+                            .into_iter()
+                            .collect();
+                        if let Some(handlers) = HANDLERS.get(req.url_path.to_str()) {
+                            options.extend(handlers.keys().map(|p| *p));
                         }
-                    }
-                }
-                PipeContextItem::LocationRoute((url_path, loc_path)) => {
-                    if !req.url_path.to_str().starts_with(url_path) {
+                        res2.add_header("Allow", {
+                            options
+                                .into_iter()
+                                .map(|m| m.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        });
+                        return res2;
+                    } else {
                         continue;
                     }
-                    let mut path = PathBuf::new();
-                    path.push(loc_path);
-                    path.push(&req.url_path.to_str()[url_path.len()..]);
-                    if let Ok(path) = path.canonicalize() {
-                        let mut temp_path = path.to_string_lossy().to_string();
-                        if temp_path.starts_with("\\\\?\\") {
-                            temp_path.drain(..4);
-                        }
-                        if !temp_path.starts_with(loc_path) {
-                            return HttpResponse::error("url path over directory");
-                        }
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            if meta.is_file() {
-                                if let Some(path) = path.to_str() {
-                                    // Generate ETag
-                                    let etag = if let Ok(modified) = meta.modified() {
-                                        if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
-                                            let modified_secs = duration.as_secs();
-                                            let file_size = meta.len();
-                                            Some(format!("\"{:x}-{:x}\"", modified_secs, file_size))
-                                        } else {
-                                            None
-                                        }
+                }
+            }
+            PipeContextItem::LocationRoute((url_path, loc_path)) => {
+                if !req.url_path.to_str().starts_with(url_path) {
+                    continue;
+                }
+                let mut path = PathBuf::new();
+                path.push(loc_path);
+                path.push(&req.url_path.to_str()[url_path.len()..]);
+                if let Ok(path) = path.canonicalize() {
+                    let mut temp_path = path.to_string_lossy().to_string();
+                    if temp_path.starts_with("\\\\?\\") {
+                        temp_path.drain(..4);
+                    }
+                    if !temp_path.starts_with(loc_path) {
+                        return HttpResponse::error("url path over directory");
+                    }
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if meta.is_file() {
+                            if let Some(path) = path.to_str() {
+                                // Generate ETag
+                                let etag = if let Ok(modified) = meta.modified() {
+                                    if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                                        let modified_secs = duration.as_secs();
+                                        let file_size = meta.len();
+                                        Some(format!("\"{:x}-{:x}\"", modified_secs, file_size))
                                     } else {
                                         None
-                                    };
-
-                                    // Execute preflight check
-                                    match req
-                                        .check_precondition_headers(Some(&meta), etag.as_deref())
-                                    {
-                                        PreflightResult::NotModified => {
-                                            let mut res = HttpResponse::empty();
-                                            res.http_code = 304;
-                                            return res;
-                                        }
-                                        PreflightResult::PreconditionFailed => {
-                                            let mut res =
-                                                HttpResponse::error("Precondition Failed");
-                                            res.http_code = 412;
-                                            return res;
-                                        }
-                                        PreflightResult::Proceed => {
-                                            return HttpResponse::from_file(
-                                                path,
-                                                false,
-                                                Some(meta),
-                                            );
-                                        }
                                     }
-                                }
-                            } else if meta.is_dir() {
-                                let mut tmp_path = path.clone();
-                                tmp_path.push("index.htm");
-                                if let Ok(tmp_meta) = std::fs::metadata(&tmp_path) {
-                                    if tmp_meta.is_file() {
-                                        if let Some(path) = tmp_path.to_str() {
-                                            // Generate ETag
-                                            let etag = if let Ok(modified) = tmp_meta.modified() {
-                                                if let Ok(duration) =
-                                                    modified.duration_since(UNIX_EPOCH)
-                                                {
-                                                    let modified_secs = duration.as_secs();
-                                                    let file_size = tmp_meta.len();
-                                                    Some(format!(
-                                                        "\"{:x}-{:x}\"",
-                                                        modified_secs, file_size
-                                                    ))
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            };
-
-                                            // Execute preflight check
-                                            match req.check_precondition_headers(
-                                                Some(&tmp_meta),
-                                                etag.as_deref(),
-                                            ) {
-                                                PreflightResult::NotModified => {
-                                                    let mut res = HttpResponse::empty();
-                                                    res.http_code = 304;
-                                                    return res;
-                                                }
-                                                PreflightResult::PreconditionFailed => {
-                                                    let mut res =
-                                                        HttpResponse::error("Precondition Failed");
-                                                    res.http_code = 412;
-                                                    return res;
-                                                }
-                                                PreflightResult::Proceed => {
-                                                    return HttpResponse::from_file(
-                                                        path,
-                                                        false,
-                                                        Some(tmp_meta),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                let mut tmp_path = path.clone();
-                                tmp_path.push("index.html");
-                                if let Ok(tmp_meta) = std::fs::metadata(&tmp_path) {
-                                    if tmp_meta.is_file() {
-                                        if let Some(path) = tmp_path.to_str() {
-                                            // Generate ETag
-                                            let etag = if let Ok(modified) = tmp_meta.modified() {
-                                                if let Ok(duration) =
-                                                    modified.duration_since(UNIX_EPOCH)
-                                                {
-                                                    let modified_secs = duration.as_secs();
-                                                    let file_size = tmp_meta.len();
-                                                    Some(format!(
-                                                        "\"{:x}-{:x}\"",
-                                                        modified_secs, file_size
-                                                    ))
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            };
-
-                                            // Execute preflight check
-                                            match req.check_precondition_headers(
-                                                Some(&tmp_meta),
-                                                etag.as_deref(),
-                                            ) {
-                                                PreflightResult::NotModified => {
-                                                    let mut res = HttpResponse::empty();
-                                                    res.http_code = 304;
-                                                    return res;
-                                                }
-                                                PreflightResult::PreconditionFailed => {
-                                                    let mut res =
-                                                        HttpResponse::error("Precondition Failed");
-                                                    res.http_code = 412;
-                                                    return res;
-                                                }
-                                                PreflightResult::Proceed => {
-                                                    return HttpResponse::from_file(
-                                                        path,
-                                                        false,
-                                                        Some(tmp_meta),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-                PipeContextItem::EmbeddedRoute(embedded_items) => {
-                    if let Some(item) = embedded_items.get(req.url_path.to_str()) {
-                        let meta = std::env::current_exe()
-                            .ok()
-                            .map(|p| std::fs::metadata(&p).ok())
-                            .flatten();
-
-                        // Generate ETag (based on content hash and file size)
-                        let etag = {
-                            use std::collections::hash_map::DefaultHasher;
-                            use std::hash::{Hash, Hasher};
-                            let mut hasher = DefaultHasher::new();
-                            item.hash(&mut hasher);
-                            let content_hash = hasher.finish();
-                            Some(format!("\"{:x}-{:x}\"", content_hash, item.len()))
-                        };
-
-                        // Execute preflight check
-                        match req.check_precondition_headers(meta.as_ref(), etag.as_deref()) {
-                            PreflightResult::NotModified => {
-                                let mut res = HttpResponse::empty();
-                                res.http_code = 304;
-                                return res;
-                            }
-                            PreflightResult::PreconditionFailed => {
-                                let mut res = HttpResponse::error("Precondition Failed");
-                                res.http_code = 412;
-                                return res;
-                            }
-                            PreflightResult::Proceed => {
-                                // Continue processing
-                            }
-                        }
-
-                        let ret = HttpResponse::from_mem_file(
-                            req.url_path.to_str(),
-                            item.to_vec(),
-                            false,
-                            meta,
-                        );
-                        return ret;
-                    }
-                    continue;
-                }
-                PipeContextItem::FinalRoute(res) => return res.clone(),
-                // PipeContextItem::Custom(handler) => {
-                //     let self3 = Arc::clone(&self2);
-                //     let next: CustomNextHandler = Box::new(move |r: &mut HttpRequest| {
-                //         let self4 = Arc::clone(&self3);
-                //         Self::handle_request(self4, r, idx + 1)
-                //     });
-                //     return handler.as_ref()(req, next).await;
-                // }
-                #[cfg(feature = "jemalloc")]
-                PipeContextItem::Jemalloc(path) => {
-                    if path == req.url_path.to_str() {
-                        return match crate::dump_jemalloc_profile().await {
-                            Ok(data) => {
-                                // Generate ETag (based on content hash and file size)
-                                let etag = {
-                                    use std::collections::hash_map::DefaultHasher;
-                                    use std::hash::{Hash, Hasher};
-                                    let mut hasher = DefaultHasher::new();
-                                    data.hash(&mut hasher);
-                                    let content_hash = hasher.finish();
-                                    Some(format!("\"{:x}-{:x}\"", content_hash, data.len()))
+                                } else {
+                                    None
                                 };
 
                                 // Execute preflight check
-                                match req.check_precondition_headers(None, etag.as_deref()) {
+                                match req.check_precondition_headers(Some(&meta), etag.as_deref()) {
                                     PreflightResult::NotModified => {
                                         let mut res = HttpResponse::empty();
                                         res.http_code = 304;
-                                        res
+                                        return res;
                                     }
                                     PreflightResult::PreconditionFailed => {
                                         let mut res = HttpResponse::error("Precondition Failed");
                                         res.http_code = 412;
-                                        res
+                                        return res;
                                     }
-                                    PreflightResult::Proceed => HttpResponse::from_mem_file(
-                                        "profile.pdf",
-                                        data,
-                                        false,
-                                        None,
-                                    ),
+                                    PreflightResult::Proceed => {
+                                        return HttpResponse::from_file(path, false, Some(meta));
+                                    }
                                 }
                             }
-                            Err(err) => HttpResponse::error(format!("{err}")),
-                        };
+                        } else if meta.is_dir() {
+                            let mut tmp_path = path.clone();
+                            tmp_path.push("index.htm");
+                            if let Ok(tmp_meta) = std::fs::metadata(&tmp_path) {
+                                if tmp_meta.is_file() {
+                                    if let Some(path) = tmp_path.to_str() {
+                                        // Generate ETag
+                                        let etag = if let Ok(modified) = tmp_meta.modified() {
+                                            if let Ok(duration) =
+                                                modified.duration_since(UNIX_EPOCH)
+                                            {
+                                                let modified_secs = duration.as_secs();
+                                                let file_size = tmp_meta.len();
+                                                Some(format!(
+                                                    "\"{:x}-{:x}\"",
+                                                    modified_secs, file_size
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        };
+
+                                        // Execute preflight check
+                                        match req.check_precondition_headers(
+                                            Some(&tmp_meta),
+                                            etag.as_deref(),
+                                        ) {
+                                            PreflightResult::NotModified => {
+                                                let mut res = HttpResponse::empty();
+                                                res.http_code = 304;
+                                                return res;
+                                            }
+                                            PreflightResult::PreconditionFailed => {
+                                                let mut res =
+                                                    HttpResponse::error("Precondition Failed");
+                                                res.http_code = 412;
+                                                return res;
+                                            }
+                                            PreflightResult::Proceed => {
+                                                return HttpResponse::from_file(
+                                                    path,
+                                                    false,
+                                                    Some(tmp_meta),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let mut tmp_path = path.clone();
+                            tmp_path.push("index.html");
+                            if let Ok(tmp_meta) = std::fs::metadata(&tmp_path) {
+                                if tmp_meta.is_file() {
+                                    if let Some(path) = tmp_path.to_str() {
+                                        // Generate ETag
+                                        let etag = if let Ok(modified) = tmp_meta.modified() {
+                                            if let Ok(duration) =
+                                                modified.duration_since(UNIX_EPOCH)
+                                            {
+                                                let modified_secs = duration.as_secs();
+                                                let file_size = tmp_meta.len();
+                                                Some(format!(
+                                                    "\"{:x}-{:x}\"",
+                                                    modified_secs, file_size
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        };
+
+                                        // Execute preflight check
+                                        match req.check_precondition_headers(
+                                            Some(&tmp_meta),
+                                            etag.as_deref(),
+                                        ) {
+                                            PreflightResult::NotModified => {
+                                                let mut res = HttpResponse::empty();
+                                                res.http_code = 304;
+                                                return res;
+                                            }
+                                            PreflightResult::PreconditionFailed => {
+                                                let mut res =
+                                                    HttpResponse::error("Precondition Failed");
+                                                res.http_code = 412;
+                                                return res;
+                                            }
+                                            PreflightResult::Proceed => {
+                                                return HttpResponse::from_file(
+                                                    path,
+                                                    false,
+                                                    Some(tmp_meta),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                #[cfg(feature = "webdav")]
-                PipeContextItem::Webdav((path, dav_server)) => {
-                    use crate::utils::string::StringExt;
-                    use futures_util::StreamExt;
-                    if !req.url_path.to_str().starts_with(path) {
-                        continue;
+                continue;
+            }
+            PipeContextItem::EmbeddedRoute(embedded_items) => {
+                if let Some(item) = embedded_items.get(req.url_path.to_str()) {
+                    let meta = std::env::current_exe()
+                        .ok()
+                        .map(|p| std::fs::metadata(&p).ok())
+                        .flatten();
+
+                    // Generate ETag (based on content hash and file size)
+                    let etag = {
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = DefaultHasher::new();
+                        item.hash(&mut hasher);
+                        let content_hash = hasher.finish();
+                        Some(format!("\"{:x}-{:x}\"", content_hash, item.len()))
+                    };
+
+                    // Execute preflight check
+                    match req.check_precondition_headers(meta.as_ref(), etag.as_deref()) {
+                        PreflightResult::NotModified => {
+                            let mut res = HttpResponse::empty();
+                            res.http_code = 304;
+                            return res;
+                        }
+                        PreflightResult::PreconditionFailed => {
+                            let mut res = HttpResponse::error("Precondition Failed");
+                            res.http_code = 412;
+                            return res;
+                        }
+                        PreflightResult::Proceed => {
+                            // Continue processing
+                        }
                     }
-                    let new_req = {
-                        let mut new_req = http::Request::new(match req.body.to_buf().len() {
-                            0 => dav_server::body::Body::empty(),
-                            _ => {
-                                let bytes = bytes::Bytes::copy_from_slice(req.body.to_buf());
-                                dav_server::body::Body::from(bytes)
-                            }
-                        });
 
-                        if let Ok(method) =
-                            http::Method::from_bytes(req.method.to_string().as_bytes())
-                        {
-                            *new_req.method_mut() = method;
-                        }
-                        *new_req.version_mut() = match req.version {
-                            9 => http::Version::HTTP_09,
-                            10 => http::Version::HTTP_10,
-                            11 => http::Version::HTTP_11,
-                            20 => http::Version::HTTP_2,
-                            30 => http::Version::HTTP_3,
-                            _ => http::Version::HTTP_11,
-                        };
-                        // Modify URI to remove the specified path prefix and preserve original scheme and authority
-                        use std::str::FromStr;
-                        let original_path = req.url_path.to_str();
-                        let adjusted_path = if original_path.starts_with(path) {
-                            // Remove the path prefix from the original path
-                            &original_path[path.len()..]
-                        } else {
-                            original_path
-                        };
-
-                        // Ensure the path starts with / for valid URI
-                        let final_path = if adjusted_path.is_empty() {
-                            "/"
-                        } else {
-                            adjusted_path
-                        };
-
-                        // Try to get original URI and preserve scheme/authority if available
-                        match req.get_uri(false) {
-                            Ok(original_uri) => {
-                                *new_req.uri_mut() = http::uri::Builder::new()
-                                    .scheme(
-                                        original_uri.scheme().map(|s| s.as_str()).unwrap_or("http"),
-                                    )
-                                    .authority(
-                                        original_uri
-                                            .authority()
-                                            .map(|a| a.as_str())
-                                            .unwrap_or("127.0.0.1"),
-                                    )
-                                    .path_and_query(final_path)
-                                    .build()
-                                    .unwrap_or_else(|_| http::Uri::from_str(final_path).unwrap());
-                            }
-                            Err(_) => {
-                                // If original URI is not available, construct with path only
-                                *new_req.uri_mut() = http::uri::Builder::new()
-                                    .path_and_query(final_path)
-                                    .build()
-                                    .unwrap_or_else(|_| http::Uri::from_str(final_path).unwrap());
-                            }
-                        };
-                        for (k, v) in req.headers.iter() {
-                            if let Ok(v) = http::HeaderValue::from_str(v.to_str()) {
-                                let k: &'static str = unsafe { std::mem::transmute(k.to_str()) };
-                                new_req.headers_mut().append(k, v);
-                            }
-                        }
-                        new_req
-                    };
-                    let res = {
-                        let mut new_res = dav_server.handle(new_req).await;
-                        let mut res = HttpResponse::empty();
-                        for (k, v) in new_res.headers().iter() {
-                            res.add_header(k.as_str().http_std_case(), v.to_str().unwrap_or(""));
-                        }
-                        res.http_code = new_res.status().as_u16();
-                        res.version = format!("{:?}", new_res.version());
-                        let body = new_res.body_mut();
-                        while let Some(Ok(part)) = body.next().await {
-                            res.body.extend(part.iter());
-                        }
-                        res
-                    };
+                    let ret = HttpResponse::from_mem_file(
+                        req.url_path.to_str(),
+                        item.to_vec(),
+                        false,
+                        meta,
+                    );
+                    return ret;
+                }
+                continue;
+            }
+            PipeContextItem::FinalRoute(res) => return res.clone(),
+            PipeContextItem::Custom(handler) => {
+                if let Some(res) = handler.as_ref()(req).await {
                     return res;
                 }
             }
-        }
+            #[cfg(feature = "jemalloc")]
+            PipeContextItem::Jemalloc(path) => {
+                if path == req.url_path.to_str() {
+                    return match crate::dump_jemalloc_profile().await {
+                        Ok(data) => {
+                            // Generate ETag (based on content hash and file size)
+                            let etag = {
+                                use std::collections::hash_map::DefaultHasher;
+                                use std::hash::{Hash, Hasher};
+                                let mut hasher = DefaultHasher::new();
+                                data.hash(&mut hasher);
+                                let content_hash = hasher.finish();
+                                Some(format!("\"{:x}-{:x}\"", content_hash, data.len()))
+                            };
 
-        HttpResponse::not_found()
+                            // Execute preflight check
+                            match req.check_precondition_headers(None, etag.as_deref()) {
+                                PreflightResult::NotModified => {
+                                    let mut res = HttpResponse::empty();
+                                    res.http_code = 304;
+                                    res
+                                }
+                                PreflightResult::PreconditionFailed => {
+                                    let mut res = HttpResponse::error("Precondition Failed");
+                                    res.http_code = 412;
+                                    res
+                                }
+                                PreflightResult::Proceed => {
+                                    HttpResponse::from_mem_file("profile.pdf", data, false, None)
+                                }
+                            }
+                        }
+                        Err(err) => HttpResponse::error(format!("{err}")),
+                    };
+                }
+            }
+            #[cfg(feature = "webdav")]
+            PipeContextItem::Webdav((path, dav_server)) => {
+                use crate::utils::string::StringExt;
+                use futures_util::StreamExt;
+                if !req.url_path.to_str().starts_with(path) {
+                    continue;
+                }
+                let new_req = {
+                    let mut new_req = http::Request::new(match req.body.to_buf().len() {
+                        0 => dav_server::body::Body::empty(),
+                        _ => {
+                            let bytes = bytes::Bytes::copy_from_slice(req.body.to_buf());
+                            dav_server::body::Body::from(bytes)
+                        }
+                    });
+
+                    if let Ok(method) = http::Method::from_bytes(req.method.to_string().as_bytes())
+                    {
+                        *new_req.method_mut() = method;
+                    }
+                    *new_req.version_mut() = match req.version {
+                        9 => http::Version::HTTP_09,
+                        10 => http::Version::HTTP_10,
+                        11 => http::Version::HTTP_11,
+                        20 => http::Version::HTTP_2,
+                        30 => http::Version::HTTP_3,
+                        _ => http::Version::HTTP_11,
+                    };
+                    // Modify URI to remove the specified path prefix and preserve original scheme and authority
+                    use std::str::FromStr;
+                    let original_path = req.url_path.to_str();
+                    let adjusted_path = if original_path.starts_with(path) {
+                        // Remove the path prefix from the original path
+                        &original_path[path.len()..]
+                    } else {
+                        original_path
+                    };
+
+                    // Ensure the path starts with / for valid URI
+                    let final_path = if adjusted_path.is_empty() {
+                        "/"
+                    } else {
+                        adjusted_path
+                    };
+
+                    // Try to get original URI and preserve scheme/authority if available
+                    match req.get_uri(false) {
+                        Ok(original_uri) => {
+                            *new_req.uri_mut() = http::uri::Builder::new()
+                                .scheme(original_uri.scheme().map(|s| s.as_str()).unwrap_or("http"))
+                                .authority(
+                                    original_uri
+                                        .authority()
+                                        .map(|a| a.as_str())
+                                        .unwrap_or("127.0.0.1"),
+                                )
+                                .path_and_query(final_path)
+                                .build()
+                                .unwrap_or_else(|_| http::Uri::from_str(final_path).unwrap());
+                        }
+                        Err(_) => {
+                            // If original URI is not available, construct with path only
+                            *new_req.uri_mut() = http::uri::Builder::new()
+                                .path_and_query(final_path)
+                                .build()
+                                .unwrap_or_else(|_| http::Uri::from_str(final_path).unwrap());
+                        }
+                    };
+                    for (k, v) in req.headers.iter() {
+                        if let Ok(v) = http::HeaderValue::from_str(v.to_str()) {
+                            let k: &'static str = unsafe { std::mem::transmute(k.to_str()) };
+                            new_req.headers_mut().append(k, v);
+                        }
+                    }
+                    new_req
+                };
+                let res = {
+                    let mut new_res = dav_server.handle(new_req).await;
+                    let mut res = HttpResponse::empty();
+                    for (k, v) in new_res.headers().iter() {
+                        res.add_header(k.as_str().http_std_case(), v.to_str().unwrap_or(""));
+                    }
+                    res.http_code = new_res.status().as_u16();
+                    res.version = format!("{:?}", new_res.version());
+                    let body = new_res.body_mut();
+                    while let Some(Ok(part)) = body.next().await {
+                        res.body.extend(part.iter());
+                    }
+                    res
+                };
+                return res;
+            }
+        }
     }
+
+    HttpResponse::not_found()
 }
 
 pub struct HttpServer {

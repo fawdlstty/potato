@@ -81,6 +81,20 @@ sudo apt install libjemalloc-dev graphviz ghostscript
 
 此后运行服务，请求 `/profile.pdf`，即可看到程序栈详细内存分配记录，如果存在内存泄露问题，找到报告里占比较大的函数重点排查
 
+## 自定义路由
+
+在configure函数里加入如下代码：
+
+```rust
+server.configure(|ctx| {
+    // ...
+    ctx.use_custom(|req| async { Some(HttpResponse::text("hello")) });
+    // ...
+});
+```
+
+`use_custom` 函数允许您插入自定义的请求处理逻辑，它接收一个异步闭包，该闭包接收请求并返回一个可选的响应。如果返回 Some(response)，则直接返回该响应，不再执行后续的中间件或处理器；如果返回 None，则继续执行后续的中间件或处理器。
+
 ## WebDAV 路由
 
 启用potato库的webdav特性：
