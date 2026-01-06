@@ -28,7 +28,7 @@ async fn websocket(req: &mut HttpRequest) -> anyhow::Result<()> {
     let mut ws = req.upgrade_websocket().await?;
     ws.send_ping().await?;
     loop {
-        match ws.recv_frame().await? {
+        match ws.recv().await? {
             WsFrame::Text(text) => ws.send_text(&text).await?,
             WsFrame::Binary(bin) => ws.send_binary(bin).await?,
         }

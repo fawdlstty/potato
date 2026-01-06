@@ -1,7 +1,8 @@
+use crate::utils::bytes::CompressExt;
 use crate::utils::enums::HttpConnection;
 use crate::utils::tcp_stream::HttpStream;
-use crate::RequestHandlerFlag;
 use crate::{HttpMethod, HttpRequest, HttpResponse, PreflightResult};
+use crate::{RequestHandlerFlag, Session};
 use async_recursion::async_recursion;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,7 @@ pub enum PipeContextItem {
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
     Custom(Arc<CustomHandler>),
+    ReverseProxy(String, String, bool),
     #[cfg(feature = "jemalloc")]
     Jemalloc(String),
     #[cfg(feature = "webdav")]
@@ -105,6 +107,19 @@ impl PipeContext {
             .push(PipeContextItem::Custom(Arc::new(move |req| {
                 Box::pin(callback(req))
             })));
+    }
+
+    pub fn use_reverse_proxy(
+        &mut self,
+        url_path: impl Into<String>,
+        proxy_url: impl Into<String>,
+        modify_content: bool,
+    ) {
+        self.items.push(PipeContextItem::ReverseProxy(
+            url_path.into(),
+            proxy_url.into(),
+            modify_content,
+        ));
     }
 
     #[cfg(feature = "jemalloc")]
@@ -591,6 +606,126 @@ impl PipeContext {
                         return res;
                     }
                 }
+                PipeContextItem::ReverseProxy(path, proxy_url, modify_content) => {
+                    if !req.url_path.to_str().starts_with(path) {
+                        continue;
+                    }
+                    let path = match path.ends_with('/') {
+                        true => &path[..path.len() - 1],
+                        false => &path,
+                    };
+                    let proxy_url = match proxy_url.ends_with('/') {
+                        true => &proxy_url[..proxy_url.len() - 1],
+                        false => &proxy_url,
+                    };
+                    let mut url = format!(
+                        "{proxy_url}{}{}",
+                        req.url_path.to_str().replacen(path, "", 1),
+                        req.query_string()
+                    );
+                    // println!(
+                    //     "source_url: {}{}",
+                    //     req.url_path.to_str(),
+                    //     req.query_string()
+                    // );
+                    // println!("target_url: {url}");
+                    if req.is_websocket() {
+                        if url.starts_with("http://") || url.starts_with("https://") {
+                            url = format!("ws{}", &url[4..]);
+                        }
+                        let mut headers = Vec::new();
+                        for (key, value) in req.headers.iter() {
+                            if key.to_str() == "Host" {
+                                continue;
+                            }
+                            headers.push(crate::Headers::Custom((
+                                key.to_str().to_string(),
+                                value.to_str().to_string(),
+                            )));
+                        }
+                        let mut target_ws = match crate::Websocket::connect(&url, headers).await {
+                            Ok(ws) => ws,
+                            Err(err) => {
+                                return HttpResponse::error(format!(
+                                    "Failed to connect[{url}]: {err}"
+                                ))
+                            }
+                        };
+
+                        let mut client_ws = match req.upgrade_websocket().await {
+                            Ok(ws) => ws,
+                            Err(err) => {
+                                return HttpResponse::error(format!(
+                                    "Failed to upgrade to websocket: {err}"
+                                ))
+                            }
+                        };
+
+                        loop {
+                            tokio::select! {
+                                frame = target_ws.recv() => {
+                                    match frame {
+                                        Ok(frame) => if client_ws.send(frame).await.is_err() {
+                                            break;
+                                        },
+                                        Err(_) => break,
+                                    }
+                                },
+                                frame = client_ws.recv() => {
+                                    match frame {
+                                        Ok(frame) => if target_ws.send(frame).await.is_err() {
+                                            break;
+                                        },
+                                        Err(_) => break,
+                                    }
+                                },
+                            };
+                        }
+                        return HttpResponse::empty();
+                    } else {
+                        let mut sess = Session::new();
+                        let mut req2 = match sess.start_request(req.method, &url).await {
+                            Ok(req2) => req2,
+                            Err(err) => return HttpResponse::error(format!("{err}")),
+                        };
+                        for (key, value) in req.headers.iter() {
+                            if key.to_str() == "Host" {
+                                continue;
+                            }
+                            req2.set_header(key.clone(), value.clone());
+                        }
+                        let mut res = match sess.end_request(req2).await {
+                            Ok(res) => res,
+                            Err(err) => return HttpResponse::error(format!("{err}")),
+                        };
+
+                        if *modify_content {
+                            match res.get_header("Content-Encoding") {
+                                Some(s) if s.to_lowercase() == "gzip" => {
+                                    if let Ok(data) = res.body.decompress() {
+                                        if let Ok(s) = str::from_utf8(&data) {
+                                            let data = s.replace(proxy_url, path).into_bytes();
+                                            if let Ok(data) = data.compress() {
+                                                res.body = data;
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(_) => return res,
+                                None => {
+                                    if let Ok(s) = str::from_utf8(&res.body) {
+                                        res.body = s.replace(proxy_url, path).into_bytes();
+                                    }
+                                }
+                            }
+                            res.headers.remove("Transfer-Encoding");
+                            res.headers
+                                .insert("Content-Length".to_string(), res.body.len().to_string());
+                        }
+                        return res;
+                    }
+                }
+
                 #[cfg(feature = "jemalloc")]
                 PipeContextItem::Jemalloc(path) => {
                     if path == req.url_path.to_str() {

@@ -412,6 +412,18 @@ impl HttpRequest {
         }
     }
 
+    pub fn query_string(&self) -> String {
+        let mut q = "?".to_string();
+        for (k, v) in self.url_query.iter() {
+            q.push_str(k.to_str());
+            q.push('=');
+            q.push_str(v.to_str());
+            q.push('&');
+        }
+        q.pop();
+        q
+    }
+
     fn add_ext<T: Any + Send + Sync + 'static>(&mut self, item: Arc<T>) {
         let type_id = TypeId::of::<T>();
         self.exts.insert(type_id, item);
