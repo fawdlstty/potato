@@ -24,7 +24,7 @@ features:
   - title: WebDAV支持
     details: 支持服务器端WebDAV协议
 
-footer: MIT Licensed | Copyright © 2025 potato
+footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---
 
 <!--

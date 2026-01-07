@@ -24,5 +24,5 @@ features:
   - title: WebDAV Support
     details: Supports server-side WebDAV protocol
 
-footer: MIT Licensed | Copyright © 2025 potato
+footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---
