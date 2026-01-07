@@ -113,3 +113,22 @@ server.configure(|ctx| {
     // ...
 });
 ```
+
+## 反向代理路由
+
+在configure函数里加入如下代码：
+
+```rust
+server.configure(|ctx| {
+    // ...
+    ctx.use_reverse_proxy("/", "http://www.fawdlstty.com", true);
+    // ...
+});
+```
+
+`use_reverse_proxy` 函数用于设置反向代理路由，它接受三个参数：
+- 第一个参数 `url_path`：本地路径前缀，指定哪些请求路径需要被代理
+- 第二个参数 `proxy_url`：目标代理服务器地址，请求将被转发到此地址
+- 第三个参数 `modify_content`：布尔值，指定是否修改响应内容中的URL（将代理服务器地址替换为本地路径）
+
+当设置 `modify_content` 为 `true` 时，响应内容中的代理服务器地址会被替换为本地路径，这对于处理静态资源中的硬编码URL非常有用。该功能支持WebSocket连接的代理，能够自动处理协议升级。

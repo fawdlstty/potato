@@ -113,3 +113,22 @@ server.configure(|ctx| {
     // ...
 });
 ```
+
+## Reverse Proxy Routing
+
+Add the following code in the configure function:
+
+```rust
+server.configure(|ctx| {
+    // ...
+    ctx.use_reverse_proxy("/", "http://www.fawdlstty.com", true);
+    // ...
+});
+```
+
+The `use_reverse_proxy` function is used to set up reverse proxy routing, and it accepts three parameters:
+- First parameter `url_path`: local path prefix, specifying which request paths need to be proxied
+- Second parameter `proxy_url`: target proxy server address, requests will be forwarded to this address
+- Third parameter `modify_content`: boolean value, specifying whether to modify URLs in the response content (replace proxy server address with local path)
+
+When `modify_content` is set to `true`, proxy server addresses in the response content will be replaced with the local path, which is very useful for handling hardcoded URLs in static resources. This feature supports WebSocket connection proxying and can automatically handle protocol upgrades.
