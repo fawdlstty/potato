@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.2.18"
+version = "0.2.19"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -14,29 +14,29 @@ readme = "../README.md"
 exclude = ["src/main.rs"]
 
 [dependencies]
-anyhow = "1.0.94"
+anyhow = "1.0.100"
 async-recursion = "1.1.1"
-async-trait = "0.1.83"
+async-trait = "0.1.89"
 base64 = "0.22.1"
-chrono = "0.4.39"
+chrono = "0.4.42"
 flate2 = "1.0.35"
-http = "1.2.0"
+http = "1.4.0"
 httparse = "1.9.5"
 inventory = "0.3.15"
 jsonwebtoken = "9.3.0"
-potato-macro = "0.2.18"
+potato-macro = "0.2.19"
 #potato-macro = { path = "../potato-macro" }
 rand = "0.8.5"
 regex = "1.11.1"
-rust-embed = "8.5.0"
+rust-embed = "8.9.0"
 rustls-pki-types = { version = "1.11.0", optional = true }
-serde = "1.0.217"
-serde_json = "1.0.134"
+serde = "1.0.228"
+serde_json = "1.0.148"
 sha1 = "0.10.6"
 smallstr = "0.3.0"
 smallvec = "1.14.0"
-strum = { version = "0.26.3", features = ["derive"] }
-tokio = { version = "1.44.1", features = ["full"] }
+strum = { version = "0.27.2", features = ["derive"] }
+tokio = { version = "1.49.0", features = ["full"] }
 tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"], optional = true }
 webpki-roots = { version = "0.26.8", optional = true }
 

@@ -1,6 +1,6 @@
 [package]
 name = "potato-macro"
-version = "0.2.18"
+version = "0.2.19"
 edition = "2021"
 rust-version = "1.73"
 license = "MIT"
@@ -13,11 +13,11 @@ readme = "../README.md"
 
 [dependencies]
 inventory = "0.3.15"
-proc-macro2 = "1.0.92"
-quote = "1.0.37"
+proc-macro2 = "1.0.103"
+quote = "1.0.42"
 rand = "0.8.5"
-serde_json = "1.0.134"
-syn = { version = "2.0.90", features = ["full"] }
+serde_json = "1.0.148"
+syn = { version = "2.0.114", features = ["full"] }
 
 [lib]
 proc-macro = true
