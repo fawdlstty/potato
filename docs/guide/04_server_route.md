@@ -4,7 +4,7 @@
 
 ```rust
 server.configure(|ctx| {
-    ctx.use_handlers();
+    ctx.use_handlers(false);
 });
 ```
 

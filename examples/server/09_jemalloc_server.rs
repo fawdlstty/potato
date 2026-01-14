@@ -1,5 +1,3 @@
-use potato::*;
-
 // notice: current only support linux
 // run cmd: `cargo add potato --features jemalloc`
 
@@ -8,7 +6,7 @@ use potato::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut server = HttpServer::new("0.0.0.0:8080");
+    let mut server = potato::HttpServer::new("0.0.0.0:8080");
     server.configure(|ctx| {
         ctx.use_jemalloc("/profile.pdf");
     });

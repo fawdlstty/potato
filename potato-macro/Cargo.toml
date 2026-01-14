@@ -1,9 +1,9 @@
 [package]
 name = "potato-macro"
-version = "0.2.13"
+version = "0.2.18"
 edition = "2021"
 rust-version = "1.73"
-license = "../LICENSE"
+license = "MIT"
 repository = "https://github.com/fawdlstty/potato"
 homepage = "https://github.com/fawdlstty/potato"
 description = "A very simple and high performance http library."

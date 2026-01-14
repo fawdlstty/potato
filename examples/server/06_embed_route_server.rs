@@ -1,8 +1,7 @@
-use potato::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut server = HttpServer::new("0.0.0.0:8080");
+    let mut server = potato::HttpServer::new("0.0.0.0:8080");
     server.configure(|ctx| {
         ctx.use_embedded_route("/", embed_dir!("assets/wwwroot"));
     });

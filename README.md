@@ -21,17 +21,15 @@ cargo add tokio --features full
 ### Hello Server
 
 ```rust
-use potato::*;
-
 // http://127.0.0.1:8080/hello
 #[http_get("/hello")]
-async fn hello() -> HttpResponse {
-    HttpResponse::html("hello world")
+async fn hello() -> potato::HttpResponse {
+    potato::HttpResponse::html("hello world")
 }
 
 #[tokio::main]
 async fn main() {
-    let mut server = HttpServer::new("0.0.0.0:8080");
+    let mut server = potato::HttpServer::new("0.0.0.0:8080");
     _ = server.serve_http().await;
 }
 ```

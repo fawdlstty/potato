@@ -4,7 +4,7 @@ Server-side routing is used to specify what actions to take for target request a
 
 ```rust
 server.configure(|ctx| {
-    ctx.use_handlers();
+    ctx.use_handlers(false);
 });
 ```
 

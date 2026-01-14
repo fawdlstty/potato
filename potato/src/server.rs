@@ -38,7 +38,7 @@ static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static Req
 
 #[derive(Clone)]
 pub enum PipeContextItem {
-    Handlers,
+    Handlers(bool),
     LocationRoute((String, String)),
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
@@ -57,7 +57,7 @@ pub struct PipeContext {
 impl PipeContext {
     pub fn new() -> Self {
         Self {
-            items: vec![PipeContextItem::Handlers],
+            items: vec![PipeContextItem::Handlers(false)],
         }
     }
 
@@ -69,8 +69,8 @@ impl PipeContext {
         self.items.clone()
     }
 
-    pub fn use_handlers(&mut self) {
-        self.items.push(PipeContextItem::Handlers);
+    pub fn use_handlers(&mut self, allow_cors: bool) {
+        self.items.push(PipeContextItem::Handlers(allow_cors));
     }
 
     pub fn use_location_route(&mut self, url_path: impl Into<String>, loc_path: impl Into<String>) {
@@ -364,7 +364,7 @@ impl PipeContext {
     ) -> HttpResponse {
         for (_idx, item) in self2.items.iter().enumerate().skip(skip) {
             match item {
-                PipeContextItem::Handlers => {
+                PipeContextItem::Handlers(allow_cors) => {
                     let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
                         Some(handlers) => handlers.get(&req.method).map(|p| p.handler),
                         None => None,
@@ -376,19 +376,26 @@ impl PipeContext {
                             return HttpResponse::empty();
                         } else if req.method == HttpMethod::OPTIONS {
                             let mut res2 = HttpResponse::html("");
-                            let mut options: HashSet<_> = [HttpMethod::HEAD, HttpMethod::OPTIONS]
-                                .into_iter()
-                                .collect();
-                            if let Some(handlers) = HANDLERS.get(req.url_path.to_str()) {
-                                options.extend(handlers.keys().map(|p| *p));
-                            }
-                            res2.add_header("Allow", {
+                            let methods_str = {
+                                let mut options: HashSet<_> =
+                                    [HttpMethod::HEAD, HttpMethod::OPTIONS]
+                                        .into_iter()
+                                        .collect();
+                                if let Some(handlers) = HANDLERS.get(req.url_path.to_str()) {
+                                    options.extend(handlers.keys().map(|p| *p));
+                                }
                                 options
                                     .into_iter()
                                     .map(|m| m.to_string())
                                     .collect::<Vec<_>>()
-                                    .join(", ")
-                            });
+                                    .join(",")
+                            };
+                            res2.add_header("Allow", &methods_str);
+                            if *allow_cors {
+                                res2.add_header("Access-Control-Allow-Origin", "*");
+                                res2.add_header("Access-Control-Allow-Methods", &methods_str);
+                                res2.add_header("Access-Control-Allow-Headers", "*");
+                            }
                             return res2;
                         } else {
                             continue;
