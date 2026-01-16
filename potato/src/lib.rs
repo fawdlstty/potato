@@ -207,7 +207,7 @@ pub struct Websocket {
 impl Websocket {
     pub async fn connect(url: &str, args: Vec<Headers>) -> anyhow::Result<Self> {
         let mut sess = Session::new();
-        let mut req = sess.start_request(HttpMethod::GET, url).await?;
+        let mut req = sess.new_request(HttpMethod::GET, url).await?;
         for arg in args.into_iter() {
             req.apply_header(arg);
         }
@@ -215,7 +215,7 @@ impl Websocket {
         req.apply_header(Headers::Upgrade("Websocket".to_string()));
         req.apply_header(Headers::Sec_WebSocket_Version("13".to_string()));
         req.apply_header(Headers::Sec_WebSocket_Key("VerySecurity".to_string()));
-        let res = sess.end_request(req).await?;
+        let res = sess.do_request(req).await?;
         if res.http_code != 101 {
             Err(anyhow!(
                 "Server return code[{}]: {}",
