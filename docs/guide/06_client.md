@@ -44,3 +44,28 @@ let pdf_data = crate::dump_jemalloc_profile()?;
 ```
 
 此时`pdf_data`变量里就存了pdf内存分析报告原始内容，将其存储为文件即可查看。
+
+## 反向代理与转发会话
+
+可以使用 [TransferSession](file:///e:/GitHub_fa/potato/potato/src/client.rs#L224-L251) 来处理反向代理和正向代理场景。它支持HTTP和WebSocket请求的转发，并且可以修改转发的内容。
+
+创建一个反向代理会话，将请求转发到指定的目标URL：
+
+```rust
+let mut transfer_session = potato::client::TransferSession::from_reverse_proxy(
+    "/api".to_string(),      // 请求路径前缀
+    "http://backend-server:8080".to_string()  // 后端目标服务器
+);
+
+// 在处理请求时使用transfer方法
+// let response = transfer_session.transfer(&mut request, true /* 是否修改内容 */).await?;
+```
+
+创建一个正向代理会话，用于通用代理转发：
+
+```rust
+let mut transfer_session = potato::client::TransferSession::from_forward_proxy();
+
+// 在处理请求时使用transfer方法
+// let response = transfer_session.transfer(&mut request, false /* 是否修改内容 */).await?;
+```

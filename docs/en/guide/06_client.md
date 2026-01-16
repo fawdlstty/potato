@@ -44,3 +44,28 @@ let pdf_data = crate::dump_jemalloc_profile()?;
 ```
 
 At this point, the `pdf_data` variable contains the raw content of the PDF memory analysis report. Store it as a file to view it.
+
+## Reverse Proxy and Transfer Sessions
+
+You can use [TransferSession](file:///e:/GitHub_fa/potato/potato/src/client.rs#L224-L251) to handle reverse proxy and forward proxy scenarios. It supports forwarding of both HTTP and WebSocket requests, and can modify the forwarded content.
+
+Create a reverse proxy session that forwards requests to a specified target URL:
+
+```rust
+let mut transfer_session = potato::client::TransferSession::from_reverse_proxy(
+    "/api".to_string(),      // Request path prefix
+    "http://backend-server:8080".to_string()  // Backend target server
+);
+
+// Use the transfer method when processing requests
+// let response = transfer_session.transfer(&mut request, true /* whether to modify content */).await?;
+```
+
+Create a forward proxy session for general proxy forwarding:
+
+```rust
+let mut transfer_session = potato::client::TransferSession::from_forward_proxy();
+
+// Use the transfer method when processing requests
+// let response = transfer_session.transfer(&mut request, false /* whether to modify content */).await?;
+```
