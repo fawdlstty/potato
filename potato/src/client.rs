@@ -4,7 +4,10 @@ use crate::utils::refstr::{HeaderItem, Headers};
 use crate::utils::tcp_stream::HttpStream;
 use crate::{HttpMethod, HttpRequest, HttpResponse, SERVER_STR};
 use anyhow::anyhow;
+use russh::client;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 macro_rules! define_session_method {
@@ -224,6 +227,7 @@ define_client_method!(trace);
 pub struct TransferSession {
     pub req_path_prefix: String,
     pub dest_url: Option<String>,
+    pub jumpbox_srv: Option<client::Handle<AuthHandler>>,
     pub conns: HashMap<(String, bool, u16), HttpStream>,
 }
 
@@ -232,16 +236,37 @@ impl TransferSession {
         TransferSession {
             req_path_prefix: "/".to_string(),
             dest_url: None,
+            jumpbox_srv: None,
             conns: HashMap::new(),
         }
     }
 
-    pub fn from_reverse_proxy(req_path_prefix: String, dest_url: String) -> Self {
+    pub fn from_reverse_proxy(
+        req_path_prefix: impl Into<String>,
+        dest_url: impl Into<String>,
+    ) -> Self {
         TransferSession {
-            req_path_prefix,
-            dest_url: Some(dest_url),
+            req_path_prefix: req_path_prefix.into(),
+            dest_url: Some(dest_url.into()),
+            jumpbox_srv: None,
             conns: HashMap::new(),
         }
+    }
+
+    pub async fn with_ssh_jumpbox(&mut self, jumpbox: SshJumpboxInfo) -> anyhow::Result<()> {
+        let config = Arc::new(client::Config::default());
+
+        let mut handle =
+            client::connect(config, (&jumpbox.host[..], jumpbox.port), AuthHandler {}).await?;
+
+        let auth_result = handle
+            .authenticate_password(jumpbox.username, jumpbox.password)
+            .await?;
+        if auth_result != russh::client::AuthResult::Success {
+            Err(anyhow!("Authentication failed for SSH jumpbox"))?;
+        }
+        self.jumpbox_srv = Some(handle);
+        Ok(())
     }
 
     pub async fn transfer(
@@ -249,20 +274,16 @@ impl TransferSession {
         req: &mut HttpRequest,
         modify_content: bool,
     ) -> anyhow::Result<HttpResponse> {
-        // Check if this is a WebSocket upgrade request
         if req.is_websocket() {
             return self.transfer_websocket(req).await;
         }
 
-        // Determine destination based on proxy type
         let (dest_host, dest_use_ssl, dest_port) = if let Some(ref dest_url) = self.dest_url {
-            // Reverse proxy: use the configured destination URL
             let uri = dest_url.parse::<http::Uri>()?;
             let host = uri.host().unwrap_or("localhost");
             let use_ssl = uri.scheme() == Some(&http::uri::Scheme::HTTPS);
             let port = uri.port_u16().unwrap_or(if use_ssl { 443 } else { 80 });
 
-            // Modify the request to remove the path prefix
             if self.req_path_prefix != "/" {
                 let orig_path = req.url_path.to_string();
                 if orig_path.starts_with(&self.req_path_prefix) {
@@ -275,21 +296,16 @@ impl TransferSession {
 
             (host.to_string(), use_ssl, port)
         } else {
-            // Forward proxy: extract host and port from the request URL
             let host = req.get_header_host().unwrap_or("localhost").to_string();
 
-            // Check if the request URL contains the full URL (for forward proxy CONNECT method)
             let (use_ssl, port) = if req.method == HttpMethod::CONNECT {
-                // CONNECT method typically used for HTTPS tunneling
                 (true, 443)
             } else {
-                // Extract scheme and port from the original request if it has a full URL
                 let host_header = req.get_header("Host").unwrap_or(&host);
                 let port_from_header = host_header
                     .split_once(':')
                     .map(|(_, p)| p.parse::<u16>().unwrap_or(80));
 
-                // For forward proxy, we need to determine if SSL is used based on the Host header or request characteristics
                 let use_ssl = req
                     .get_header("X-Forwarded-Proto")
                     .map_or(false, |proto| proto == "https")
@@ -305,39 +321,83 @@ impl TransferSession {
             (host, use_ssl, port)
         };
 
-        // Get or create connection to destination server
         let conn_key = (dest_host.clone(), dest_use_ssl, dest_port);
         let stream = match self.conns.get_mut(&conn_key) {
             Some(stream) => stream,
             None => {
-                // Create new connection
-                let new_stream: HttpStream = match dest_use_ssl {
-                    #[cfg(feature = "tls")]
-                    true => {
-                        use rustls_pki_types::ServerName;
-                        use std::sync::Arc;
-                        use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-                        use tokio_rustls::TlsConnector;
+                let new_stream: HttpStream = match &self.jumpbox_srv {
+                    Some(jumpbox_srv) => {
+                        let mut channel = jumpbox_srv
+                            .channel_open_direct_tcpip(&dest_host, dest_port as u32, "127.0.0.1", 0)
+                            .await
+                            .map_err(|p| anyhow!("Failed to connect {dest_host} over ssh: {p}"))?;
 
-                        let mut root_cert = RootCertStore::empty();
-                        root_cert.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                        let config = ClientConfig::builder()
-                            .with_root_certificates(root_cert)
-                            .with_no_client_auth();
-                        let connector = TlsConnector::from(Arc::new(config));
-                        let dnsname = ServerName::try_from(dest_host.clone())?;
-                        let tcp_stream =
-                            TcpStream::connect(format!("{}:{}", dest_host, dest_port)).await?;
-                        let tls_stream = connector.connect(dnsname, tcp_stream).await?;
-                        HttpStream::from_client_tls(tls_stream)
+                        let (stream1, stream2) = tokio::io::duplex(65536);
+                        let (mut reader, mut writer) = tokio::io::split(stream2);
+
+                        tokio::spawn(async move {
+                            let mut buffer = vec![0u8; 8192];
+                            loop {
+                                tokio::select! {
+                                    msg = channel.wait() => {
+                                        match msg {
+                                            Some(russh::ChannelMsg::Data { data }) => {
+                                                if writer.write_all(&data).await.is_err() {
+                                                    break;
+                                                }
+                                                if writer.flush().await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Some(_) => continue,
+                                            None => break,
+                                        }
+                                    },
+                                    result = reader.read(&mut buffer) => {
+                                        match result {
+                                            Ok(0) => break,
+                                            Ok(n) => {
+                                                if channel.data(&buffer[..n]).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    },
+                                }
+                            }
+                        });
+
+                        HttpStream::from_duplex_stream(stream1)
                     }
-                    #[cfg(not(feature = "tls"))]
-                    true => Err(anyhow!("unsupported tls during non-tls build"))?,
-                    false => {
-                        let tcp_stream =
-                            TcpStream::connect(format!("{}:{}", dest_host, dest_port)).await?;
-                        HttpStream::from_tcp(tcp_stream)
-                    }
+                    None => match dest_use_ssl {
+                        #[cfg(feature = "tls")]
+                        true => {
+                            use rustls_pki_types::ServerName;
+                            use std::sync::Arc;
+                            use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+                            use tokio_rustls::TlsConnector;
+
+                            let mut root_cert = RootCertStore::empty();
+                            root_cert.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                            let config = ClientConfig::builder()
+                                .with_root_certificates(root_cert)
+                                .with_no_client_auth();
+                            let connector = TlsConnector::from(Arc::new(config));
+                            let dnsname = ServerName::try_from(dest_host.clone())?;
+                            let tcp_stream =
+                                TcpStream::connect(format!("{}:{}", dest_host, dest_port)).await?;
+                            let tls_stream = connector.connect(dnsname, tcp_stream).await?;
+                            HttpStream::from_client_tls(tls_stream)
+                        }
+                        #[cfg(not(feature = "tls"))]
+                        true => Err(anyhow!("unsupported tls during non-tls build"))?,
+                        false => {
+                            let tcp_stream =
+                                TcpStream::connect(format!("{}:{}", dest_host, dest_port)).await?;
+                            HttpStream::from_tcp(tcp_stream)
+                        }
+                    },
                 };
 
                 self.conns.insert(conn_key.clone(), new_stream);
@@ -345,23 +405,16 @@ impl TransferSession {
             }
         };
 
-        // Update Host header to match destination
         req.set_header(HeaderItem::Host, dest_host.clone());
-
-        // Forward the request to destination
         stream.write_all(&req.as_bytes()).await?;
-
-        // Read response from destination
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
         let (mut res, _) = HttpResponse::from_stream(&mut buf, stream).await?;
 
-        // Modify content if needed (for reverse proxy)
         if modify_content {
             match res.get_header("Content-Encoding") {
                 Some(s) if s.to_lowercase() == "gzip" => {
                     if let Ok(data) = res.body.decompress() {
                         if let Ok(s) = str::from_utf8(&data) {
-                            // Determine proxy URL and path for replacement
                             if let Some(ref dest_url) = self.dest_url {
                                 let proxy_url = if dest_url.ends_with('/') {
                                     &dest_url[..dest_url.len() - 1]
@@ -381,10 +434,9 @@ impl TransferSession {
                         }
                     }
                 }
-                Some(_) => {} // Skip modifying content if encoding is not gzip
+                Some(_) => {}
                 None => {
                     if let Ok(s) = str::from_utf8(&res.body) {
-                        // Determine proxy URL and path for replacement
                         if let Some(ref dest_url) = self.dest_url {
                             let proxy_url = if dest_url.ends_with('/') {
                                 &dest_url[..dest_url.len() - 1]
@@ -410,7 +462,6 @@ impl TransferSession {
     }
 
     async fn transfer_websocket(&mut self, req: &mut HttpRequest) -> anyhow::Result<HttpResponse> {
-        // Helper function to build WebSocket URL
         fn build_websocket_url(
             scheme_opt: Option<&str>,
             host: &str,
@@ -429,9 +480,7 @@ impl TransferSession {
             format!("{scheme}://{host}{port_str}{path}{query_str}")
         }
 
-        // Determine destination URL for WebSocket connection
         let dest_url = if let Some(ref dest_url_str) = self.dest_url {
-            // Reverse proxy: use the configured destination URL
             let uri = dest_url_str.parse::<http::Uri>()?;
             let path = if self.req_path_prefix != "/" {
                 let orig_path = req.url_path.to_string();
@@ -447,7 +496,6 @@ impl TransferSession {
                 req.url_path.to_str().to_string()
             };
 
-            // Extract host and port from the parsed URI
             let host = uri.host().unwrap_or("localhost");
             let port =
                 uri.port_u16()
@@ -458,10 +506,8 @@ impl TransferSession {
                     });
             build_websocket_url(uri.scheme_str(), host, port, &path, req.query_string())
         } else {
-            // Forward proxy case - extract destination from the original request
             let host = req.get_header_host().unwrap_or("localhost");
 
-            // Determine if we should use wss or ws based on the Host header or other indicators
             let use_ssl = req
                 .get_header("X-Forwarded-Proto")
                 .map_or(false, |proto| proto == "https" || proto == "wss")
@@ -470,16 +516,14 @@ impl TransferSession {
                     .map_or(false, |_| true)
                 || req.url_path.to_str().starts_with("https")
                 || host.contains(".com") && !host.contains("127.") && !host.starts_with("192.")
-                || host.contains("localhost"); // Assume localhost might be secure in dev
+                || host.contains("localhost");
 
-            // Extract port from host header, default to 443 for wss and 80 for ws if not specified
             let (host_part, port_part) = host.split_once(':').unwrap_or((host, ""));
 
             let port = port_part
                 .parse::<u16>()
                 .unwrap_or(if use_ssl { 443 } else { 80 });
 
-            // Get the original path and query string from the request
             let path = req.url_path.to_str();
             let query_str = req.query_string();
 
@@ -492,7 +536,6 @@ impl TransferSession {
             )
         };
 
-        // Prepare headers for WebSocket connection
         let mut headers = Vec::new();
         for (key, value) in req.headers.iter() {
             if key.to_str() == "Host" {
@@ -536,4 +579,23 @@ impl TransferSession {
 
         Ok(HttpResponse::empty())
     }
+}
+
+pub struct AuthHandler {}
+impl client::Handler for AuthHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+pub struct SshJumpboxInfo {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
 }

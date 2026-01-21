@@ -1,7 +1,7 @@
 use crate::utils::enums::HttpConnection;
 use crate::utils::tcp_stream::HttpStream;
-use crate::RequestHandlerFlag;
 use crate::{HttpMethod, HttpRequest, HttpResponse, PreflightResult};
+use crate::{RequestHandlerFlag, TransferSession};
 use async_recursion::async_recursion;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -19,7 +19,9 @@ use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKey
 #[cfg(feature = "tls")]
 use tokio_rustls::{rustls, TlsAcceptor};
 
-type CustomHandler = dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = Option<HttpResponse>> + Send + '_>>
+type CustomHandler = dyn Fn(
+        &mut HttpRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<HttpResponse>>> + Send + '_>>
     + Send
     + Sync;
 
@@ -100,7 +102,7 @@ impl PipeContext {
     pub fn use_custom<F, R>(&mut self, callback: F)
     where
         F: for<'a> Fn(&'a mut HttpRequest) -> R + Send + Sync + 'static,
-        R: Future<Output = Option<HttpResponse>> + Send + 'static,
+        R: Future<Output = anyhow::Result<Option<HttpResponse>>> + Send + 'static,
     {
         self.items
             .push(PipeContextItem::Custom(Arc::new(move |req| {
@@ -607,20 +609,18 @@ impl PipeContext {
                     continue;
                 }
                 PipeContextItem::FinalRoute(res) => return res.clone(),
-                PipeContextItem::Custom(handler) => {
-                    if let Some(res) = handler.as_ref()(req).await {
-                        return res;
-                    }
-                }
+                PipeContextItem::Custom(handler) => match handler.as_ref()(req).await {
+                    Ok(Some(res)) => return res,
+                    Ok(None) => continue,
+                    Err(err) => return HttpResponse::error(format!("{err}")),
+                },
                 PipeContextItem::ReverseProxy(path, proxy_url, modify_content) => {
                     if !req.url_path.to_str().starts_with(path) {
                         continue;
                     }
 
-                    let mut transfer_session = crate::client::TransferSession::from_reverse_proxy(
-                        path.clone(),
-                        proxy_url.clone(),
-                    );
+                    let mut transfer_session =
+                        TransferSession::from_reverse_proxy(path.clone(), proxy_url.clone());
 
                     match transfer_session.transfer(req, *modify_content).await {
                         Ok(response) => return response,
@@ -853,7 +853,8 @@ impl HttpServer {
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res = PipeContext::handle_request(pipe_ctx2.clone(), &mut req, 0).await;
+                    let res =
+                        PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
                         match stream.write_all(&res.as_bytes(cmode)).await {
@@ -912,7 +913,8 @@ impl HttpServer {
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res = PipeContext::handle_request(pipe_ctx2.clone(), &mut req, 0).await;
+                    let res =
+                        PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
                         match stream.write_all(&res.as_bytes(cmode)).await {

@@ -14,6 +14,7 @@ pub enum HttpStream {
     ServerTls(ServerTlsStream<TcpStream>),
     #[cfg(feature = "tls")]
     ClientTls(ClientTlsStream<TcpStream>),
+    DuplexStream(tokio::io::DuplexStream),
 }
 unsafe impl Send for HttpStream {}
 
@@ -32,6 +33,10 @@ impl HttpStream {
         Self::ClientTls(s)
     }
 
+    pub fn from_duplex_stream(stream: tokio::io::DuplexStream) -> Self {
+        HttpStream::DuplexStream(stream)
+    }
+
     pub async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
         Ok(match self {
             HttpStream::Tcp(s) => s.read(buf).await?,
@@ -39,6 +44,7 @@ impl HttpStream {
             HttpStream::ServerTls(s) => s.read(buf).await?,
             #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => s.read(buf).await?,
+            HttpStream::DuplexStream(s) => s.read(buf).await?,
         })
     }
 
@@ -49,6 +55,7 @@ impl HttpStream {
             HttpStream::ServerTls(s) => s.read_exact(buf).await?,
             #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => s.read_exact(buf).await?,
+            HttpStream::DuplexStream(s) => s.read_exact(buf).await?,
         })
     }
 
@@ -59,6 +66,7 @@ impl HttpStream {
             HttpStream::ServerTls(s) => s.write_all(buf).await?,
             #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => s.write_all(buf).await?,
+            HttpStream::DuplexStream(s) => s.write_all(buf).await?,
         }
         Ok(())
     }
