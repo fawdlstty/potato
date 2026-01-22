@@ -253,14 +253,14 @@ impl TransferSession {
         }
     }
 
-    pub async fn with_ssh_jumpbox(&mut self, jumpbox: SshJumpboxInfo) -> anyhow::Result<()> {
+    pub async fn with_ssh_jumpbox(&mut self, jumpbox: &SshJumpboxInfo) -> anyhow::Result<()> {
         let config = Arc::new(client::Config::default());
 
         let mut handle =
             client::connect(config, (&jumpbox.host[..], jumpbox.port), AuthHandler {}).await?;
 
         let auth_result = handle
-            .authenticate_password(jumpbox.username, jumpbox.password)
+            .authenticate_password(jumpbox.username.clone(), jumpbox.password.clone())
             .await?;
         if auth_result != russh::client::AuthResult::Success {
             Err(anyhow!("Authentication failed for SSH jumpbox"))?;
@@ -333,6 +333,7 @@ impl TransferSession {
                             .map_err(|p| anyhow!("Failed to connect {dest_host} over ssh: {p}"))?;
 
                         let (stream1, stream2) = tokio::io::duplex(65536);
+
                         let (mut reader, mut writer) = tokio::io::split(stream2);
 
                         tokio::spawn(async move {
@@ -593,6 +594,7 @@ impl client::Handler for AuthHandler {
     }
 }
 
+#[derive(Clone)]
 pub struct SshJumpboxInfo {
     pub host: String,
     pub port: u16,

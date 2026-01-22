@@ -99,15 +99,17 @@ impl PipeContext {
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
     }
 
-    pub fn use_custom<F, R>(&mut self, callback: F)
+    pub fn use_custom<F>(&mut self, callback: F)
     where
-        F: for<'a> Fn(&'a mut HttpRequest) -> R + Send + Sync + 'static,
-        R: Future<Output = anyhow::Result<Option<HttpResponse>>> + Send + 'static,
+        F: for<'a> Fn(
+                &'a mut HttpRequest,
+            ) -> Pin<
+                Box<dyn Future<Output = anyhow::Result<Option<HttpResponse>>> + Send + 'a>,
+            > + Send
+            + Sync
+            + 'static,
     {
-        self.items
-            .push(PipeContextItem::Custom(Arc::new(move |req| {
-                Box::pin(callback(req))
-            })));
+        self.items.push(PipeContextItem::Custom(Arc::new(callback)));
     }
 
     pub fn use_reverse_proxy(
