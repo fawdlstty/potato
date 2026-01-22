@@ -4,7 +4,6 @@ use crate::utils::refstr::{HeaderItem, Headers};
 use crate::utils::tcp_stream::HttpStream;
 use crate::{HttpMethod, HttpRequest, HttpResponse, SERVER_STR};
 use anyhow::anyhow;
-use russh::client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -227,7 +226,8 @@ define_client_method!(trace);
 pub struct TransferSession {
     pub req_path_prefix: String,
     pub dest_url: Option<String>,
-    pub jumpbox_srv: Option<client::Handle<AuthHandler>>,
+    #[cfg(feature = "ssh")]
+    pub jumpbox_srv: Option<russh::client::Handle<AuthHandler>>,
     pub conns: HashMap<(String, bool, u16), HttpStream>,
 }
 
@@ -236,6 +236,7 @@ impl TransferSession {
         TransferSession {
             req_path_prefix: "/".to_string(),
             dest_url: None,
+            #[cfg(feature = "ssh")]
             jumpbox_srv: None,
             conns: HashMap::new(),
         }
@@ -248,16 +249,19 @@ impl TransferSession {
         TransferSession {
             req_path_prefix: req_path_prefix.into(),
             dest_url: Some(dest_url.into()),
+            #[cfg(feature = "ssh")]
             jumpbox_srv: None,
             conns: HashMap::new(),
         }
     }
 
+    #[cfg(feature = "ssh")]
     pub async fn with_ssh_jumpbox(&mut self, jumpbox: &SshJumpboxInfo) -> anyhow::Result<()> {
-        let config = Arc::new(client::Config::default());
+        let config = Arc::new(russh::client::Config::default());
 
         let mut handle =
-            client::connect(config, (&jumpbox.host[..], jumpbox.port), AuthHandler {}).await?;
+            russh::client::connect(config, (&jumpbox.host[..], jumpbox.port), AuthHandler {})
+                .await?;
 
         let auth_result = handle
             .authenticate_password(jumpbox.username.clone(), jumpbox.password.clone())
@@ -325,52 +329,55 @@ impl TransferSession {
         let stream = match self.conns.get_mut(&conn_key) {
             Some(stream) => stream,
             None => {
-                let new_stream: HttpStream = match &self.jumpbox_srv {
-                    Some(jumpbox_srv) => {
-                        let mut channel = jumpbox_srv
-                            .channel_open_direct_tcpip(&dest_host, dest_port as u32, "127.0.0.1", 0)
-                            .await
-                            .map_err(|p| anyhow!("Failed to connect {dest_host} over ssh: {p}"))?;
+                let mut new_stream = None;
+                #[cfg(feature = "ssh")]
+                if let Some(jumpbox_srv) = &self.jumpbox_srv {
+                    let mut channel = jumpbox_srv
+                        .channel_open_direct_tcpip(&dest_host, dest_port as u32, "127.0.0.1", 0)
+                        .await
+                        .map_err(|p| anyhow!("Failed to connect {dest_host} over ssh: {p}"))?;
 
-                        let (stream1, stream2) = tokio::io::duplex(65536);
+                    let (stream1, stream2) = tokio::io::duplex(65536);
 
-                        let (mut reader, mut writer) = tokio::io::split(stream2);
+                    let (mut reader, mut writer) = tokio::io::split(stream2);
 
-                        tokio::spawn(async move {
-                            let mut buffer = vec![0u8; 8192];
-                            loop {
-                                tokio::select! {
-                                    msg = channel.wait() => {
-                                        match msg {
-                                            Some(russh::ChannelMsg::Data { data }) => {
-                                                if writer.write_all(&data).await.is_err() {
-                                                    break;
-                                                }
-                                                if writer.flush().await.is_err() {
-                                                    break;
-                                                }
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0u8; 8192];
+                        loop {
+                            tokio::select! {
+                                msg = channel.wait() => {
+                                    match msg {
+                                        Some(russh::ChannelMsg::Data { data }) => {
+                                            if writer.write_all(&data).await.is_err() {
+                                                break;
                                             }
-                                            Some(_) => continue,
-                                            None => break,
-                                        }
-                                    },
-                                    result = reader.read(&mut buffer) => {
-                                        match result {
-                                            Ok(0) => break,
-                                            Ok(n) => {
-                                                if channel.data(&buffer[..n]).await.is_err() {
-                                                    break;
-                                                }
+                                            if writer.flush().await.is_err() {
+                                                break;
                                             }
-                                            Err(_) => break,
                                         }
-                                    },
-                                }
+                                        Some(_) => continue,
+                                        None => break,
+                                    }
+                                },
+                                result = reader.read(&mut buffer) => {
+                                    match result {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            if channel.data(&buffer[..n]).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                },
                             }
-                        });
+                        }
+                    });
 
-                        HttpStream::from_duplex_stream(stream1)
-                    }
+                    new_stream = Some(HttpStream::from_duplex_stream(stream1));
+                }
+                let new_stream = match new_stream {
+                    Some(new_stream) => new_stream,
                     None => match dest_use_ssl {
                         #[cfg(feature = "tls")]
                         true => {
@@ -582,8 +589,10 @@ impl TransferSession {
     }
 }
 
+#[cfg(feature = "ssh")]
 pub struct AuthHandler {}
-impl client::Handler for AuthHandler {
+#[cfg(feature = "ssh")]
+impl russh::client::Handler for AuthHandler {
     type Error = russh::Error;
 
     async fn check_server_key(

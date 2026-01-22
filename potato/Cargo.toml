@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.2.20"
+version = "0.2.21"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -27,7 +27,6 @@ jsonwebtoken = "9.3.0"
 #jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 potato-macro = "0.2.19"
 #potato-macro = { path = "../potato-macro" }
-russh = { version = "0.56.0", default-features = false, features = ["flate2", "ring", "rsa"] }
 rand = "0.8.5"
 regex = "1.11.1"
 rust-embed = "8.9.0"
@@ -56,18 +55,22 @@ tikv-jemallocator = { version = "0.6.0", features = [
     "unprefixed_malloc_on_supported_platforms",
     "background_threads",
 ], optional = true }
+# ssh
+rand_core = { version = "=0.10.0-rc-3", optional = true }
+russh = { version = "0.56.0", default-features = false, features = ["flate2", "ring", "rsa"], optional = true }
 # webdav
 bytes = { version = "1.10.1", optional = true }
 dav-server = { version = "0.10.0", optional = true }
 futures-util = { version = "0.3.31", optional = true }
 
 [features]
-default = ["openapi", "tls"]
+default = ["openapi", "ssh", "tls"]
 jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:tikv-jemallocator"]
 openapi = []
+ssh = ["dep:rand_core", "dep:russh"]
 tls = ["dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
 webdav = ["dep:bytes", "dep:dav-server", "dep:futures-util", "dep:webpki-roots"]
-full = ["jemalloc", "openapi", "tls", "webdav"]
+full = ["jemalloc", "openapi", "ssh", "tls", "webdav"]
 
 # cargo publish -p potato-macro --allow-dirty --registry crates-io
 # cargo publish -p potato --allow-dirty --registry crates-io
