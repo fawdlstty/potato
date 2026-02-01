@@ -368,7 +368,7 @@ impl PipeContext {
         for (_idx, item) in self2.items.iter().enumerate().skip(skip) {
             match item {
                 PipeContextItem::Handlers(allow_cors) => {
-                    let handler_ref = match HANDLERS.get(req.url_path.to_str()) {
+                    let handler_ref = match HANDLERS.get(&req.url_path[..]) {
                         Some(handlers) => handlers.get(&req.method).map(|p| p.handler),
                         None => None,
                     };
@@ -384,7 +384,7 @@ impl PipeContext {
                                     [HttpMethod::HEAD, HttpMethod::OPTIONS]
                                         .into_iter()
                                         .collect();
-                                if let Some(handlers) = HANDLERS.get(req.url_path.to_str()) {
+                                if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
                                     options.extend(handlers.keys().map(|p| *p));
                                 }
                                 options
@@ -406,12 +406,12 @@ impl PipeContext {
                     }
                 }
                 PipeContextItem::LocationRoute((url_path, loc_path)) => {
-                    if !req.url_path.to_str().starts_with(url_path) {
+                    if !req.url_path.starts_with(url_path) {
                         continue;
                     }
                     let mut path = PathBuf::new();
                     path.push(loc_path);
-                    path.push(&req.url_path.to_str()[url_path.len()..]);
+                    path.push(&req.url_path[url_path.len()..]);
                     if let Ok(path) = path.canonicalize() {
                         let mut temp_path = path.to_string_lossy().to_string();
                         if temp_path.starts_with("\\\\?\\") {
@@ -567,7 +567,7 @@ impl PipeContext {
                     continue;
                 }
                 PipeContextItem::EmbeddedRoute(embedded_items) => {
-                    if let Some(item) = embedded_items.get(req.url_path.to_str()) {
+                    if let Some(item) = embedded_items.get(&req.url_path[..]) {
                         let meta = std::env::current_exe()
                             .ok()
                             .map(|p| std::fs::metadata(&p).ok())
@@ -600,12 +600,8 @@ impl PipeContext {
                             }
                         }
 
-                        let ret = HttpResponse::from_mem_file(
-                            req.url_path.to_str(),
-                            item.to_vec(),
-                            false,
-                            meta,
-                        );
+                        let ret =
+                            HttpResponse::from_mem_file(&req.url_path, item.to_vec(), false, meta);
                         return ret;
                     }
                     continue;
@@ -617,7 +613,7 @@ impl PipeContext {
                     Err(err) => return HttpResponse::error(format!("{err}")),
                 },
                 PipeContextItem::ReverseProxy(path, proxy_url, modify_content) => {
-                    if !req.url_path.to_str().starts_with(path) {
+                    if !req.url_path.starts_with(path) {
                         continue;
                     }
 

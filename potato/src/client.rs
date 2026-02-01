@@ -501,7 +501,7 @@ impl TransferSession {
                     orig_path
                 }
             } else {
-                req.url_path.to_str().to_string()
+                req.url_path.to_string()
             };
 
             let host = uri.host().unwrap_or("localhost");
@@ -522,7 +522,7 @@ impl TransferSession {
                 || req
                     .get_header("X-Forwarded-Proto-Https")
                     .map_or(false, |_| true)
-                || req.url_path.to_str().starts_with("https")
+                || req.url_path.starts_with("https")
                 || host.contains(".com") && !host.contains("127.") && !host.starts_with("192.")
                 || host.contains("localhost");
 
@@ -532,14 +532,13 @@ impl TransferSession {
                 .parse::<u16>()
                 .unwrap_or(if use_ssl { 443 } else { 80 });
 
-            let path = req.url_path.to_str();
             let query_str = req.query_string();
 
             build_websocket_url(
                 if use_ssl { Some("https") } else { None },
                 host_part,
                 port,
-                path,
+                &req.url_path,
                 query_str,
             )
         };
@@ -551,7 +550,7 @@ impl TransferSession {
             }
             headers.push(crate::Headers::Custom((
                 key.to_str().to_string(),
-                value.to_str().to_string(),
+                value.to_string(),
             )));
         }
 

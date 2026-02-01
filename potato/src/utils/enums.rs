@@ -1,4 +1,4 @@
-use super::refstr::{RefStr, ToRefStrExt};
+use hipstr::LocalHipStr;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HttpConnection {
@@ -18,19 +18,19 @@ impl HttpConnection {
 }
 
 #[derive(PartialEq)]
-pub enum HttpContentType {
+pub enum HttpContentType<'a> {
     ApplicationJson,
     ApplicationXWwwFormUrlencoded,
-    MultipartFormData(RefStr),
+    MultipartFormData(LocalHipStr<'a>),
 }
 
-impl HttpContentType {
+impl<'a> HttpContentType<'a> {
     pub fn from_str(val: &str) -> Option<Self> {
         match val.len() {
             16 if val.eq_ignore_ascii_case("application/json") => Some(Self::ApplicationJson),
             19 if val.starts_with("multipart/form-data") => val
                 .split_once("boundary=")
-                .map(|(_, boundary)| Self::MultipartFormData(boundary.to_ref_str())),
+                .map(|(_, boundary)| Self::MultipartFormData(LocalHipStr::from(boundary))),
             33 if val.eq_ignore_ascii_case("application/x-www-form-urlencoded") => {
                 Some(Self::ApplicationXWwwFormUrlencoded)
             }

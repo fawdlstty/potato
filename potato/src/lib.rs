@@ -5,14 +5,13 @@ pub mod utils;
 
 pub use client::*;
 pub use global_config::*;
+use hipstr::{LocalHipByt, LocalHipStr};
 pub use inventory;
 pub use potato_macro::*;
 pub use regex;
 pub use rust_embed;
 pub use serde_json;
 pub use server::*;
-use tokio::sync::Mutex;
-pub use utils::refstr::Headers;
 
 #[cfg(feature = "jemalloc")]
 pub use utils::jemalloc_helper::*;
@@ -34,11 +33,12 @@ use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 use std::{collections::HashMap, future::Future, pin::Pin};
 use strum::Display;
+use tokio::sync::Mutex;
 use utils::bytes::CompressExt;
 use utils::enums::{HttpConnection, HttpContentType};
 use utils::number::HttpCodeExt;
-use utils::refbuf::{RefOrBuffer, ToRefBufExt};
-use utils::refstr::{HeaderItem, HeaderRefOrString, RefOrString, ToRefStrExt};
+use utils::refstr::Headers;
+use utils::refstr::{HeaderItem, HeaderOrHipStr};
 use utils::string::StringExt;
 use utils::tcp_stream::{HttpStream, VecU8Ext};
 
@@ -375,8 +375,8 @@ pub enum WsFrameImpl {
 
 #[derive(Clone, Debug)]
 pub struct PostFile {
-    pub filename: RefOrString,
-    pub data: RefOrBuffer,
+    pub filename: LocalHipStr<'static>,
+    pub data: LocalHipByt<'static>,
 }
 
 unsafe impl Send for PostFile {}
@@ -384,13 +384,13 @@ unsafe impl Send for PostFile {}
 #[derive(Debug)]
 pub struct HttpRequest {
     pub method: HttpMethod,
-    pub url_path: RefOrString,
-    pub url_query: HashMap<RefOrString, RefOrString>,
+    pub url_path: LocalHipStr<'static>,
+    pub url_query: HashMap<LocalHipStr<'static>, LocalHipStr<'static>>,
     pub version: u8,
-    pub headers: HashMap<HeaderRefOrString, RefOrString>,
-    pub body: RefOrBuffer,
-    pub body_pairs: HashMap<RefOrString, RefOrString>,
-    pub body_files: HashMap<RefOrString, PostFile>,
+    pub headers: HashMap<HeaderOrHipStr, LocalHipStr<'static>>,
+    pub body: LocalHipByt<'static>,
+    pub body_pairs: HashMap<LocalHipStr<'static>, LocalHipStr<'static>>,
+    pub body_files: HashMap<LocalHipStr<'static>, PostFile>,
     pub exts: HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>>,
 }
 
@@ -401,11 +401,11 @@ impl HttpRequest {
     pub fn new() -> Self {
         Self {
             method: HttpMethod::GET,
-            url_path: "/".to_ref_string(),
+            url_path: LocalHipStr::from("/"),
             url_query: HashMap::with_capacity(16),
             version: 11,
             headers: HashMap::with_capacity(16),
-            body: [].to_ref_buffer(),
+            body: LocalHipByt::new(),
             body_pairs: HashMap::with_capacity(16),
             body_files: HashMap::with_capacity(4),
             exts: HashMap::new(),
@@ -415,9 +415,9 @@ impl HttpRequest {
     pub fn query_string(&self) -> String {
         let mut q = "?".to_string();
         for (k, v) in self.url_query.iter() {
-            q.push_str(k.to_str());
+            q.push_str(k);
             q.push('=');
-            q.push_str(v.to_str());
+            q.push_str(v);
             q.push('&');
         }
         q.pop();
@@ -452,9 +452,9 @@ impl HttpRequest {
                 }
                 false => q.push('&'),
             }
-            q.push_str(k.to_str());
+            q.push_str(k);
             q.push('=');
-            q.push_str(v.to_str());
+            q.push_str(v);
         }
         Ok(http::uri::Builder::new()
             .scheme(if is_https { "https" } else { "http" })
@@ -466,26 +466,32 @@ impl HttpRequest {
         let uri = url.parse::<Uri>()?;
         let mut req = Self::new();
         req.method = method;
-        req.url_path = uri.path().to_ref_string();
-        req.headers
-            .insert("Host".into(), uri.host().unwrap_or("localhost").into());
+        req.url_path = LocalHipStr::from(uri.path());
+        req.headers.insert(
+            HeaderOrHipStr::from_str("Host"),
+            uri.host().unwrap_or("localhost").into(),
+        );
         let use_ssl = uri.scheme() == Some(&Scheme::HTTPS);
         let port = uri.port_u16().unwrap_or(if use_ssl { 443 } else { 80 });
         Ok((req, use_ssl, port))
     }
 
-    pub fn set_header(&mut self, key: impl Into<HeaderRefOrString>, value: impl Into<RefOrString>) {
+    pub fn set_header(
+        &mut self,
+        key: impl Into<HeaderOrHipStr>,
+        value: impl Into<LocalHipStr<'static>>,
+    ) {
         self.headers.insert(key.into(), value.into());
     }
 
     pub fn get_header(&self, key: &str) -> Option<&str> {
         self.headers
-            .get(&key.to_ref_string().into())
-            .map(|a| a.to_str())
+            .get(&HeaderOrHipStr::HipStr(LocalHipStr::from(key)))
+            .map(|a| &a[..])
     }
 
     pub fn get_header_key(&self, key: HeaderItem) -> Option<&str> {
-        self.headers.get(&key.into()).map(|a| a.to_str())
+        self.headers.get(&key.into()).map(|a| &a[..])
     }
 
     pub fn get_header_accept_encoding(&self) -> CompressMode {
@@ -519,7 +525,7 @@ impl HttpRequest {
             .map_or(0, |val| val.parse::<usize>().unwrap_or(0))
     }
 
-    pub fn get_header_content_type(&self) -> Option<HttpContentType> {
+    pub fn get_header_content_type<'a>(&'a self) -> Option<HttpContentType<'a>> {
         HttpContentType::from_str(self.get_header_key(HeaderItem::Content_Type).unwrap_or(""))
     }
 
@@ -604,22 +610,36 @@ impl HttpRequest {
             }
             buf.extend(&tmp_buf[0..t]);
         }
-        req.body = buf[hdr_len..hdr_len + bdy_len].to_ref_buffer();
-        if let Some(cnt_type) = req.get_header_content_type() {
-            match cnt_type {
-                HttpContentType::ApplicationJson => {
-                    if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
+        req.body = LocalHipByt::from(&buf[hdr_len..hdr_len + bdy_len]);
+
+        // 先获取Content-Type的字符串值，避免借用冲突
+        let content_type_str = {
+            req.get_header_key(HeaderItem::Content_Type)
+                .map(|s| s.to_string())
+        };
+
+        // 根据内容类型字符串处理请求体
+        if let Some(content_type_str) = content_type_str {
+            // 解析内容类型
+            let content_type_parsed = HttpContentType::from_str(&content_type_str);
+
+            match content_type_parsed {
+                Some(HttpContentType::ApplicationJson) => {
+                    if let Ok(body_str) = std::str::from_utf8(&req.body) {
                         if let Ok(root) = serde_json::from_str::<serde_json::Value>(&body_str) {
                             if let serde_json::Value::Object(obj) = root {
                                 for (k, v) in obj {
-                                    req.body_pairs.insert(k.into(), v.to_string().into());
+                                    req.body_pairs.insert(
+                                        LocalHipStr::from(k),
+                                        LocalHipStr::from(v.to_string()),
+                                    );
                                 }
                             }
                         }
                     }
                 }
-                HttpContentType::ApplicationXWwwFormUrlencoded => {
-                    if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
+                Some(HttpContentType::ApplicationXWwwFormUrlencoded) => {
+                    if let Ok(body_str) = std::str::from_utf8(&req.body) {
                         body_str.split('&').for_each(|s| {
                             if let Some((a, b)) = s.split_once('=') {
                                 req.body_pairs
@@ -628,9 +648,8 @@ impl HttpRequest {
                         });
                     }
                 }
-                HttpContentType::MultipartFormData(boundary) => {
-                    let boundary = boundary.to_str();
-                    if let Ok(body_str) = std::str::from_utf8(req.body.to_buf()) {
+                Some(HttpContentType::MultipartFormData(boundary)) => {
+                    if let Ok(body_str) = std::str::from_utf8(&req.body) {
                         let split_str = ssformat!(64, "--{boundary}");
                         for mut s in body_str.split(split_str.as_str()) {
                             if s == "--" {
@@ -652,24 +671,25 @@ impl HttpRequest {
                                 for key in keys.into_iter() {
                                     if let Some((k, v)) = key.trim().split_once('=') {
                                         if k == "name" {
-                                            name = Some(v[1..v.len() - 1].to_ref_string());
+                                            name = Some(LocalHipStr::from(&v[1..v.len() - 1]));
                                         } else if k == "filename" {
-                                            filename = Some(v[1..v.len() - 1].to_ref_string());
+                                            filename = Some(LocalHipStr::from(&v[1..v.len() - 1]));
                                         }
                                     }
                                 }
                                 if let Some(name) = name {
                                     if let Some(filename) = filename {
-                                        let data = content.as_bytes().to_ref_buffer();
+                                        let data = LocalHipByt::from(content.as_bytes());
                                         req.body_files.insert(name, PostFile { filename, data });
                                     } else {
-                                        req.body_pairs.insert(name, content.to_ref_string());
+                                        req.body_pairs.insert(name, LocalHipStr::from(content));
                                     }
                                 }
                             }
                         }
                     }
                 }
+                None => {}
             }
         }
         Ok((req, hdr_len + bdy_len))
@@ -712,23 +732,25 @@ impl HttpRequest {
         let url = rreq.path.unwrap();
         match url.find('?') {
             Some(p) => {
-                req.url_path = url[..p].to_ref_string();
+                req.url_path = LocalHipStr::from(&url[..p]);
                 req.url_query = url[p + 1..]
                     .split('&')
                     .into_iter()
                     .map(|s| s.split_once('=').unwrap_or((s, "")))
-                    .map(|(a, b)| (a.to_ref_string(), b.to_ref_string()))
+                    .map(|(a, b)| (LocalHipStr::from(a), LocalHipStr::from(b)))
                     .collect();
             }
-            None => req.url_path = url.to_ref_string(),
+            None => req.url_path = LocalHipStr::from(url),
         }
         req.version = rreq.version.unwrap_or(1) + 10;
         for h in rreq.headers.iter() {
             if h.name == "" {
                 break;
             }
-            req.headers
-                .insert(h.name.to_header_ref_string(), h.value.to_ref_string());
+            req.headers.insert(
+                HeaderOrHipStr::from_str(h.name),
+                LocalHipStr::from(str::from_utf8(h.value)?),
+            );
         }
         Ok(Some((req, n)))
     }
@@ -832,21 +854,21 @@ impl HttpRequest {
     }
 
     pub fn as_bytes(&self) -> Vec<u8> {
-        let mut req_str = format!("{} {} HTTP/1.1\r\n", self.method, self.url_path.to_str());
+        let mut req_str = format!("{} {} HTTP/1.1\r\n", self.method, self.url_path);
         for (k, v) in self.headers.iter() {
-            if let HeaderRefOrString::HeaderItem(HeaderItem::Content_Length) = k {
+            if let HeaderOrHipStr::HeaderItem(HeaderItem::Content_Length) = k {
                 continue;
             }
-            req_str.push_str(&format!("{}: {}\r\n", k.to_str(), v.to_str()));
+            req_str.push_str(&format!("{}: {v}\r\n", k.to_str()));
         }
         req_str.push_str(&format!(
             "{}: {}\r\n",
             HeaderItem::Content_Length.to_str(),
-            self.body.to_buf().len()
+            self.body.len()
         ));
         req_str.push_str("\r\n");
         let mut ret = req_str.as_bytes().to_vec();
-        ret.extend(self.body.to_buf());
+        ret.extend(&self.body[..]);
         ret
     }
 }
