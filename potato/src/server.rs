@@ -628,7 +628,7 @@ impl PipeContext {
 
                 #[cfg(feature = "jemalloc")]
                 PipeContextItem::Jemalloc(path) => {
-                    if path == req.url_path.to_str() {
+                    if path == &req.url_path[..] {
                         return match crate::dump_jemalloc_profile().await {
                             Ok(data) => {
                                 // Generate ETag (based on content hash and file size)
@@ -669,14 +669,14 @@ impl PipeContext {
                 PipeContextItem::Webdav((path, dav_server)) => {
                     use crate::utils::string::StringExt;
                     use futures_util::StreamExt;
-                    if !req.url_path.to_str().starts_with(path) {
+                    if !req.url_path.starts_with(path) {
                         continue;
                     }
                     let new_req = {
-                        let mut new_req = http::Request::new(match req.body.to_buf().len() {
+                        let mut new_req = http::Request::new(match req.body.len() {
                             0 => dav_server::body::Body::empty(),
                             _ => {
-                                let bytes = bytes::Bytes::copy_from_slice(req.body.to_buf());
+                                let bytes = bytes::Bytes::copy_from_slice(&req.body[..]);
                                 dav_server::body::Body::from(bytes)
                             }
                         });
@@ -696,12 +696,11 @@ impl PipeContext {
                         };
                         // Modify URI to remove the specified path prefix and preserve original scheme and authority
                         use std::str::FromStr;
-                        let original_path = req.url_path.to_str();
-                        let adjusted_path = if original_path.starts_with(path) {
+                        let adjusted_path = if req.url_path.starts_with(path) {
                             // Remove the path prefix from the original path
-                            &original_path[path.len()..]
+                            &req.url_path[path.len()..]
                         } else {
-                            original_path
+                            &req.url_path[..]
                         };
 
                         // Ensure the path starts with / for valid URI
@@ -737,7 +736,7 @@ impl PipeContext {
                             }
                         };
                         for (k, v) in req.headers.iter() {
-                            if let Ok(v) = http::HeaderValue::from_str(v.to_str()) {
+                            if let Ok(v) = http::HeaderValue::from_str(&v[..]) {
                                 let k: &'static str = unsafe { std::mem::transmute(k.to_str()) };
                                 new_req.headers_mut().append(k, v);
                             }

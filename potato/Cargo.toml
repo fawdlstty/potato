@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.2.22"
+version = "0.2.23"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -37,10 +37,7 @@ smallstr = "0.3.0"
 smallvec = "1.14.0"
 strum = { version = "0.27.2", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["full"] }
-tokio-rustls = { version = "0.26.2", default-features = false, features = [
-    "ring",
-    "tls12",
-], optional = true }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"], optional = true }
 webpki-roots = { version = "1.0.5", optional = true }
 
 # jemalloc
@@ -59,11 +56,7 @@ tikv-jemallocator = { version = "0.6.0", features = [
 ], optional = true }
 # ssh
 rand_core = { version = "=0.10.0-rc-3", optional = true }
-russh = { version = "0.56.0", default-features = false, features = [
-    "flate2",
-    "ring",
-    "rsa",
-], optional = true }
+russh = { version = "0.56.0", default-features = false, features = ["flate2", "ring", "rsa"], optional = true }
 # webdav
 bytes = { version = "1.10.1", optional = true }
 dav-server = { version = "0.10.0", optional = true }
@@ -72,11 +65,7 @@ hipstr = "0.8.0"
 
 [features]
 default = ["openapi", "ssh", "tls"]
-jemalloc = [
-    "dep:tikv-jemalloc-ctl",
-    "dep:tikv-jemalloc-sys",
-    "dep:tikv-jemallocator",
-]
+jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:tikv-jemallocator"]
 openapi = []
 ssh = ["dep:rand_core", "dep:russh"]
 tls = ["dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
