@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.2.23"
+version = "0.2.24"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -55,7 +55,6 @@ tikv-jemallocator = { version = "0.6.0", features = [
     "background_threads",
 ], optional = true }
 # ssh
-rand_core = { version = "=0.10.0-rc-3", optional = true }
 russh = { version = "0.56.0", default-features = false, features = ["flate2", "ring", "rsa"], optional = true }
 # webdav
 bytes = { version = "1.10.1", optional = true }
@@ -64,10 +63,10 @@ futures-util = { version = "0.3.31", optional = true }
 hipstr = "0.8.0"
 
 [features]
-default = ["openapi", "ssh", "tls"]
+default = ["openapi", "tls"]
 jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:tikv-jemallocator"]
 openapi = []
-ssh = ["dep:rand_core", "dep:russh"]
+ssh = ["dep:russh"]
 tls = ["dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
 webdav = ["dep:bytes", "dep:dav-server", "dep:futures-util", "dep:webpki-roots"]
 full = ["jemalloc", "openapi", "ssh", "tls", "webdav"]
