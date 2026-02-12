@@ -18,7 +18,7 @@ impl HeaderOrHipStr {
     pub fn to_str(&self) -> &str {
         match self {
             HeaderOrHipStr::HeaderItem(header_item) => header_item.to_str(),
-            HeaderOrHipStr::HipStr(hip_str) => hip_str.as_borrowed().unwrap_or(""),
+            HeaderOrHipStr::HipStr(hip_str) => hip_str.as_str(),
         }
     }
 }

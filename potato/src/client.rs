@@ -5,8 +5,6 @@ use crate::utils::tcp_stream::HttpStream;
 use crate::{HttpMethod, HttpRequest, HttpResponse, SERVER_STR};
 use anyhow::anyhow;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 macro_rules! define_session_method {
@@ -257,6 +255,7 @@ impl TransferSession {
 
     #[cfg(feature = "ssh")]
     pub async fn with_ssh_jumpbox(&mut self, jumpbox: &SshJumpboxInfo) -> anyhow::Result<()> {
+        use std::sync::Arc;
         let config = Arc::new(russh::client::Config::default());
 
         let mut handle =
@@ -329,6 +328,9 @@ impl TransferSession {
         let stream = match self.conns.get_mut(&conn_key) {
             Some(stream) => stream,
             None => {
+                #[cfg(not(feature = "ssh"))]
+                let new_stream = None;
+                #[cfg(feature = "ssh")]
                 let mut new_stream = None;
                 #[cfg(feature = "ssh")]
                 if let Some(jumpbox_srv) = &self.jumpbox_srv {
@@ -342,6 +344,7 @@ impl TransferSession {
                     let (mut reader, mut writer) = tokio::io::split(stream2);
 
                     tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
                         let mut buffer = vec![0u8; 8192];
                         loop {
                             tokio::select! {

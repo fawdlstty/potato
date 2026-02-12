@@ -12,6 +12,7 @@ pub use regex;
 pub use rust_embed;
 pub use serde_json;
 pub use server::*;
+pub use utils::refstr::Headers;
 
 #[cfg(feature = "jemalloc")]
 pub use utils::jemalloc_helper::*;
@@ -37,7 +38,6 @@ use tokio::sync::Mutex;
 use utils::bytes::CompressExt;
 use utils::enums::{HttpConnection, HttpContentType};
 use utils::number::HttpCodeExt;
-use utils::refstr::Headers;
 use utils::refstr::{HeaderItem, HeaderOrHipStr};
 use utils::string::StringExt;
 use utils::tcp_stream::{HttpStream, VecU8Ext};
