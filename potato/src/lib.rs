@@ -5,7 +5,7 @@ pub mod utils;
 
 pub use client::*;
 pub use global_config::*;
-use hipstr::{LocalHipByt, LocalHipStr};
+pub use hipstr;
 pub use inventory;
 pub use potato_macro::*;
 pub use regex;
@@ -20,6 +20,7 @@ pub use utils::jemalloc_helper::*;
 use anyhow::{anyhow, Error};
 use chrono::Utc;
 use core::str;
+use hipstr::{LocalHipByt, LocalHipStr};
 use http::uri::Scheme;
 use http::Uri;
 use rust_embed::Embed;

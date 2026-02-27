@@ -157,12 +157,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                         let mut arg_value = quote! {
                             match req.body_pairs
-                                .get(&potato::utils::refstr::LocalHipStr<'static>::from_str(#arg_name_str))
+                                .get(&potato::hipstr::LocalHipStr::from(#arg_name_str))
                                 .map(|p| p.to_string()) {
                                 Some(val) => val,
                                 None => match req.url_query
-                                    .get(&potato::utils::refstr::LocalHipStr<'static>::from_str(#arg_name_str))
-                                    .map(|p| p.to_str().to_string()) {
+                                    .get(&potato::hipstr::LocalHipStr::from(#arg_name_str))
+                                    .map(|p| p.as_str().to_string()) {
                                     Some(val) => val,
                                     None => return potato::HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
                                 },
