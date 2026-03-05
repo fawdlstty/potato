@@ -2,7 +2,7 @@
 use crate::utils::bytes::CompressExt;
 use crate::utils::refstr::{HeaderItem, Headers};
 use crate::utils::tcp_stream::HttpStream;
-use crate::{HttpMethod, HttpRequest, HttpResponse, SERVER_STR};
+use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody, SERVER_STR};
 use anyhow::anyhow;
 use std::collections::HashMap;
 use tokio::net::TcpStream;
@@ -424,8 +424,33 @@ impl TransferSession {
         if modify_content {
             match res.get_header("Content-Encoding") {
                 Some(s) if s.to_lowercase() == "gzip" => {
-                    if let Ok(data) = res.body.decompress() {
-                        if let Ok(s) = str::from_utf8(&data) {
+                    if let HttpResponseBody::Data(ref mut body_data) = res.body {
+                        if let Ok(data) = body_data.decompress() {
+                            if let Ok(s) = str::from_utf8(&data) {
+                                if let Some(ref dest_url) = self.dest_url {
+                                    let proxy_url = if dest_url.ends_with('/') {
+                                        &dest_url[..dest_url.len() - 1]
+                                    } else {
+                                        dest_url.as_str()
+                                    };
+                                    let path = if self.req_path_prefix.ends_with('/') {
+                                        &self.req_path_prefix[..self.req_path_prefix.len() - 1]
+                                    } else {
+                                        self.req_path_prefix.as_str()
+                                    };
+                                    let data = s.replace(proxy_url, path).into_bytes();
+                                    if let Ok(data) = data.compress() {
+                                        *body_data = data;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if let HttpResponseBody::Data(ref mut body_data) = res.body {
+                        if let Ok(s) = str::from_utf8(body_data) {
                             if let Some(ref dest_url) = self.dest_url {
                                 let proxy_url = if dest_url.ends_with('/') {
                                     &dest_url[..dest_url.len() - 1]
@@ -437,36 +462,17 @@ impl TransferSession {
                                 } else {
                                     self.req_path_prefix.as_str()
                                 };
-                                let data = s.replace(proxy_url, path).into_bytes();
-                                if let Ok(data) = data.compress() {
-                                    res.body = data;
-                                }
+                                *body_data = s.replace(proxy_url, path).into_bytes();
                             }
-                        }
-                    }
-                }
-                Some(_) => {}
-                None => {
-                    if let Ok(s) = str::from_utf8(&res.body) {
-                        if let Some(ref dest_url) = self.dest_url {
-                            let proxy_url = if dest_url.ends_with('/') {
-                                &dest_url[..dest_url.len() - 1]
-                            } else {
-                                dest_url.as_str()
-                            };
-                            let path = if self.req_path_prefix.ends_with('/') {
-                                &self.req_path_prefix[..self.req_path_prefix.len() - 1]
-                            } else {
-                                self.req_path_prefix.as_str()
-                            };
-                            res.body = s.replace(proxy_url, path).into_bytes();
                         }
                     }
                 }
             }
             res.headers.remove("Transfer-Encoding");
-            res.headers
-                .insert("Content-Length".to_string(), res.body.len().to_string());
+            if let HttpResponseBody::Data(ref body_data) = res.body {
+                res.headers
+                    .insert("Content-Length".to_string(), body_data.len().to_string());
+            }
         }
 
         Ok(res)

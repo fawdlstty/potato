@@ -224,7 +224,11 @@ mod integration_tests {
             Ok(response) => {
                 println!("Response code: {}", response.http_code);
                 println!("Response headers: {:?}", response.headers);
-                println!("Response body length: {}", response.body.len());
+                let body_len = match &response.body {
+                    potato::HttpResponseBody::Data(data) => data.len(),
+                    potato::HttpResponseBody::Stream(_) => 0,
+                };
+                println!("Response body length: {}", body_len);
 
                 // 验证响应对象的有效性
                 assert!(!response.headers.is_empty() || response.headers.is_empty());
@@ -340,13 +344,18 @@ mod integration_tests {
         let url = format!("http://{}/", server_addr);
         match potato::get(&url, vec![]).await {
             Ok(response) => {
-                // 尝试将响应体解析为UTF-8字符串
-                match String::from_utf8(response.body.clone()) {
-                    Ok(text) => {
-                        println!("Response as string length: {}", text.len());
-                    }
-                    Err(e) => {
-                        println!("Response is not valid UTF-8: {}", e);
+                // 尝试将响应体解析为 UTF-8 字符串
+                match &response.body {
+                    potato::HttpResponseBody::Data(data) => match String::from_utf8(data.clone()) {
+                        Ok(text) => {
+                            println!("Response as string length: {}", text.len());
+                        }
+                        Err(e) => {
+                            println!("Response is not valid UTF-8: {}", e);
+                        }
+                    },
+                    potato::HttpResponseBody::Stream(_) => {
+                        println!("Response is a stream");
                     }
                 }
             }

@@ -1,6 +1,6 @@
 use crate::utils::enums::HttpConnection;
 use crate::utils::tcp_stream::HttpStream;
-use crate::{HttpMethod, HttpRequest, HttpResponse, PreflightResult};
+use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody, PreflightResult};
 use crate::{RequestHandlerFlag, TransferSession};
 use async_recursion::async_recursion;
 use std::borrow::Cow;
@@ -752,9 +752,11 @@ impl PipeContext {
                         res.http_code = new_res.status().as_u16();
                         res.version = format!("{:?}", new_res.version());
                         let body = new_res.body_mut();
+                        let mut body_data = Vec::new();
                         while let Some(Ok(part)) = body.next().await {
-                            res.body.extend(part.iter());
+                            body_data.extend(part.iter());
                         }
+                        res.body = HttpResponseBody::Data(body_data);
                         res
                     };
                     return res;
@@ -854,7 +856,7 @@ impl HttpServer {
                         PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
-                        match stream.write_all(&res.as_bytes(cmode)).await {
+                        match res.write_to_stream(&mut stream, cmode).await {
                             Ok(()) => _ = buf.drain(..n),
                             Err(_) => break,
                         }
@@ -914,7 +916,7 @@ impl HttpServer {
                         PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
-                        match stream.write_all(&res.as_bytes(cmode)).await {
+                        match res.write_to_stream(&mut stream, cmode).await {
                             Ok(()) => _ = buf.drain(..n),
                             Err(_) => break,
                         }

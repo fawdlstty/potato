@@ -13,6 +13,14 @@ categories = []
 readme = "../README.md"
 exclude = ["src/main.rs"]
 
+[[example]]
+name = "15_streaming_server"
+path = "../examples/server/15_streaming_server.rs"
+
+[[example]]
+name = "16_streaming_macro"
+path = "../examples/server/16_streaming_macro.rs"
+
 [dependencies]
 anyhow = "1.0.100"
 async-recursion = "1.1.1"
@@ -69,7 +77,7 @@ openapi = []
 ssh = ["dep:russh"]
 tls = ["dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
 webdav = ["dep:bytes", "dep:dav-server", "dep:futures-util", "dep:webpki-roots"]
-full = ["jemalloc", "openapi", "ssh", "tls", "webdav"]
+full = ["openapi", "ssh", "tls", "webdav"]
 
 # cargo publish -p potato-macro --allow-dirty --registry crates-io
 # cargo publish -p potato --allow-dirty --registry crates-io

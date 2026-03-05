@@ -42,12 +42,17 @@ mod webdav_tests {
 
         sleep(Duration::from_millis(300)).await;
 
-        // 测试 WebDAV GET 方法（读取文件）
+        // 测试 WebDAV GET 方法 (读取文件)
         let url = format!("http://{}/webdav/test.txt", server_addr);
         match potato::get(&url, vec![]).await {
             Ok(res) => {
                 println!("WebDAV GET response: {}", res.http_code);
-                let body = String::from_utf8(res.body.clone()).unwrap_or_default();
+                let body = match &res.body {
+                    potato::HttpResponseBody::Data(data) => {
+                        String::from_utf8(data.clone()).unwrap_or_default()
+                    }
+                    potato::HttpResponseBody::Stream(_) => "stream response".to_string(),
+                };
                 if res.http_code == 200 {
                     assert_eq!(body, "hello webdav");
                     println!("✅ WebDAV file content verified");

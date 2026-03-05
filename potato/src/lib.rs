@@ -12,6 +12,7 @@ pub use regex;
 pub use rust_embed;
 pub use serde_json;
 pub use server::*;
+use tokio::sync::mpsc::Receiver;
 pub use utils::refstr::Headers;
 
 #[cfg(feature = "jemalloc")]
@@ -218,10 +219,14 @@ impl Websocket {
         req.apply_header(Headers::Sec_WebSocket_Key("VerySecurity".to_string()));
         let res = sess.do_request(req).await?;
         if res.http_code != 101 {
+            let body_str = match &res.body {
+                HttpResponseBody::Data(data) => str::from_utf8(&data[..])?,
+                HttpResponseBody::Stream(_) => "stream response",
+            };
             Err(anyhow!(
                 "Server return code[{}]: {}",
                 res.http_code,
-                str::from_utf8(&res.body)?
+                body_str
             ))?;
         }
         let stream = sess
@@ -874,15 +879,34 @@ impl HttpRequest {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+pub enum HttpResponseBody {
+    Data(Vec<u8>),
+    Stream(Receiver<Vec<u8>>),
+}
+
+#[derive(Debug)]
 pub struct HttpResponse {
     pub version: String,
     pub http_code: u16,
     pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
+    pub body: HttpResponseBody,
 }
 unsafe impl Send for HttpResponse {}
 unsafe impl Sync for HttpResponse {}
+impl Clone for HttpResponse {
+    fn clone(&self) -> Self {
+        Self {
+            version: self.version.clone(),
+            http_code: self.http_code,
+            headers: self.headers.clone(),
+            body: match &self.body {
+                HttpResponseBody::Data(data) => HttpResponseBody::Data(data.clone()),
+                HttpResponseBody::Stream(_) => panic!("Cannot clone Stream response"),
+            },
+        }
+    }
+}
 
 macro_rules! make_resp_by_text {
     ($fn_name:ident, $cnt_type:expr) => {
@@ -892,7 +916,7 @@ macro_rules! make_resp_by_text {
                 version: "HTTP/1.1".into(),
                 http_code: 200,
                 headers: Self::default_headers($cnt_type),
-                body: body.as_bytes().to_vec(),
+                body: HttpResponseBody::Data(body.as_bytes().to_vec()),
             }
         }
     };
@@ -905,7 +929,7 @@ macro_rules! make_resp_by_binary {
                 version: "HTTP/1.1".into(),
                 http_code: 200,
                 headers: Self::default_headers($cnt_type),
-                body: body.to_vec(),
+                body: HttpResponseBody::Data(body.to_vec()),
             }
         }
     };
@@ -941,7 +965,7 @@ impl HttpResponse {
             version: "".into(),
             http_code: 0,
             headers: HashMap::with_capacity(16),
-            body: vec![],
+            body: HttpResponseBody::Data(vec![]),
         }
     }
 
@@ -963,6 +987,37 @@ impl HttpResponse {
 
     pub fn empty() -> Self {
         Self::html("")
+    }
+
+    /// Create a streaming response with chunked transfer encoding
+    pub fn stream(rx: Receiver<Vec<u8>>) -> Self {
+        Self {
+            version: "HTTP/1.1".into(),
+            http_code: 200,
+            headers: [
+                ("Transfer-Encoding".into(), "chunked".into()),
+                ("Content-Type".into(), "application/octet-stream".into()),
+            ]
+            .into(),
+            body: HttpResponseBody::Stream(rx),
+        }
+    }
+
+    /// Create a streaming response with custom content type
+    pub fn stream_with_content_type(
+        rx: Receiver<Vec<u8>>,
+        content_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: "HTTP/1.1".into(),
+            http_code: 200,
+            headers: [
+                ("Transfer-Encoding".into(), "chunked".into()),
+                ("Content-Type".into(), content_type.into()),
+            ]
+            .into(),
+            body: HttpResponseBody::Stream(rx),
+        }
     }
 
     pub fn from_file(path: &str, download: bool, meta: Option<Metadata>) -> Self {
@@ -1032,7 +1087,7 @@ impl HttpResponse {
                     );
                 }
             }
-            ret.body = data;
+            ret.body = HttpResponseBody::Data(data);
             ret
         }
     }
@@ -1059,50 +1114,106 @@ impl HttpResponse {
                 ("Sec-WebSocket-Accept".into(), ws_accept.into()),
             ]
             .into(),
-            body: vec![],
+            body: HttpResponseBody::Data(vec![]),
         }
     }
 
     pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {
-        let mut payload_tmp = vec![];
-        let mut payload_ref = &self.body;
-        if cmode == CompressMode::Gzip
-            && self.body.len() >= 32
-            && self.get_header("Content-Encoding").is_none()
-        {
-            if let Ok(data) = self.body.compress() {
-                payload_tmp = data;
-                payload_ref = &payload_tmp;
+        match &self.body {
+            HttpResponseBody::Data(data) => {
+                let mut payload_tmp: Vec<u8> = vec![];
+                if cmode == CompressMode::Gzip
+                    && data.len() >= 32
+                    && self.get_header("Content-Encoding").is_none()
+                {
+                    if let Ok(compressed_data) = data.compress() {
+                        payload_tmp = compressed_data;
+                    }
+                }
+                let payload_ref = if payload_tmp.is_empty() {
+                    cmode = CompressMode::None;
+                    data.as_slice()
+                } else {
+                    payload_tmp.as_slice()
+                };
+                //
+                let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
+                let status_str = self.http_code.http_code_to_desp();
+                ret.push_str(&ssformat!(
+                    64,
+                    "{} {} {status_str}\r\n",
+                    self.version,
+                    self.http_code
+                ));
+                for (key, value) in self.headers.iter() {
+                    if key == "Content-Length" {
+                        continue;
+                    }
+                    ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
+                }
+                ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
+                if cmode == CompressMode::Gzip {
+                    ret.push_str("Content-Encoding: gzip\r\n");
+                }
+                ret.push_str("\r\n");
+                let mut ret: Vec<u8> = ret.as_bytes().to_vec();
+                ret.extend(payload_ref);
+                ret
+            }
+            HttpResponseBody::Stream(_) => vec![], // Stream responses are handled separately
+        }
+    }
+
+    /// Write response to stream, handling both Data and Stream body types
+    pub async fn write_to_stream(
+        &self,
+        stream: &mut crate::utils::tcp_stream::HttpStream,
+        cmode: CompressMode,
+    ) -> anyhow::Result<()> {
+        match &self.body {
+            HttpResponseBody::Data(_) => {
+                // For Data body, use the normal as_bytes method
+                let bytes = self.as_bytes(cmode);
+                stream.write_all(&bytes).await?;
+            }
+            HttpResponseBody::Stream(rx) => {
+                // Clone the receiver for ownership
+                let mut rx_clone = unsafe { std::ptr::read(rx as *const Receiver<Vec<u8>>) };
+                // For Stream body, send headers first, then chunks
+                let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
+                let status_str = self.http_code.http_code_to_desp();
+                ret.push_str(&ssformat!(
+                    64,
+                    "{} {} {status_str}\r\n",
+                    self.version,
+                    self.http_code
+                ));
+                for (key, value) in self.headers.iter() {
+                    if key == "Content-Length" {
+                        continue;
+                    }
+                    ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
+                }
+                ret.push_str("\r\n");
+                let header_bytes: Vec<u8> = ret.as_bytes().to_vec();
+                stream.write_all(&header_bytes).await?;
+
+                // Send chunks
+                while let Some(chunk) = rx_clone.recv().await {
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    // Write chunked encoding: length in hex, \r\n, data, \r\n
+                    let chunk_len_hex = format!("{:x}\r\n", chunk.len());
+                    stream.write_all(chunk_len_hex.as_bytes()).await?;
+                    stream.write_all(&chunk).await?;
+                    stream.write_all(b"\r\n").await?;
+                }
+                // Send final chunk (length 0)
+                stream.write_all(b"0\r\n\r\n").await?;
             }
         }
-        if payload_tmp.len() == 0 {
-            cmode = CompressMode::None;
-        }
-        //
-        let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
-        let status_str = self.http_code.http_code_to_desp();
-        ret.push_str(&ssformat!(
-            64,
-            "{} {} {status_str}\r\n",
-            self.version,
-            self.http_code
-        ));
-        for (key, value) in self.headers.iter() {
-            if key == "Content-Length" {
-                continue;
-            }
-            ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
-        }
-        if self.http_code != 101 {
-            ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
-            if cmode == CompressMode::Gzip {
-                ret.push_str("Content-Encoding: gzip\r\n");
-            }
-        }
-        ret.push_str("\r\n");
-        let mut ret: Vec<u8> = ret.as_bytes().to_vec();
-        ret.extend(payload_ref);
-        ret
+        Ok(())
     }
 
     pub async fn from_stream(
@@ -1122,7 +1233,8 @@ impl HttpResponse {
             while hdr_len + bdy_len > buf.len() {
                 buf.extend_by_streams(stream).await?;
             }
-            res.body = buf[hdr_len..hdr_len + bdy_len].to_vec(); // to_ref_buf
+            res.body = HttpResponseBody::Data(buf[hdr_len..hdr_len + bdy_len].to_vec());
+        // to_ref_buf
         } else if res.headers.get("Transfer-Encoding") == Some(&"chunked".to_string()) {
             loop {
                 let chunked_len = {
@@ -1159,8 +1271,11 @@ impl HttpResponse {
                 while hdr_len + bdy_len + chunked_len + 2 > buf.len() {
                     buf.extend_by_streams(stream).await?;
                 }
-                res.body
-                    .extend(&buf[(hdr_len + bdy_len)..(hdr_len + bdy_len + chunked_len)]);
+                res.body = HttpResponseBody::Data({
+                    let mut tmp = vec![];
+                    tmp.extend(&buf[(hdr_len + bdy_len)..(hdr_len + bdy_len + chunked_len)]);
+                    tmp
+                });
                 bdy_len += chunked_len + 2;
             }
         }

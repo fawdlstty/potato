@@ -41,7 +41,12 @@ mod tests {
         match potato::get(&url, vec![]).await {
             Ok(res) => {
                 println!("HTTP Server /hello response: {}", res.http_code);
-                let body = String::from_utf8(res.body).unwrap_or_default();
+                let body = match &res.body {
+                    potato::HttpResponseBody::Data(data) => {
+                        String::from_utf8(data.clone()).unwrap_or_default()
+                    }
+                    potato::HttpResponseBody::Stream(_) => "stream response".to_string(),
+                };
                 println!("Response body: {}", body);
                 assert!(res.http_code == 200);
                 assert!(body.contains("hello world"));
@@ -99,8 +104,13 @@ mod tests {
         match potato::get(&url, vec![]).await {
             Ok(res) => {
                 println!("Handler with String param: {}", res.http_code);
-                let body = String::from_utf8(res.body).unwrap_or_default();
-                // 只在状态码为200时验证body
+                let body = match &res.body {
+                    potato::HttpResponseBody::Data(data) => {
+                        String::from_utf8(data.clone()).unwrap_or_default()
+                    }
+                    potato::HttpResponseBody::Stream(_) => "stream response".to_string(),
+                };
+                // 只在状态码为 200 时验证 body
                 if res.http_code == 200 {
                     assert!(body.contains("hello World"));
                 }
@@ -677,7 +687,12 @@ mod tests {
         match potato::get(&url, vec![]).await {
             Ok(res) => {
                 println!("Custom middleware response: {}", res.http_code);
-                let body = String::from_utf8(res.body).unwrap_or_default();
+                let body = match &res.body {
+                    potato::HttpResponseBody::Data(data) => {
+                        String::from_utf8(data.clone()).unwrap_or_default()
+                    }
+                    potato::HttpResponseBody::Stream(_) => "stream response".to_string(),
+                };
                 println!("Response body: {}", body);
                 assert!(res.http_code == 200);
                 assert!(body.contains("custom middleware"));
