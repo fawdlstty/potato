@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod bytes;
 pub mod enums;
 pub mod number;

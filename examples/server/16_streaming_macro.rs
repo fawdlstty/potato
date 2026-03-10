@@ -1,9 +1,8 @@
-use potato::{http_get, HttpResponse, HttpServer};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 
 /// 流式传输示例 - 直接返回 Receiver<Vec<u8>>
-#[http_get("/stream")]
+#[potato::http_get("/stream")]
 async fn stream_handler() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(100);
 
@@ -22,7 +21,7 @@ async fn stream_handler() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 }
 
 /// 流式传输示例 - 返回 Result<Receiver<Vec<u8>>>
-#[http_get("/stream-result")]
+#[potato::http_get("/stream-result")]
 async fn stream_result_handler() -> anyhow::Result<tokio::sync::mpsc::Receiver<Vec<u8>>> {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(100);
 
@@ -41,7 +40,7 @@ async fn stream_result_handler() -> anyhow::Result<tokio::sync::mpsc::Receiver<V
 }
 
 /// SSE (Server-Sent Events) 示例
-#[http_get("/sse")]
+#[potato::http_get("/sse")]
 async fn sse_handler() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(100);
 
@@ -62,7 +61,7 @@ async fn sse_handler() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut server = HttpServer::new("127.0.0.1:3000");
+    let mut server = potato::HttpServer::new("127.0.0.1:3000");
 
     server.configure(|ctx| {
         ctx.use_handlers(true);
