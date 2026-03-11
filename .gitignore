@@ -1,4 +1,5 @@
 .vscode/
+.qoder/
 node_modules/
 target/
 tmp/

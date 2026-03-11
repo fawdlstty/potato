@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.2.28"
+version = "0.2.29"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -12,14 +12,6 @@ keywords = ["http", "web"]
 categories = []
 readme = "../README.md"
 exclude = ["src/main.rs"]
-
-[[example]]
-name = "15_streaming_server"
-path = "../examples/server/15_streaming_server.rs"
-
-[[example]]
-name = "16_streaming_macro"
-path = "../examples/server/16_streaming_macro.rs"
 
 [dependencies]
 anyhow = "1.0.100"

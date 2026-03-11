@@ -14,18 +14,7 @@ impl StringExt for String {
             .replace("->", "")
             .replace("anyhow::Result", "Result")
             .replace("potato::HttpRequest", "HttpRequest")
-            .replace("potato::HttpResponse", "HttpResponse")
-            .replace("tokio::sync::mpsc::Receiver", "Receiver")
-            .replace("tokio::sync::mpsc::Sender", "Sender")
-            .replace("sync::mpsc::Receiver", "Receiver")
-            .replace("sync::mpsc::Sender", "Sender")
-            .replace("mpsc::Receiver", "Receiver")
-            .replace("mpsc::Sender", "Sender")
-            .replace("Vec<u8>", "Vec<u8>")
-            .replace("Vec", "Vec")
-            .replace("u8", "u8")
-            .replace("Receiver", "Receiver")
-            .replace("Sender", "Sender");
+            .replace("potato::HttpResponse", "HttpResponse");
         match ret.is_empty() {
             true => "()".to_string(),
             false => ret,

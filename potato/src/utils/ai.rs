@@ -12,8 +12,9 @@ impl OpenAISender {
         object: impl Into<String>,
         model: impl Into<String>,
         role: impl Into<String>,
-    ) -> anyhow::Result<(Self, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
-        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        buffer_size: usize,
+    ) -> anyhow::Result<(Self, crate::HttpResponse)> {
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
         let obj = Self {
             id: id.into(),
             object: object.into(),
@@ -37,7 +38,13 @@ impl OpenAISender {
         }))?;
         let payload = format!("data: {root}\n\n");
         obj.tx.send(payload.into_bytes()).await?;
-        Ok((obj, rx))
+
+        let mut res = crate::HttpResponse::stream(rx);
+        res.add_header("Content-Type", "text/event-stream");
+        res.add_header("Cache-Control", "no-cache");
+        res.add_header("Connection", "keep-alive");
+        //
+        Ok((obj, res))
     }
 
     pub async fn send(&self, message: impl Into<String>) -> anyhow::Result<()> {
@@ -87,8 +94,9 @@ impl ClaudeSender {
         id: impl Into<String>,
         model: impl Into<String>,
         role: impl Into<String>,
-    ) -> anyhow::Result<(Self, tokio::sync::mpsc::Receiver<Vec<u8>>)> {
-        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        buffer_size: usize,
+    ) -> anyhow::Result<(Self, crate::HttpResponse)> {
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
         let root = serde_json::to_string(&serde_json::json!({
             "type": "message_start",
             "message": {
@@ -118,7 +126,13 @@ impl ClaudeSender {
         }))?;
         let payload = format!("event: content_block_start\ndata: {root}\n\n");
         tx.send(payload.into_bytes()).await?;
-        Ok((Self { tx }, rx))
+
+        let mut res = crate::HttpResponse::stream(rx);
+        res.add_header("Content-Type", "text/event-stream");
+        res.add_header("Cache-Control", "no-cache");
+        res.add_header("Connection", "keep-alive");
+        //
+        Ok((Self { tx }, res))
     }
 
     pub async fn send(&self, message: impl Into<String>) -> anyhow::Result<()> {

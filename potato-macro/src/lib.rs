@@ -210,21 +210,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     Err(err) => potato::HttpResponse::error(format!("{err:?}")),
                 }
             },
-            "Result<Receiver<Vec<u8>>>" => quote! {
-                match #fn_name().await {
-                    Ok(rx) => potato::HttpResponse::stream(rx),
-                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
-                }
-            },
             "()" => quote! {
                 #fn_name().await;
                 potato::HttpResponse::text("ok")
             },
             "HttpResponse" => quote! {
                 #fn_name().await
-            },
-            "Receiver<Vec<u8>>" => quote! {
-                potato::HttpResponse::stream(#fn_name().await)
             },
             _ => panic!("unsupported ret type: {ret_type}"),
         },
@@ -243,13 +234,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     Err(err) => potato::HttpResponse::error(format!("{err:?}")),
                 }
             },
-            "Result<Receiver<Vec<u8>>>" => quote! {
-                let #(#arg_names),* = #(#args),*;
-                match #fn_name(#(#arg_names),*).await {
-                    Ok(rx) => potato::HttpResponse::stream(rx),
-                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
-                }
-            },
             "()" => quote! {
                 let #(#arg_names),* = #(#args),*;
                 #fn_name(#(#arg_names),*).await;
@@ -258,10 +242,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             "HttpResponse" => quote! {
                 let #(#arg_names),* = #(#args),*;
                 #fn_name(#(#arg_names),*).await
-            },
-            "Receiver<Vec<u8>>" => quote! {
-                let #(#arg_names),* = #(#args),*;
-                potato::HttpResponse::stream(#fn_name(#(#arg_names),*).await)
             },
             _ => panic!("unsupported ret type: {ret_type}"),
         },
@@ -280,13 +260,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     Err(err) => potato::HttpResponse::error(format!("{err:?}")),
                 }
             },
-            "Result<Receiver<Vec<u8>>>" => quote! {
-                let (#(#arg_names),*) = (#(#args),*);
-                match #fn_name(#(#arg_names),*).await {
-                    Ok(rx) => potato::HttpResponse::stream(rx),
-                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
-                }
-            },
             "()" => quote! {
                 let (#(#arg_names),*) = (#(#args),*);
                 #fn_name(#(#arg_names),*).await;
@@ -295,10 +268,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             "HttpResponse" => quote! {
                 let (#(#arg_names),*) = (#(#args),*);
                 #fn_name(#(#arg_names),*).await
-            },
-            "Receiver<Vec<u8>>" => quote! {
-                let (#(#arg_names),*) = (#(#args),*);
-                potato::HttpResponse::stream(#fn_name(#(#arg_names),*).await)
             },
             _ => panic!("unsupported ret type: {ret_type}"),
         },
@@ -358,88 +327,6 @@ pub fn http_options(attr: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "HEAD")
-}
-
-/// OpenAI 风格流式接口宏
-/// 自动将返回类型转换为 HttpResponse 并设置正确的 Content-Type
-#[proc_macro_attribute]
-pub fn openai(attr: TokenStream, input: TokenStream) -> TokenStream {
-    let req_name = Ident::new("GET", Span::call_site());
-    let route_path = syn::parse::<syn::LitStr>(attr.clone())
-        .expect("`openai` macro requires a path argument")
-        .value();
-    if !route_path.starts_with('/') {
-        panic!("route path must start with '/'");
-    }
-    let root_fn = syn::parse_macro_input!(input as syn::ItemFn);
-    let fn_name = root_fn.sig.ident.clone();
-    let wrap_func_name = random_ident();
-    let wrap_func_name2 = random_ident();
-
-    quote! {
-        #root_fn
-
-        #[doc(hidden)]
-        async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
-            match #fn_name().await {
-                Ok(rx) => potato::HttpResponse::stream_with_content_type(rx, "text/event-stream"),
-                Err(err) => potato::HttpResponse::error(format!("{err:?}")),
-            }
-        }
-
-        #[doc(hidden)]
-        fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
-            Box::pin(#wrap_func_name2(req))
-        }
-
-        potato::inventory::submit!{potato::RequestHandlerFlag::new(
-            potato::HttpMethod::#req_name,
-            #route_path,
-            #wrap_func_name,
-            potato::RequestHandlerFlagDoc::new(true, false, "", "", "[]")
-        )}
-    }.into()
-}
-
-/// Claude 风格流式接口宏
-/// 自动将返回类型转换为 HttpResponse 并设置正确的 Content-Type
-#[proc_macro_attribute]
-pub fn claude(attr: TokenStream, input: TokenStream) -> TokenStream {
-    let req_name = Ident::new("GET", Span::call_site());
-    let route_path = syn::parse::<syn::LitStr>(attr.clone())
-        .expect("`claude` macro requires a path argument")
-        .value();
-    if !route_path.starts_with('/') {
-        panic!("route path must start with '/'");
-    }
-    let root_fn = syn::parse_macro_input!(input as syn::ItemFn);
-    let fn_name = root_fn.sig.ident.clone();
-    let wrap_func_name = random_ident();
-    let wrap_func_name2 = random_ident();
-
-    quote! {
-        #root_fn
-
-        #[doc(hidden)]
-        async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
-            match #fn_name().await {
-                Ok(rx) => potato::HttpResponse::stream_with_content_type(rx, "text/event-stream"),
-                Err(err) => potato::HttpResponse::error(format!("{err:?}")),
-            }
-        }
-
-        #[doc(hidden)]
-        fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
-            Box::pin(#wrap_func_name2(req))
-        }
-
-        potato::inventory::submit!{potato::RequestHandlerFlag::new(
-            potato::HttpMethod::#req_name,
-            #route_path,
-            #wrap_func_name,
-            potato::RequestHandlerFlagDoc::new(true, false, "", "", "[]")
-        )}
-    }.into()
 }
 
 #[proc_macro]

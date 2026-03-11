@@ -9,22 +9,31 @@ Potato framework supports SSE (Server-Sent Events) for streaming, particularly s
 ### Basic Usage
 
 ```rust
-#[potato::openai("/api/v1/chat")]
-async fn openai_chat() -> anyhow::Result<tokio::sync::mpsc::Receiver<Vec<u8>>> {
-    let (sender, rx) = potato::OpenAISender::new(
+#[potato::http_get("/api/v1/chat")]
+async fn openai_chat() -> anyhow::Result<potato::HttpResponse> {
+    let (sender, res) = potato::OpenAISender::new(
         "chatcmpl-123456",           // Response ID
         "chat.completion.chunk",     // Object type
         "gpt-3.5-turbo",             // Model name
         "assistant",                 // Role
+        100,                         // Buffer size
     )
     .await?;
+    
     tokio::spawn(async move {
-        sender.send("Hello!").await?;
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-        sender.send("I am an AI assistant.").await?;
-        sender.send_finish("stop").await?;
+        async fn openai_chat_inner(sender: potato::OpenAISender) -> anyhow::Result<()> {
+            sender.send("Hello!").await?;
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            sender.send("I am an AI assistant.").await?;
+            sender.send_finish("stop").await?;
+            Ok(())
+        }
+        if let Err(e) = openai_chat_inner(sender).await {
+            eprintln!("OpenAI chat error: {e}");
+        }
     });
-    Ok(rx)
+    
+    Ok(res)
 }
 
 #[tokio::main]
@@ -34,44 +43,46 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-### API Reference
+### Explanation
 
-**`#[potato::openai(path)]` Macro**
-- Automatically configures routing and SSE response headers
-- `path`: Route path, such as `"/api/v1/chat"`
+1. **Create OpenAISender**: Use `OpenAISender::new()` to create a sender and response object. Parameters include:
+   - `id`: Response ID (e.g., "chatcmpl-123456")
+   - `object`: Object type (typically "chat.completion.chunk")
+   - `model`: Model name (e.g., "gpt-3.5-turbo")
+   - `role`: Assistant role (typically "assistant")
+   - `buffer_size`: Channel buffer size (e.g., 100)
 
-**`potato::OpenAISender::new()`**
-- Creates OpenAI SSE sender
-- Parameters: id, object type, model name, assistant role
-- Returns: Sender instance and receiver channel
+2. **Send Messages**: Use `sender.send()` to send message chunks. Each call adds a content delta.
 
-**`sender.send(message)`**
-- Sends a content chunk
-- Parameter: Text content to send
+3. **Finish Streaming**: Use `sender.send_finish(finish_reason)` to end the stream with a finish reason (e.g., "stop", "length", "content_filter").
 
-**`sender.send_finish(finish_reason)`**
-- Sends completion marker
-- Parameter: Finish reason (e.g., `"stop"`, `"length"`)
+4. **Response Type**: Handler returns `anyhow::Result<HttpResponse>`, where the response is automatically configured with SSE headers.
 
 ## Claude Style Streaming
 
 ### Basic Usage
 
 ```rust
-#[potato::claude("/api/v1/chat")]
-async fn claude_chat() -> anyhow::Result<tokio::sync::mpsc::Receiver<Vec<u8>>> {
-    let (sender, rx) = potato::ClaudeSender::new(
-        "msg_claude_123456",         // Message ID
-        "claude-3-sonnet-20240229",  // Model name
-        "assistant",                 // Role
-    )
-    .await?;
+#[potato::http_get("/api/v1/chat")]
+async fn claude_chat() -> anyhow::Result<potato::HttpResponse> {
+    let (sender, rx) =
+        potato::ClaudeSender::new("msg_claude_123456", "claude-3-sonnet-20240229", "assistant", 100).await?;
+    
     tokio::spawn(async move {
-        sender.send("Hello!").await?;
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-        sender.send("I am Claude AI assistant.").await?;
-        sender.send_finish().await?;
+        async fn claude_chat_inner(sender: potato::ClaudeSender) -> anyhow::Result<()> {
+            // Send content chunks
+            sender.send("Hello!").await?;
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            sender.send("I am Claude AI assistant.").await?;
+            // Send finish event (includes content_block_stop, message_delta, message_stop)
+            sender.send_finish().await?;
+            Ok(())
+        }
+        if let Err(e) = claude_chat_inner(sender).await {
+            eprintln!("Claude chat error: {e}");
+        }
     });
+    
     Ok(rx)
 }
 
@@ -82,21 +93,62 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-### API Reference
+### Explanation
 
-**`#[potato::claude(path)]` Macro**
-- Automatically configures routing and SSE response headers
-- `path`: Route path, such as `"/api/v1/chat"`
+1. **Create ClaudeSender**: Use `ClaudeSender::new()` to create a sender and response object. Parameters include:
+   - `id`: Message ID (e.g., "msg_claude_123456")
+   - `model`: Model name (e.g., "claude-3-sonnet-20240229")
+   - `role`: Assistant role (typically "assistant")
+   - `buffer_size`: Channel buffer size (e.g., 100)
 
-**`potato::ClaudeSender::new()`**
-- Creates Claude SSE sender
-- Parameters: id, model name, role
-- Returns: Sender instance and receiver channel
+2. **Send Messages**: Use `sender.send()` to send text content blocks.
 
-**`sender.send(message)`**
-- Sends a content chunk
-- Parameter: Text content to send
+3. **Finish Streaming**: Use `sender.send_finish()` to end the stream. This automatically sends:
+   - `content_block_stop`: Indicates content block completion
+   - `message_delta`: Contains stop reason and usage statistics
+   - `message_stop`: Indicates message completion
 
-**`sender.send_finish()`**
-- Sends all completion events (automatically in order)
-- No parameters required
+4. **Response Type**: Handler returns `anyhow::Result<HttpResponse>`, automatically configured with appropriate SSE headers for Claude protocol.
+
+## Generic Streaming
+
+For simple streaming without AI protocols, use `HttpResponse::stream()`:
+
+```rust
+#[potato::http_get("/stream")]
+async fn stream_handler() -> anyhow::Result<HttpResponse> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+
+    tokio::spawn(async move {
+        for i in 0..10 {
+            let data = format!("Message {}\n", i).into_bytes();
+            tx.send(data).await.ok();
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    });
+
+    Ok(HttpResponse::stream(rx))
+}
+```
+
+For SSE (Server-Sent Events), set appropriate headers:
+
+```rust
+#[potato::http_get("/sse")]
+async fn sse_handler() -> anyhow::Result<HttpResponse> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+
+    tokio::spawn(async move {
+        for i in 0..5 {
+            let sse_data = format!("data: Event {}\n\n", i);
+            tx.send(sse_data.into_bytes()).await.ok();
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+    });
+
+    let mut resp = HttpResponse::stream(rx);
+    resp.add_header("Content-Type", "text/event-stream");
+    resp.add_header("Cache-Control", "no-cache");
+    Ok(resp)
+}
+```

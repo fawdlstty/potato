@@ -1,6 +1,6 @@
 use crate::utils::enums::HttpConnection;
 use crate::utils::tcp_stream::HttpStream;
-use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody, PreflightResult};
+use crate::{HttpMethod, HttpRequest, HttpResponse, PreflightResult};
 use crate::{RequestHandlerFlag, TransferSession};
 use async_recursion::async_recursion;
 use std::borrow::Cow;
@@ -756,7 +756,7 @@ impl PipeContext {
                         while let Some(Ok(part)) = body.next().await {
                             body_data.extend(part.iter());
                         }
-                        res.body = HttpResponseBody::Data(body_data);
+                        res.body = crate::HttpResponseBody::Data(body_data);
                         res
                     };
                     return res;

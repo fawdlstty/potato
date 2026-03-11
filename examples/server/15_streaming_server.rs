@@ -1,65 +1,63 @@
-use potato::{HttpResponse, HttpServer};
-use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+#[potato::http_get("/api/v1/chat")]
+async fn openai_chat() -> anyhow::Result<potato::HttpResponse> {
+    let (sender, res) = potato::OpenAISender::new(
+        "chatcmpl-openai",
+        "chat.completion.chunk",
+        "gpt-3.5-turbo",
+        "assistant",
+        100,
+    )
+    .await?;
+    tokio::spawn(async move {
+        async fn openai_chat_inner(sender: potato::OpenAISender) -> anyhow::Result<()> {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            sender.send("Hello,").await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            sender.send("World!").await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            sender.send("hohohoho!").await?;
+            sender.send_finish("stop").await?;
+            Ok(())
+        }
+        if let Err(e) = openai_chat_inner(sender).await {
+            eprintln!("OpenAI chat error: {e}");
+        }
+    });
+    Ok(res)
+}
+
+#[potato::http_get("/api2/v1/chat")]
+async fn claude_chat() -> anyhow::Result<potato::HttpResponse> {
+    let (sender, rx) =
+        potato::ClaudeSender::new("chatclaude", "claude-3-sonnet-20240229", "assistant", 100)
+            .await?;
+    tokio::spawn(async move {
+        async fn claude_chat_inner(sender: potato::ClaudeSender) -> anyhow::Result<()> {
+            // 发送内容片段
+            sender.send("Hello,").await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            sender.send("World!").await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            sender.send("hohohoho!").await?;
+            // 发送结束事件（包含 content_block_stop, message_delta, message_stop）
+            sender.send_finish().await?;
+            Ok(())
+        }
+        if let Err(e) = claude_chat_inner(sender).await {
+            eprintln!("Claude chat error: {e}");
+        }
+    });
+    Ok(rx)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut server = HttpServer::new("127.0.0.1:3000");
-
+    let mut server = potato::HttpServer::new("127.0.0.1:3000");
     server.configure(|ctx| {
-        ctx.use_custom(|req| {
-            Box::pin(async move {
-                if req.url_path == "/stream" {
-                    // 创建一个 channel 用于流式传输
-                    let (tx, rx) = mpsc::channel::<Vec<u8>>(100);
-
-                    // 启动一个任务来生成数据
-                    tokio::spawn(async move {
-                        let mut interval = interval(Duration::from_millis(500));
-                        for i in 0..10 {
-                            interval.tick().await;
-                            let data = format!("Message {}\\n", i).into_bytes();
-                            if tx.send(data).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-
-                    // 创建流式响应
-                    Ok(Some(HttpResponse::stream(rx)))
-                } else if req.url_path == "/sse" {
-                    // Server-Sent Events 示例
-                    let (tx, rx) = mpsc::channel::<Vec<u8>>(100);
-
-                    tokio::spawn(async move {
-                        let mut interval = interval(Duration::from_millis(1000));
-                        for i in 0..5 {
-                            interval.tick().await;
-                            // SSE 格式：data: <message>\\n\\n
-                            let sse_data = format!("data: Event {}\\n\\n", i);
-                            if tx.send(sse_data.into_bytes()).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-
-                    let mut resp = HttpResponse::stream(rx);
-                    resp.add_header("Content-Type", "text/event-stream");
-                    resp.add_header("Cache-Control", "no-cache");
-                    Ok(Some(resp))
-                } else {
-                    Ok(None)
-                }
-            })
-        });
+        ctx.use_handlers(true);
     });
-
-    println!("Server starting on http://127.0.0.1:3000");
-    println!("Test endpoints:");
-    println!("  - http://127.0.0.1:3000/stream (chunked stream)");
-    println!("  - http://127.0.0.1:3000/sse (Server-Sent Events)");
-
-    server.serve_http().await?;
-
-    Ok(())
+    println!("OpenAI stream on http://127.0.0.1:3000/stream");
+    println!("OpenAI custom stream on http://127.0.0.1:3000/stream-custom");
+    println!("Claude stream on http://127.0.0.1:3000/claude-stream");
+    server.serve_http().await
 }
