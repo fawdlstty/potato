@@ -852,7 +852,7 @@ impl HttpServer {
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res =
+                    let mut res =
                         PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
@@ -912,7 +912,7 @@ impl HttpServer {
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let res =
+                    let mut res =
                         PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;

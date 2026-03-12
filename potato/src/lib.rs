@@ -1167,19 +1167,17 @@ impl HttpResponse {
 
     /// Write response to stream, handling both Data and Stream body types
     pub async fn write_to_stream(
-        &self,
+        &mut self,
         stream: &mut crate::utils::tcp_stream::HttpStream,
         cmode: CompressMode,
     ) -> anyhow::Result<()> {
-        match &self.body {
+        match &mut self.body {
             HttpResponseBody::Data(_) => {
                 // For Data body, use the normal as_bytes method
                 let bytes = self.as_bytes(cmode);
                 stream.write_all(&bytes).await?;
             }
             HttpResponseBody::Stream(rx) => {
-                // Clone the receiver for ownership
-                let mut rx_clone = unsafe { std::ptr::read(rx as *const Receiver<Vec<u8>>) };
                 // For Stream body, send headers first, then chunks
                 let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
                 let status_str = self.http_code.http_code_to_desp();
@@ -1200,7 +1198,7 @@ impl HttpResponse {
                 stream.write_all(&header_bytes).await?;
 
                 // Send chunks
-                while let Some(chunk) = rx_clone.recv().await {
+                while let Some(chunk) = rx.recv().await {
                     if chunk.is_empty() {
                         break;
                     }

@@ -23,6 +23,8 @@ features:
     details: Built-in jemalloc memory leak detection function, convenient for troubleshooting memory leaks
   - title: WebDAV Support
     details: Supports server-side WebDAV protocol
+  - title: AI Protocol Support
+    details: Supports OpenAI and Claude two mainstream AI streaming protocols
 
 footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---

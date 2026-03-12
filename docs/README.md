@@ -21,8 +21,10 @@ features:
     details: 内置JwtAuth校验功能，方便API鉴权
   - title: 内存泄露排查
     details: 内置jemalloc内存泄露检测功能，方便排查内存泄露
-  - title: WebDAV支持
-    details: 支持服务器端WebDAV协议
+  - title: WebDAV 支持
+    details: 支持服务器端 WebDAV 协议
+  - title: AI 协议支持
+    details: 支持 OpenAI 和 Claude 两种主流 AI 流式传输协议
 
 footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---
