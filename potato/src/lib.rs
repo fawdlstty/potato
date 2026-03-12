@@ -990,8 +990,8 @@ impl HttpResponse {
         Self::html("")
     }
 
-    /// Create a streaming response with chunked transfer encoding
-    pub fn stream(rx: Receiver<Vec<u8>>) -> Self {
+    /// Create a SSE response with chunked transfer encoding
+    pub fn sse(rx: Receiver<Vec<u8>>) -> Self {
         Self {
             version: "HTTP/1.1".into(),
             http_code: 200,
@@ -1004,11 +1004,8 @@ impl HttpResponse {
         }
     }
 
-    /// Create a streaming response with custom content type
-    pub fn stream_with_content_type(
-        rx: Receiver<Vec<u8>>,
-        content_type: impl Into<String>,
-    ) -> Self {
+    /// Create a SSE response with custom content type
+    pub fn sse_with_content_type(rx: Receiver<Vec<u8>>, content_type: impl Into<String>) -> Self {
         Self {
             version: "HTTP/1.1".into(),
             http_code: 200,

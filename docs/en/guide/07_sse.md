@@ -1,4 +1,4 @@
-# Streaming
+# Server-Sent Events
 
 ## Overview
 
@@ -110,13 +110,13 @@ async fn main() -> anyhow::Result<()> {
 
 4. **Response Type**: Handler returns `anyhow::Result<HttpResponse>`, automatically configured with appropriate SSE headers for Claude protocol.
 
-## Generic Streaming
+## Generic SSE Transmission
 
-For simple streaming without AI protocols, use `HttpResponse::stream()`:
+For simple SSE scenarios without AI protocols, use `HttpResponse::sse()`:
 
 ```rust
-#[potato::http_get("/stream")]
-async fn stream_handler() -> anyhow::Result<HttpResponse> {
+#[potato::http_get("/sse")]
+async fn sse_handler() -> anyhow::Result<HttpResponse> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
 
     tokio::spawn(async move {
@@ -127,15 +127,15 @@ async fn stream_handler() -> anyhow::Result<HttpResponse> {
         }
     });
 
-    Ok(HttpResponse::stream(rx))
+    Ok(HttpResponse::sse(rx))
 }
 ```
 
-For SSE (Server-Sent Events), set appropriate headers:
+For custom SSE events, set appropriate headers:
 
 ```rust
-#[potato::http_get("/sse")]
-async fn sse_handler() -> anyhow::Result<HttpResponse> {
+#[potato::http_get("/sse-custom")]
+async fn sse_custom_handler() -> anyhow::Result<HttpResponse> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
 
     tokio::spawn(async move {
@@ -146,7 +146,7 @@ async fn sse_handler() -> anyhow::Result<HttpResponse> {
         }
     });
 
-    let mut resp = HttpResponse::stream(rx);
+    let mut resp = HttpResponse::sse(rx);
     resp.add_header("Content-Type", "text/event-stream");
     resp.add_header("Cache-Control", "no-cache");
     Ok(resp)

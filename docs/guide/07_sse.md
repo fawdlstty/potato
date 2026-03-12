@@ -1,4 +1,4 @@
-# 流式传输
+# SSE（流式传输）
 
 ## 概述
 
@@ -110,13 +110,13 @@ async fn main() -> anyhow::Result<()> {
 
 4. **响应类型**: Handler 返回 `anyhow::Result<HttpResponse>`，自动为 Claude 协议配置适当的 SSE 头部。
 
-## 通用流式传输
+## 通用 SSE 传输
 
-对于不需要 AI 协议的简单流式场景，使用 `HttpResponse::stream()`：
+对于不需要 AI 协议的简单 SSE 场景，使用 `HttpResponse::sse()`：
 
 ```rust
-#[potato::http_get("/stream")]
-async fn stream_handler() -> anyhow::Result<HttpResponse> {
+#[potato::http_get("/sse")]
+async fn sse_handler() -> anyhow::Result<HttpResponse> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
 
     tokio::spawn(async move {
@@ -127,15 +127,15 @@ async fn stream_handler() -> anyhow::Result<HttpResponse> {
         }
     });
 
-    Ok(HttpResponse::stream(rx))
+    Ok(HttpResponse::sse(rx))
 }
 ```
 
-对于 SSE（Server-Sent Events），设置适当的头部：
+对于自定义 SSE 事件，设置适当的头部：
 
 ```rust
-#[potato::http_get("/sse")]
-async fn sse_handler() -> anyhow::Result<HttpResponse> {
+#[potato::http_get("/sse-custom")]
+async fn sse_custom_handler() -> anyhow::Result<HttpResponse> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
 
     tokio::spawn(async move {
@@ -146,7 +146,7 @@ async fn sse_handler() -> anyhow::Result<HttpResponse> {
         }
     });
 
-    let mut resp = HttpResponse::stream(rx);
+    let mut resp = HttpResponse::sse(rx);
     resp.add_header("Content-Type", "text/event-stream");
     resp.add_header("Cache-Control", "no-cache");
     Ok(resp)

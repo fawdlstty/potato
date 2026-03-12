@@ -39,7 +39,7 @@ impl OpenAISender {
         let payload = format!("data: {root}\n\n");
         obj.tx.send(payload.into_bytes()).await?;
 
-        let mut res = crate::HttpResponse::stream(rx);
+        let mut res = crate::HttpResponse::sse(rx);
         res.add_header("Content-Type", "text/event-stream");
         res.add_header("Cache-Control", "no-cache");
         res.add_header("Connection", "keep-alive");
@@ -127,7 +127,7 @@ impl ClaudeSender {
         let payload = format!("event: content_block_start\ndata: {root}\n\n");
         tx.send(payload.into_bytes()).await?;
 
-        let mut res = crate::HttpResponse::stream(rx);
+        let mut res = crate::HttpResponse::sse(rx);
         res.add_header("Content-Type", "text/event-stream");
         res.add_header("Cache-Control", "no-cache");
         res.add_header("Connection", "keep-alive");

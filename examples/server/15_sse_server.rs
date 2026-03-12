@@ -33,13 +33,11 @@ async fn claude_chat() -> anyhow::Result<potato::HttpResponse> {
             .await?;
     tokio::spawn(async move {
         async fn claude_chat_inner(sender: potato::ClaudeSender) -> anyhow::Result<()> {
-            // 发送内容片段
             sender.send("Hello,").await?;
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             sender.send("World!").await?;
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             sender.send("hohohoho!").await?;
-            // 发送结束事件（包含 content_block_stop, message_delta, message_stop）
             sender.send_finish().await?;
             Ok(())
         }
@@ -56,8 +54,8 @@ async fn main() -> anyhow::Result<()> {
     server.configure(|ctx| {
         ctx.use_handlers(true);
     });
-    println!("OpenAI stream on http://127.0.0.1:3000/stream");
-    println!("OpenAI custom stream on http://127.0.0.1:3000/stream-custom");
-    println!("Claude stream on http://127.0.0.1:3000/claude-stream");
+    println!("OpenAI SSE on http://127.0.0.1:3000/sse");
+    println!("OpenAI custom SSE on http://127.0.0.1:3000/sse-custom");
+    println!("Claude SSE on http://127.0.0.1:3000/claude-sse");
     server.serve_http().await
 }
