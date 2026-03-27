@@ -358,11 +358,7 @@ impl PipeContext {
             .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
 
-    pub async fn handle_request(
-        self2: Arc<PipeContext>,
-        req: &mut HttpRequest,
-        skip: usize,
-    ) -> HttpResponse {
+    pub async fn handle_request(self2: &PipeContext, req: &mut HttpRequest, skip: usize) -> HttpResponse {
         for (_idx, item) in self2.items.iter().enumerate().skip(skip) {
             match item {
                 PipeContextItem::Handlers(allow_cors) => {
@@ -858,16 +854,24 @@ impl HttpServer {
                             Err(_) => break,
                         }
                     };
+                    req.client_addr = Some(*client_addr);
                     req.add_ext(Arc::clone(&client_addr));
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let mut res =
-                        PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
+                    let mut res = PipeContext::handle_request(pipe_ctx2.as_ref(), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
                         match res.write_to_stream(&mut stream, cmode).await {
-                            Ok(()) => _ = buf.drain(..n),
+                            Ok(()) => {
+                                if n > 0 {
+                                    let remain = buf.len().saturating_sub(n);
+                                    if remain > 0 {
+                                        buf.copy_within(n.., 0);
+                                    }
+                                    buf.truncate(remain);
+                                }
+                            }
                             Err(_) => break,
                         }
                     }
@@ -918,16 +922,24 @@ impl HttpServer {
                             Err(_) => break,
                         }
                     };
+                    req.client_addr = Some(*client_addr);
                     req.add_ext(Arc::clone(&client_addr));
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let mut res =
-                        PipeContext::handle_request(Arc::clone(&pipe_ctx2), &mut req, 0).await;
+                    let mut res = PipeContext::handle_request(pipe_ctx2.as_ref(), &mut req, 0).await;
                     {
                         let mut stream = stream.lock().await;
                         match res.write_to_stream(&mut stream, cmode).await {
-                            Ok(()) => _ = buf.drain(..n),
+                            Ok(()) => {
+                                if n > 0 {
+                                    let remain = buf.len().saturating_sub(n);
+                                    if remain > 0 {
+                                        buf.copy_within(n.., 0);
+                                    }
+                                    buf.truncate(remain);
+                                }
+                            }
                             Err(_) => break,
                         }
                     }

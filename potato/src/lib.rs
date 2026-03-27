@@ -400,6 +400,7 @@ pub struct HttpRequest {
     pub body: LocalHipByt<'static>,
     pub body_pairs: HashMap<LocalHipStr<'static>, LocalHipStr<'static>>,
     pub body_files: HashMap<LocalHipStr<'static>, PostFile>,
+    pub client_addr: Option<SocketAddr>,
     pub exts: HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>>,
 }
 
@@ -417,7 +418,8 @@ impl HttpRequest {
             body: LocalHipByt::new(),
             body_pairs: HashMap::with_capacity(16),
             body_files: HashMap::with_capacity(4),
-            exts: HashMap::new(),
+            client_addr: None,
+            exts: HashMap::with_capacity(2),
         }
     }
 
@@ -529,6 +531,8 @@ impl HttpRequest {
     pub fn get_header_connection(&self) -> HttpConnection {
         if let Some(conn) = self.get_header_key(HeaderItem::Connection) {
             HttpConnection::from_str(conn).unwrap_or(HttpConnection::Close)
+        } else if self.version >= 11 {
+            HttpConnection::KeepAlive
         } else {
             HttpConnection::Close
         }
@@ -599,11 +603,10 @@ impl HttpRequest {
         }
     }
 
-    pub async fn from_stream(
+    async fn from_stream_impl(
         buf: &mut Vec<u8>,
-        stream: Arc<Mutex<HttpStream>>,
+        stream: &mut HttpStream,
     ) -> anyhow::Result<(Self, usize)> {
-        let mut stream = stream.lock().await;
         let mut tmp_buf = [0u8; 4096];
         let (mut req, hdr_len) = loop {
             let n = stream.read(&mut tmp_buf).await?;
@@ -707,6 +710,21 @@ impl HttpRequest {
             }
         }
         Ok((req, hdr_len + bdy_len))
+    }
+
+    pub async fn from_stream(
+        buf: &mut Vec<u8>,
+        stream: Arc<Mutex<HttpStream>>,
+    ) -> anyhow::Result<(Self, usize)> {
+        let mut stream = stream.lock().await;
+        Self::from_stream_impl(buf, &mut stream).await
+    }
+
+    pub async fn from_stream_direct(
+        buf: &mut Vec<u8>,
+        stream: &mut HttpStream,
+    ) -> anyhow::Result<(Self, usize)> {
+        Self::from_stream_impl(buf, stream).await
     }
 
     pub fn from_headers_part(buf: &[u8]) -> anyhow::Result<Option<(Self, usize)>> {
@@ -1191,11 +1209,50 @@ impl HttpResponse {
         stream: &mut crate::utils::tcp_stream::HttpStream,
         cmode: CompressMode,
     ) -> anyhow::Result<()> {
+        let no_content_encoding = self.get_header("Content-Encoding").is_none();
         match &mut self.body {
-            HttpResponseBody::Data(_) => {
-                // For Data body, use the normal as_bytes method
-                let bytes = self.as_bytes(cmode);
-                stream.write_all(&bytes).await?;
+            HttpResponseBody::Data(data) => {
+                let mut payload_tmp: Vec<u8> = vec![];
+                let mut cmode = cmode;
+                if cmode == CompressMode::Gzip
+                    && data.len() >= 32
+                    && no_content_encoding
+                {
+                    if let Ok(compressed_data) = data.compress() {
+                        payload_tmp = compressed_data;
+                    }
+                }
+                let payload_ref = if payload_tmp.is_empty() {
+                    cmode = CompressMode::None;
+                    data.as_slice()
+                } else {
+                    payload_tmp.as_slice()
+                };
+
+                let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
+                let status_str = self.http_code.http_code_to_desp();
+                ret.push_str(&ssformat!(
+                    64,
+                    "{} {} {status_str}\r\n",
+                    self.version,
+                    self.http_code
+                ));
+                for (key, value) in self.headers.iter() {
+                    if key == "Content-Length" {
+                        continue;
+                    }
+                    ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
+                }
+                ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
+                if cmode == CompressMode::Gzip {
+                    ret.push_str("Content-Encoding: gzip\r\n");
+                }
+                ret.push_str("\r\n");
+
+                stream.write_all(ret.as_bytes()).await?;
+                if !payload_ref.is_empty() {
+                    stream.write_all(payload_ref).await?;
+                }
             }
             HttpResponseBody::Stream(rx) => {
                 // For Stream body, send headers first, then chunks
