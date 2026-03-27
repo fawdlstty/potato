@@ -12,7 +12,11 @@ pub enum HeaderOrHipStr {
 
 impl HeaderOrHipStr {
     pub fn from_str(val: &str) -> Self {
-        Self::HipStr(LocalHipStr::from(val))
+        if let Some(item) = HeaderItem::try_from_str(val) {
+            Self::HeaderItem(item)
+        } else {
+            Self::HipStr(LocalHipStr::from(val))
+        }
     }
 
     pub fn to_str(&self) -> &str {
@@ -132,6 +136,6 @@ pub enum HeaderItem {
 
 impl Into<HeaderOrHipStr> for &str {
     fn into(self) -> HeaderOrHipStr {
-        HeaderOrHipStr::HipStr(LocalHipStr::from(self))
+        HeaderOrHipStr::from_str(self)
     }
 }

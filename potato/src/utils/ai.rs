@@ -40,9 +40,9 @@ impl OpenAISender {
         obj.tx.send(payload.into_bytes()).await?;
 
         let mut res = crate::HttpResponse::sse(rx);
-        res.add_header("Content-Type", "text/event-stream");
-        res.add_header("Cache-Control", "no-cache");
-        res.add_header("Connection", "keep-alive");
+        res.add_header("Content-Type".into(), "text/event-stream".into());
+        res.add_header("Cache-Control".into(), "no-cache".into());
+        res.add_header("Connection".into(), "keep-alive".into());
         //
         Ok((obj, res))
     }
@@ -128,9 +128,9 @@ impl ClaudeSender {
         tx.send(payload.into_bytes()).await?;
 
         let mut res = crate::HttpResponse::sse(rx);
-        res.add_header("Content-Type", "text/event-stream");
-        res.add_header("Cache-Control", "no-cache");
-        res.add_header("Connection", "keep-alive");
+        res.add_header("Content-Type".into(), "text/event-stream".into());
+        res.add_header("Cache-Control".into(), "no-cache".into());
+        res.add_header("Connection".into(), "keep-alive".into());
         //
         Ok((Self { tx }, res))
     }

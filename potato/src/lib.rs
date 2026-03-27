@@ -12,6 +12,7 @@ pub use regex;
 pub use rust_embed;
 pub use serde_json;
 pub use server::*;
+use thread_local::ThreadLocal;
 pub use utils::ai::*;
 pub use utils::refstr::Headers;
 
@@ -28,6 +29,7 @@ use rust_embed::Embed;
 use sha1::{Digest, Sha1};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::fs::{File, Metadata};
 use std::io::Read;
 use std::net::SocketAddr;
@@ -492,6 +494,11 @@ impl HttpRequest {
     }
 
     pub fn get_header(&self, key: &str) -> Option<&str> {
+        if let Some(header_item) = HeaderItem::try_from_str(key) {
+            if let Some(value) = self.headers.get(&HeaderOrHipStr::HeaderItem(header_item)) {
+                return Some(&value[..]);
+            }
+        }
         self.headers
             .get(&HeaderOrHipStr::HipStr(LocalHipStr::from(key)))
             .map(|a| &a[..])
@@ -597,7 +604,7 @@ impl HttpRequest {
         stream: Arc<Mutex<HttpStream>>,
     ) -> anyhow::Result<(Self, usize)> {
         let mut stream = stream.lock().await;
-        let mut tmp_buf = [0u8; 1024];
+        let mut tmp_buf = [0u8; 4096];
         let (mut req, hdr_len) = loop {
             let n = stream.read(&mut tmp_buf).await?;
             if n == 0 {
@@ -890,7 +897,7 @@ pub enum HttpResponseBody {
 pub struct HttpResponse {
     pub version: String,
     pub http_code: u16,
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<Cow<'static, str>, Cow<'static, str>>,
     pub body: HttpResponseBody,
 }
 unsafe impl Send for HttpResponse {}
@@ -946,15 +953,27 @@ impl HttpResponse {
     make_resp_by_text!(xml, "application/xml");
     make_resp_by_binary!(png, "image/png");
 
-    fn default_headers(cnt_type: impl Into<String>) -> HashMap<String, String> {
+    fn default_headers(
+        cnt_type: impl Into<String>,
+    ) -> HashMap<Cow<'static, str>, Cow<'static, str>> {
+        let now = Utc::now();
+        let current_ts = now.timestamp();
+
+        static TL_TIMESTAMP: ThreadLocal<RefCell<(i64, Cow<'static, str>)>> = ThreadLocal::new();
+        let mut tl_timestamp = TL_TIMESTAMP.get_or_default().borrow_mut();
+        let date_str = if current_ts == tl_timestamp.0 {
+            tl_timestamp.1.clone()
+        } else {
+            let new_date: Cow<'_, str> = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string().into();
+            *tl_timestamp = (current_ts, new_date.clone());
+            new_date
+        };
+
         [
-            (
-                "Date".into(),
-                Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-            ),
-            ("Server".into(), SERVER_STR.clone()),
+            ("Date".into(), date_str),
+            ("Server".into(), SERVER_STR.clone().into()),
             ("Connection".into(), "keep-alive".into()),
-            ("Content-Type".into(), cnt_type.into()),
+            ("Content-Type".into(), cnt_type.into().into()),
             ("Pragma".into(), "no-cache".into()),
             ("Cache-Control".into(), "no-cache".into()),
         ]
@@ -970,8 +989,8 @@ impl HttpResponse {
         }
     }
 
-    pub fn add_header(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.headers.insert(key.into(), value.into());
+    pub fn add_header(&mut self, key: Cow<'static, str>, value: Cow<'static, str>) {
+        self.headers.insert(key, value);
     }
 
     pub fn not_found() -> Self {
@@ -1011,7 +1030,7 @@ impl HttpResponse {
             http_code: 200,
             headers: [
                 ("Transfer-Encoding".into(), "chunked".into()),
-                ("Content-Type".into(), content_type.into()),
+                ("Content-Type".into(), content_type.into().into()),
             ]
             .into(),
             body: HttpResponseBody::Stream(rx),
@@ -1040,10 +1059,11 @@ impl HttpResponse {
                     let modified_time =
                         chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + duration);
                     ret.add_header(
-                        "Last-Modified",
+                        "Last-Modified".into(),
                         modified_time
                             .format("%a, %d %b %Y %H:%M:%S GMT")
-                            .to_string(),
+                            .to_string()
+                            .into(),
                     );
                 }
             }
@@ -1054,7 +1074,7 @@ impl HttpResponse {
                     let modified_secs = duration.as_secs();
                     let file_size = meta.len();
                     let etag = format!("\"{:x}-{:x}\"", modified_secs, file_size);
-                    ret.add_header("ETag", etag);
+                    ret.add_header("ETag".into(), etag.into());
                 }
             }
             ret
@@ -1072,7 +1092,7 @@ impl HttpResponse {
                 _ if path.ends_with('/') => "text/html",
                 _ => "application/octet-stream",
             };
-            ret.add_header("Content-Type", mime_type);
+            ret.add_header("Content-Type".into(), mime_type.into());
             if download {
                 let file = match path.rfind('/') {
                     Some(p) => &path[p + 1..],
@@ -1080,8 +1100,8 @@ impl HttpResponse {
                 };
                 if file.len() > 0 {
                     ret.add_header(
-                        "Content-Disposition",
-                        format!("attachment; filename={file}"),
+                        "Content-Disposition".into(),
+                        format!("attachment; filename={file}").into(),
                     );
                 }
             }
@@ -1104,9 +1124,12 @@ impl HttpResponse {
             headers: [
                 (
                     "Date".into(),
-                    Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+                    Utc::now()
+                        .format("%a, %d %b %Y %H:%M:%S GMT")
+                        .to_string()
+                        .into(),
                 ),
-                ("Server".into(), SERVER_STR.clone()),
+                ("Server".into(), SERVER_STR.clone().into()),
                 ("Connection".into(), "Upgrade".into()),
                 ("Upgrade".into(), "websocket".into()),
                 ("Sec-WebSocket-Accept".into(), ws_accept.into()),
@@ -1231,7 +1254,11 @@ impl HttpResponse {
             }
             res.body = HttpResponseBody::Data(buf[hdr_len..hdr_len + bdy_len].to_vec());
         // to_ref_buf
-        } else if res.headers.get("Transfer-Encoding") == Some(&"chunked".to_string()) {
+        } else if res
+            .headers
+            .get("Transfer-Encoding")
+            .is_some_and(|v| v == "chunked")
+        {
             loop {
                 let chunked_len = {
                     let mut chunked_len = 0;
@@ -1298,15 +1325,16 @@ impl HttpResponse {
                 break;
             }
             req.headers.insert(
-                h.name.http_std_case(),
-                str::from_utf8(h.value).unwrap_or("").to_string(),
+                h.name.http_std_case().into(),
+                str::from_utf8(h.value).unwrap_or("").to_string().into(),
             );
         }
         Ok(Some((req, n)))
     }
 
     pub fn get_header(&self, key: &str) -> Option<&str> {
-        self.headers.get(&key.http_std_case()).map(|a| a.as_str())
+        let header_key = key.http_std_case();
+        self.headers.get(header_key.as_str()).map(|a| a.as_ref())
     }
 }
 

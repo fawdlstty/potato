@@ -14,7 +14,7 @@
 标注有两种用法，一种是直接传递请求路径。示例：
 
 ```rust
-#[http_get("/hello")]
+#[potato::http_get("/hello")]
 async fn hello() -> HttpResponse {
     HttpResponse::html("hello world")
 }
@@ -23,7 +23,7 @@ async fn hello() -> HttpResponse {
 另一种用法是指定请求路径和鉴权参数。示例：
 
 ```rust
-#[http_get(path="/check", auth_arg=payload)]
+#[potato::http_get(path="/check", auth_arg=payload)]
 async fn check(payload: String) -> HttpResponse {
     HttpResponse::html(format!("payload: [{payload}]"))
 }

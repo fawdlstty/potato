@@ -22,7 +22,7 @@ cargo add tokio --features full
 
 ```rust
 // http://127.0.0.1:8080/hello
-#[http_get("/hello")]
+#[potato::http_get("/hello")]
 async fn hello() -> potato::HttpResponse {
     potato::HttpResponse::html("hello world")
 }

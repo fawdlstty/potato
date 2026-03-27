@@ -2,7 +2,6 @@ use crate::utils::enums::HttpConnection;
 use crate::utils::tcp_stream::HttpStream;
 use crate::{HttpMethod, HttpRequest, HttpResponse, PreflightResult};
 use crate::{RequestHandlerFlag, TransferSession};
-use async_recursion::async_recursion;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -359,7 +358,6 @@ impl PipeContext {
             .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
 
-    #[async_recursion]
     pub async fn handle_request(
         self2: Arc<PipeContext>,
         req: &mut HttpRequest,
@@ -379,7 +377,7 @@ impl PipeContext {
                             return HttpResponse::empty();
                         } else if req.method == HttpMethod::OPTIONS {
                             let mut res2 = HttpResponse::html("");
-                            let methods_str = {
+                            let methods_str: Cow<'static, str> = {
                                 let mut options: HashSet<_> =
                                     [HttpMethod::HEAD, HttpMethod::OPTIONS]
                                         .into_iter()
@@ -392,12 +390,14 @@ impl PipeContext {
                                     .map(|m| m.to_string())
                                     .collect::<Vec<_>>()
                                     .join(",")
+                                    .into()
                             };
-                            res2.add_header("Allow", &methods_str);
+
+                            res2.add_header("Allow".into(), methods_str.clone());
                             if *allow_cors {
-                                res2.add_header("Access-Control-Allow-Origin", "*");
-                                res2.add_header("Access-Control-Allow-Methods", &methods_str);
-                                res2.add_header("Access-Control-Allow-Headers", "*");
+                                res2.add_header("Access-Control-Allow-Origin".into(), "*".into());
+                                res2.add_header("Access-Control-Allow-Methods".into(), methods_str);
+                                res2.add_header("Access-Control-Allow-Headers".into(), "*".into());
                             }
                             return res2;
                         } else {
@@ -746,8 +746,18 @@ impl PipeContext {
                     let res = {
                         let mut new_res = dav_server.handle(new_req).await;
                         let mut res = HttpResponse::empty();
-                        for (k, v) in new_res.headers().iter() {
-                            res.add_header(k.as_str().http_std_case(), v.to_str().unwrap_or(""));
+                        let headers: Vec<(String, String)> = new_res
+                            .headers()
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    k.as_str().http_std_case(),
+                                    v.to_str().unwrap_or("").to_string(),
+                                )
+                            })
+                            .collect();
+                        for (k, v) in headers {
+                            res.add_header(k.into(), v.into());
                         }
                         res.http_code = new_res.status().as_u16();
                         res.version = format!("{:?}", new_res.version());

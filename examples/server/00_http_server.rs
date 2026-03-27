@@ -1,4 +1,4 @@
-#[http_get("/hello")]
+#[potato::http_get("/hello")]
 async fn hello() -> potato::HttpResponse {
     potato::HttpResponse::html("hello world")
 }

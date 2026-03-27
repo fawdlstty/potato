@@ -470,8 +470,10 @@ impl TransferSession {
             }
             res.headers.remove("Transfer-Encoding");
             if let HttpResponseBody::Data(ref body_data) = res.body {
-                res.headers
-                    .insert("Content-Length".to_string(), body_data.len().to_string());
+                res.headers.insert(
+                    "Content-Length".to_string().into(),
+                    body_data.len().to_string().into(),
+                );
             }
         }
 

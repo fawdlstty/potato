@@ -14,7 +14,7 @@ These six methods are identical in functionality except for describing the proce
 There are two ways to use annotations. One is to directly pass the request path. Example:
 
 ```rust
-#[http_get("/hello")]
+#[potato::http_get("/hello")]
 async fn hello() -> HttpResponse {
     HttpResponse::html("hello world")
 }
@@ -23,7 +23,7 @@ async fn hello() -> HttpResponse {
 Another usage is to specify the request path and authentication parameter. Example:
 
 ```rust
-#[http_get(path="/check", auth_arg=payload)]
+#[potato::http_get(path="/check", auth_arg=payload)]
 async fn check(payload: String) -> HttpResponse {
     HttpResponse::html(format!("payload: [{payload}]"))
 }
