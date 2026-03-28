@@ -405,6 +405,7 @@ mod tests {
     }
 
     /// 测试 OpenAPI 文档功能 - examples/server/02_openapi_server.rs
+    #[cfg(feature = "openapi")]
     #[tokio::test]
     async fn test_openapi_server() -> anyhow::Result<()> {
         let port = get_test_port();

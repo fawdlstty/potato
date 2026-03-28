@@ -1,11 +1,16 @@
 /// 特性标志测试
 /// 仅在启用对应特性时运行: jemalloc, webdav, ssh
+#[cfg(feature = "webdav")]
 use std::sync::atomic::{AtomicU16, Ordering};
+#[cfg(feature = "webdav")]
 use std::time::Duration;
+#[cfg(feature = "webdav")]
 use tokio::time::sleep;
 
+#[cfg(feature = "webdav")]
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(28000);
 
+#[cfg(feature = "webdav")]
 fn get_test_port() -> u16 {
     PORT_COUNTER.fetch_add(1, Ordering::Relaxed)
 }

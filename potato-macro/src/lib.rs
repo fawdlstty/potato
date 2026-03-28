@@ -102,6 +102,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     };
     let doc_desp = "";
     let fn_name = root_fn.sig.ident.clone();
+    let is_async = root_fn.sig.asyncness.is_some();
     let wrap_func_name = random_ident();
     let mut args = vec![];
     let mut arg_names = vec![];
@@ -137,20 +138,41 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                             panic!("auth_arg argument is must String type");
                         }
                         arg_auth_mark = true;
-                        quote! {
-                            match req.headers
-                                .get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization"))
-                                .map(|v| v.to_str()) {
-                                Some(mut auth) => {
-                                    if auth.starts_with("Bearer ") {
-                                        auth = &auth[7..];
+                        if is_async {
+                            quote! {
+                                match req.headers
+                                    .get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization"))
+                                    .map(|v| v.to_str()) {
+                                    Some(mut auth) => {
+                                        if auth.starts_with("Bearer ") {
+                                            auth = &auth[7..];
+                                        }
+                                        match potato::ServerAuth::jwt_check(&auth).await {
+                                            Ok(payload) => payload,
+                                            Err(err) => return potato::HttpResponse::error(format!("auth failed: {err:?}")),
+                                        }
                                     }
-                                    match potato::ServerAuth::jwt_check(&auth).await {
-                                        Ok(payload) => payload,
-                                        Err(err) => return potato::HttpResponse::error(format!("auth failed: {err:?}")),
-                                    }
+                                    None => return potato::HttpResponse::error("miss header : Authorization"),
                                 }
-                                None => return potato::HttpResponse::error("miss header : Authorization"),
+                            }
+                        } else {
+                            quote! {
+                                match req.headers
+                                    .get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization"))
+                                    .map(|v| v.to_str()) {
+                                    Some(mut auth) => {
+                                        if auth.starts_with("Bearer ") {
+                                            auth = &auth[7..];
+                                        }
+                                        match tokio::task::block_in_place(|| {
+                                            tokio::runtime::Handle::current().block_on(potato::ServerAuth::jwt_check(&auth))
+                                        }) {
+                                            Ok(payload) => payload,
+                                            Err(err) => return potato::HttpResponse::error(format!("auth failed: {err:?}")),
+                                        }
+                                    }
+                                    None => return potato::HttpResponse::error("miss header : Authorization"),
+                                }
                             }
                         }
                     } else {
@@ -196,104 +218,105 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         .to_token_stream()
         .to_string()
         .type_simplify();
-    let wrap_func_body = match args.len() {
-        0 => match &ret_type[..] {
+    let call_expr = match args.len() {
+        0 => quote! { #fn_name() },
+        1 => quote! {{
+            let #(#arg_names),* = #(#args),*;
+            #fn_name(#(#arg_names),*)
+        }},
+        _ => quote! {{
+            let (#(#arg_names),*) = (#(#args),*);
+            #fn_name(#(#arg_names),*)
+        }},
+    };
+    let wrap_func_body = if is_async {
+        match &ret_type[..] {
             "Result<()>" => quote! {
-                match #fn_name().await {
-                    Ok(ret) => potato::HttpResponse::text("ok"),
+                match #call_expr.await {
+                    Ok(_) => potato::HttpResponse::text("ok"),
                     Err(err) => potato::HttpResponse::error(format!("{err:?}")),
                 }
             },
             "Result<HttpResponse>" | "anyhow::Result<HttpResponse>" => quote! {
-                match #fn_name().await {
+                match #call_expr.await {
                     Ok(ret) => ret,
                     Err(err) => potato::HttpResponse::error(format!("{err:?}")),
                 }
             },
             "()" => quote! {
-                #fn_name().await;
+                #call_expr.await;
                 potato::HttpResponse::text("ok")
             },
             "HttpResponse" => quote! {
-                #fn_name().await
+                #call_expr.await
             },
             _ => panic!("unsupported ret type: {ret_type}"),
-        },
-        1 => match &ret_type[..] {
+        }
+    } else {
+        match &ret_type[..] {
             "Result<()>" => quote! {
-                let #(#arg_names),* = #(#args),*;
-                match #fn_name(#(#arg_names),*).await {
-                    Ok(ret) => potato::HttpResponse::text("ok"),
+                match #call_expr {
+                    Ok(_) => potato::HttpResponse::text("ok"),
                     Err(err) => potato::HttpResponse::error(format!("{err:?}")),
                 }
             },
-            "Result<HttpResponse>" => quote! {
-                let #(#arg_names),* = #(#args),*;
-                match #fn_name(#(#arg_names),*).await {
+            "Result<HttpResponse>" | "anyhow::Result<HttpResponse>" => quote! {
+                match #call_expr {
                     Ok(ret) => ret,
                     Err(err) => potato::HttpResponse::error(format!("{err:?}")),
                 }
             },
             "()" => quote! {
-                let #(#arg_names),* = #(#args),*;
-                #fn_name(#(#arg_names),*).await;
+                #call_expr;
                 potato::HttpResponse::text("ok")
             },
             "HttpResponse" => quote! {
-                let #(#arg_names),* = #(#args),*;
-                #fn_name(#(#arg_names),*).await
+                #call_expr
             },
             _ => panic!("unsupported ret type: {ret_type}"),
-        },
-        _ => match &ret_type[..] {
-            "Result<()>" => quote! {
-                let (#(#arg_names),*) = (#(#args),*);
-                match #fn_name(#(#arg_names),*).await {
-                    Ok(ret) => potato::HttpResponse::text("ok"),
-                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
-                }
-            },
-            "Result<HttpResponse>" => quote! {
-                let (#(#arg_names),*) = (#(#args),*);
-                match #fn_name(#(#arg_names),*).await {
-                    Ok(ret) => ret,
-                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
-                }
-            },
-            "()" => quote! {
-                let (#(#arg_names),*) = (#(#args),*);
-                #fn_name(#(#arg_names),*).await;
-                potato::HttpResponse::text("ok")
-            },
-            "HttpResponse" => quote! {
-                let (#(#arg_names),*) = (#(#args),*);
-                #fn_name(#(#arg_names),*).await
-            },
-            _ => panic!("unsupported ret type: {ret_type}"),
-        },
+        }
     };
     let doc_args = serde_json::to_string(&doc_args).unwrap();
-    //let mut content =
-    quote! {
-        #root_fn
+    if is_async {
+        quote! {
+            #root_fn
 
-        #[doc(hidden)]
-        async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
-            #wrap_func_body
+            #[doc(hidden)]
+            async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+                #wrap_func_body
+            }
+
+            #[doc(hidden)]
+            fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
+                Box::pin(#wrap_func_name2(req))
+            }
+
+            potato::inventory::submit!{potato::RequestHandlerFlag::new(
+                potato::HttpMethod::#req_name,
+                #route_path,
+                potato::HttpHandler::Async(#wrap_func_name),
+                potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args)
+            )}
         }
+        .into()
+    } else {
+        quote! {
+            #root_fn
 
-        #[doc(hidden)]
-        fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
-            Box::pin(#wrap_func_name2(req))
+            #[doc(hidden)]
+            fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+                #wrap_func_body
+            }
+
+            potato::inventory::submit!{potato::RequestHandlerFlag::new(
+                potato::HttpMethod::#req_name,
+                #route_path,
+                potato::HttpHandler::Sync(#wrap_func_name2),
+                potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args)
+            )}
         }
-
-        potato::inventory::submit!{potato::RequestHandlerFlag::new(
-            potato::HttpMethod::#req_name,
-            #route_path,
-            #wrap_func_name,
-            potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args)
-        )}
-    }.into()
+        .into()
+    }
     //}.to_string();
     //panic!("{content}");
     //todo!()

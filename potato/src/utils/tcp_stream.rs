@@ -1,5 +1,6 @@
 #![allow(async_fn_in_trait)]
 use async_trait::async_trait;
+use std::io::IoSlice;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
@@ -69,6 +70,116 @@ impl HttpStream {
             HttpStream::DuplexStream(s) => s.write_all(buf).await?,
         }
         Ok(())
+    }
+
+    pub async fn write_all_vectored(&mut self, bufs: &[IoSlice<'_>]) -> anyhow::Result<()> {
+        if bufs.is_empty() {
+            return Ok(());
+        }
+        match self {
+            HttpStream::Tcp(s) => write_all_vectored_inner(s, bufs).await?,
+            #[cfg(feature = "tls")]
+            HttpStream::ServerTls(s) => write_all_vectored_inner(s, bufs).await?,
+            #[cfg(feature = "tls")]
+            HttpStream::ClientTls(s) => write_all_vectored_inner(s, bufs).await?,
+            HttpStream::DuplexStream(s) => write_all_vectored_inner(s, bufs).await?,
+        }
+        Ok(())
+    }
+
+    pub async fn write_all_vectored2(&mut self, a: &[u8], b: &[u8]) -> anyhow::Result<()> {
+        match self {
+            HttpStream::Tcp(s) => write_all_vectored2_inner(s, a, b).await?,
+            #[cfg(feature = "tls")]
+            HttpStream::ServerTls(s) => write_all_vectored2_inner(s, a, b).await?,
+            #[cfg(feature = "tls")]
+            HttpStream::ClientTls(s) => write_all_vectored2_inner(s, a, b).await?,
+            HttpStream::DuplexStream(s) => write_all_vectored2_inner(s, a, b).await?,
+        }
+        Ok(())
+    }
+}
+
+async fn write_all_vectored_inner<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bufs: &[IoSlice<'_>],
+) -> anyhow::Result<()> {
+    let mut idx = 0usize;
+    let mut offset = 0usize;
+    while idx < bufs.len() {
+        let mut slices = Vec::with_capacity(bufs.len() - idx);
+        if offset > 0 {
+            slices.push(IoSlice::new(&bufs[idx][offset..]));
+            for b in &bufs[idx + 1..] {
+                slices.push(IoSlice::new(b));
+            }
+        } else {
+            for b in &bufs[idx..] {
+                slices.push(IoSlice::new(b));
+            }
+        }
+
+        let n = writer.write_vectored(&slices).await?;
+        if n == 0 {
+            return Err(anyhow::Error::msg("connection closed while writing"));
+        }
+
+        let mut written = n;
+        if offset > 0 {
+            let rem = bufs[idx].len() - offset;
+            if written < rem {
+                offset += written;
+                continue;
+            }
+            written -= rem;
+            idx += 1;
+            offset = 0;
+        }
+        while idx < bufs.len() && written >= bufs[idx].len() {
+            written -= bufs[idx].len();
+            idx += 1;
+        }
+        if idx < bufs.len() && written > 0 {
+            offset = written;
+        }
+    }
+    Ok(())
+}
+
+async fn write_all_vectored2_inner<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    a: &[u8],
+    b: &[u8],
+) -> anyhow::Result<()> {
+    let mut a_off = 0usize;
+    let mut b_off = 0usize;
+    loop {
+        if a_off >= a.len() && b_off >= b.len() {
+            return Ok(());
+        }
+        let n = if a_off < a.len() && b_off < b.len() {
+            let bufs = [IoSlice::new(&a[a_off..]), IoSlice::new(&b[b_off..])];
+            writer.write_vectored(&bufs).await?
+        } else if a_off < a.len() {
+            writer.write(&a[a_off..]).await?
+        } else {
+            writer.write(&b[b_off..]).await?
+        };
+        if n == 0 {
+            return Err(anyhow::Error::msg("connection closed while writing"));
+        }
+
+        if a_off < a.len() {
+            let a_rem = a.len() - a_off;
+            if n < a_rem {
+                a_off += n;
+                continue;
+            }
+            a_off = a.len();
+            b_off += n - a_rem;
+        } else {
+            b_off += n;
+        }
     }
 }
 

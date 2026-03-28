@@ -1,14 +1,19 @@
+#[cfg(feature = "tls")]
 use std::sync::atomic::{AtomicU16, Ordering};
+#[cfg(feature = "tls")]
 use std::time::Duration;
+#[cfg(feature = "tls")]
 use tokio::time::sleep;
 
+#[cfg(feature = "tls")]
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(25000);
 
+#[cfg(feature = "tls")]
 fn get_test_port() -> u16 {
     PORT_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tls"))]
 mod tests {
     use super::*;
     use potato::HttpServer;
