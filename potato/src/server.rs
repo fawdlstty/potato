@@ -368,7 +368,11 @@ impl PipeContext {
             .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
 
-    pub async fn handle_request(self2: &PipeContext, req: &mut HttpRequest, skip: usize) -> HttpResponse {
+    pub async fn handle_request(
+        self2: &PipeContext,
+        req: &mut HttpRequest,
+        skip: usize,
+    ) -> HttpResponse {
         for (_idx, item) in self2.items.iter().enumerate().skip(skip) {
             match item {
                 PipeContextItem::Handlers(allow_cors) => {
@@ -859,34 +863,19 @@ impl HttpServer {
             let mut stream = Arc::new(Mutex::new(HttpStream::from_tcp(stream)));
             _ = tokio::task::spawn(async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
-                let mut req = HttpRequest::new();
                 loop {
-                    let n = {
-                        if let Some(stream_mutex) = Arc::get_mut(&mut stream) {
-                            match HttpRequest::from_stream_direct_into(
-                                &mut buf,
-                                stream_mutex.get_mut(),
-                                &mut req,
-                            )
-                            .await
-                            {
-                                Ok(n) => n,
-                                Err(_) => break,
-                            }
-                        } else {
-                            match HttpRequest::from_stream_into(&mut buf, Arc::clone(&stream), &mut req)
-                                .await
-                            {
-                                Ok(n) => n,
-                                Err(_) => break,
-                            }
+                    let (mut req, n) = {
+                        match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
+                            Ok((req, n)) => (req, n),
+                            Err(_) => break,
                         }
                     };
                     req.client_addr = Some(client_addr);
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let mut res = PipeContext::handle_request(pipe_ctx2.as_ref(), &mut req, 0).await;
+                    let mut res =
+                        PipeContext::handle_request(pipe_ctx2.as_ref(), &mut req, 0).await;
                     let stream_for_write = req.exts.remove(&TypeId::of::<Mutex<HttpStream>>());
                     match stream_for_write {
                         Some(stream_in_req) => {
@@ -949,34 +938,19 @@ impl HttpServer {
             let mut stream = Arc::new(Mutex::new(HttpStream::from_server_tls(stream)));
             _ = tokio::task::spawn(async move {
                 let mut buf: Vec<u8> = Vec::with_capacity(4096);
-                let mut req = HttpRequest::new();
                 loop {
-                    let n = {
-                        if let Some(stream_mutex) = Arc::get_mut(&mut stream) {
-                            match HttpRequest::from_stream_direct_into(
-                                &mut buf,
-                                stream_mutex.get_mut(),
-                                &mut req,
-                            )
-                            .await
-                            {
-                                Ok(n) => n,
-                                Err(_) => break,
-                            }
-                        } else {
-                            match HttpRequest::from_stream_into(&mut buf, Arc::clone(&stream), &mut req)
-                                .await
-                            {
-                                Ok(n) => n,
-                                Err(_) => break,
-                            }
+                    let (mut req, n) = {
+                        match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
+                            Ok((req, n)) => (req, n),
+                            Err(_) => break,
                         }
                     };
                     req.client_addr = Some(client_addr);
                     req.add_ext(Arc::clone(&stream));
                     let cmode = req.get_header_accept_encoding();
                     let conn = req.get_header_connection();
-                    let mut res = PipeContext::handle_request(pipe_ctx2.as_ref(), &mut req, 0).await;
+                    let mut res =
+                        PipeContext::handle_request(pipe_ctx2.as_ref(), &mut req, 0).await;
                     let stream_for_write = req.exts.remove(&TypeId::of::<Mutex<HttpStream>>());
                     match stream_for_write {
                         Some(stream_in_req) => {

@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.2.30"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -25,7 +25,7 @@ httparse = "1.9.5"
 inventory = "0.3.15"
 jsonwebtoken = "9.3.0"
 #jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
-potato-macro = { version = "0.2.28", path = "../potato-macro" }
+potato-macro = { version = "0.3.0", path = "../potato-macro" }
 rand = "0.8.5"
 regex = "1.11.1"
 rust-embed = "8.9.0"

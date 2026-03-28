@@ -431,19 +431,6 @@ impl HttpRequest {
         }
     }
 
-    fn reset_for_reuse(&mut self) {
-        self.method = HttpMethod::GET;
-        self.url_path = LocalHipStr::from("/");
-        self.url_query.clear();
-        self.version = 11;
-        self.headers.clear();
-        self.body.clear();
-        self.body_pairs.clear();
-        self.body_files.clear();
-        self.client_addr = None;
-        self.exts.clear();
-    }
-
     pub fn query_string(&self) -> String {
         let mut q = "?".to_string();
         for (k, v) in self.url_query.iter() {
@@ -630,18 +617,16 @@ impl HttpRequest {
     async fn from_stream_impl(
         buf: &mut Vec<u8>,
         stream: &mut HttpStream,
-        req: &mut Self,
-    ) -> anyhow::Result<usize> {
-        req.reset_for_reuse();
+    ) -> anyhow::Result<(Self, usize)> {
         let mut tmp_buf = [0u8; 4096];
-        let hdr_len = loop {
+        let (mut req, hdr_len) = loop {
             let n = stream.read(&mut tmp_buf).await?;
             if n == 0 {
                 return Err(anyhow::Error::msg("connection closed"));
             }
             buf.extend(&tmp_buf[0..n]);
-            match HttpRequest::from_headers_part_into(&buf[..], req)? {
-                Some(hdr_len) => break hdr_len,
+            match HttpRequest::from_headers_part(&buf[..])? {
+                Some((req, hdr_len)) => break (req, hdr_len),
                 None => continue,
             }
         };
@@ -652,6 +637,9 @@ impl HttpRequest {
                 return Err(anyhow::Error::msg("connection closed"));
             }
             buf.extend(&tmp_buf[0..t]);
+        }
+        if bdy_len == 0 {
+            return Ok((req, hdr_len));
         }
         req.body = LocalHipByt::from(&buf[hdr_len..hdr_len + bdy_len]);
 
@@ -735,7 +723,7 @@ impl HttpRequest {
                 None => {}
             }
         }
-        Ok(hdr_len + bdy_len)
+        Ok((req, hdr_len + bdy_len))
     }
 
     pub async fn from_stream(
@@ -743,47 +731,10 @@ impl HttpRequest {
         stream: Arc<Mutex<HttpStream>>,
     ) -> anyhow::Result<(Self, usize)> {
         let mut stream = stream.lock().await;
-        let mut req = HttpRequest::new();
-        let n = Self::from_stream_impl(buf, &mut stream, &mut req).await?;
-        Ok((req, n))
-    }
-
-    pub async fn from_stream_into(
-        buf: &mut Vec<u8>,
-        stream: Arc<Mutex<HttpStream>>,
-        req: &mut Self,
-    ) -> anyhow::Result<usize> {
-        let mut stream = stream.lock().await;
-        Self::from_stream_impl(buf, &mut stream, req).await
-    }
-
-    pub async fn from_stream_direct(
-        buf: &mut Vec<u8>,
-        stream: &mut HttpStream,
-    ) -> anyhow::Result<(Self, usize)> {
-        let mut req = HttpRequest::new();
-        let n = Self::from_stream_impl(buf, stream, &mut req).await?;
-        Ok((req, n))
-    }
-
-    pub async fn from_stream_direct_into(
-        buf: &mut Vec<u8>,
-        stream: &mut HttpStream,
-        req: &mut Self,
-    ) -> anyhow::Result<usize> {
-        Self::from_stream_impl(buf, stream, req).await
+        Self::from_stream_impl(buf, &mut stream).await
     }
 
     pub fn from_headers_part(buf: &[u8]) -> anyhow::Result<Option<(Self, usize)>> {
-        let mut req = HttpRequest::new();
-        match Self::from_headers_part_into(buf, &mut req)? {
-            Some(n) => Ok(Some((req, n))),
-            None => Ok(None),
-        }
-    }
-
-    pub fn from_headers_part_into(buf: &[u8], req: &mut Self) -> anyhow::Result<Option<usize>> {
-        req.reset_for_reuse();
         let mut headers = [httparse::EMPTY_HEADER; 48];
         let (rreq, n) = {
             let mut req = httparse::Request::new(&mut headers);
@@ -793,6 +744,7 @@ impl HttpRequest {
             };
             (req, n)
         };
+        let mut req = HttpRequest::new();
         req.method = {
             let method = rreq.method.unwrap();
             match method.len() {
@@ -838,7 +790,7 @@ impl HttpRequest {
                 LocalHipStr::from(str::from_utf8(h.value)?),
             );
         }
-        Ok(Some(n))
+        Ok(Some((req, n)))
     }
 
     /// Check HTTP conditional preflight headers to determine if special status codes should be returned
@@ -1268,10 +1220,7 @@ impl HttpResponse {
             HttpResponseBody::Data(data) => {
                 let mut payload_tmp: Vec<u8> = vec![];
                 let mut cmode = cmode;
-                if cmode == CompressMode::Gzip
-                    && data.len() >= 32
-                    && no_content_encoding
-                {
+                if cmode == CompressMode::Gzip && data.len() >= 32 && no_content_encoding {
                     if let Ok(compressed_data) = data.compress() {
                         payload_tmp = compressed_data;
                     }
@@ -1292,7 +1241,14 @@ impl HttpResponse {
                     self.http_code
                 ));
                 if self.headers.len() == 6 {
-                    if let (Some(date), Some(server), Some(connection), Some(content_type), Some(pragma), Some(cache_control)) = (
+                    if let (
+                        Some(date),
+                        Some(server),
+                        Some(connection),
+                        Some(content_type),
+                        Some(pragma),
+                        Some(cache_control),
+                    ) = (
                         self.headers.get("Date"),
                         self.headers.get("Server"),
                         self.headers.get("Connection"),
