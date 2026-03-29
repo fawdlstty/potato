@@ -63,12 +63,14 @@ pub enum PreflightResult {
 #[derive(Debug)]
 pub enum HttpRequestParseError {
     BadRequest(String),
+    ExpectationFailed(String),
 }
 
 impl fmt::Display for HttpRequestParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HttpRequestParseError::BadRequest(msg) => write!(f, "{msg}"),
+            HttpRequestParseError::ExpectationFailed(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -446,10 +448,62 @@ impl HttpRequest {
         anyhow::Error::new(HttpRequestParseError::BadRequest(msg.into()))
     }
 
+    fn expectation_failed(msg: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(HttpRequestParseError::ExpectationFailed(msg.into()))
+    }
+
     pub fn bad_request_message(err: &anyhow::Error) -> Option<&str> {
-        err.downcast_ref::<HttpRequestParseError>().map(|parse_err| match parse_err {
-            HttpRequestParseError::BadRequest(msg) => msg.as_str(),
-        })
+        err.downcast_ref::<HttpRequestParseError>()
+            .and_then(|parse_err| match parse_err {
+                HttpRequestParseError::BadRequest(msg) => Some(msg.as_str()),
+                HttpRequestParseError::ExpectationFailed(_) => None,
+            })
+    }
+
+    pub fn parse_error_response(err: &anyhow::Error) -> Option<HttpResponse> {
+        err.downcast_ref::<HttpRequestParseError>()
+            .map(|parse_err| {
+                let (status, msg) = match parse_err {
+                    HttpRequestParseError::BadRequest(msg) => (400, msg.as_str()),
+                    HttpRequestParseError::ExpectationFailed(msg) => (417, msg.as_str()),
+                };
+                let mut res = HttpResponse::text(msg.to_string());
+                res.http_code = status;
+                res.add_header("Connection".into(), "close".into());
+                res
+            })
+    }
+
+    async fn process_expect_header(
+        &self,
+        stream: &mut HttpStream,
+        has_request_body: bool,
+    ) -> anyhow::Result<()> {
+        let Some(expect) = self.get_header_key(HeaderItem::Expect) else {
+            return Ok(());
+        };
+        if self.version < 11 {
+            Err(Self::expectation_failed(
+                "Expect header is not supported for HTTP versions below 1.1",
+            ))?;
+        }
+        let mut has_100_continue = false;
+        for token in expect.split(',').map(|token| token.trim()) {
+            if token.is_empty() {
+                Err(Self::expectation_failed("empty Expect header"))?;
+            }
+            if token.eq_ignore_ascii_case("100-continue") {
+                has_100_continue = true;
+                continue;
+            }
+            Err(Self::expectation_failed(format!(
+                "unsupported Expect header: {token}"
+            )))?;
+        }
+        if has_100_continue && has_request_body {
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        }
+        Ok(())
     }
 
     pub fn new() -> Self {
@@ -841,18 +895,26 @@ impl HttpRequest {
             }
         };
         let has_chunked_transfer_encoding = req.has_chunked_transfer_encoding()?;
-        let bdy_len;
+        let mut content_length = 0usize;
         if has_chunked_transfer_encoding {
             if req.get_header_key(HeaderItem::Content_Length).is_some() {
                 Err(anyhow!(
                     "conflicting headers: Transfer-Encoding and Content-Length"
                 ))?;
             }
+        } else {
+            content_length = req.parse_header_content_length()?.unwrap_or(0);
+        }
+
+        let has_request_body = has_chunked_transfer_encoding || content_length > 0;
+        req.process_expect_header(stream, has_request_body).await?;
+
+        let bdy_len;
+        if has_chunked_transfer_encoding {
             let (body, consumed_len) = Self::read_chunked_body(buf, stream, hdr_len).await?;
             req.body = body;
             bdy_len = consumed_len;
         } else {
-            let content_length = req.parse_header_content_length()?.unwrap_or(0);
             while hdr_len + content_length > buf.len() {
                 let t = stream.read(&mut tmp_buf).await?;
                 if t == 0 {
@@ -1028,10 +1090,23 @@ impl HttpRequest {
                 }
                 has_valid_host = true;
             }
-            req.headers.insert(
-                HeaderOrHipStr::from_str(h.name),
-                LocalHipStr::from(normalized_header_value),
-            );
+            if h.name.eq_ignore_ascii_case("Expect") {
+                let expect_key: HeaderOrHipStr = HeaderItem::Expect.into();
+                if let Some(existing) = req.headers.get(&expect_key) {
+                    req.headers.insert(
+                        expect_key,
+                        LocalHipStr::from(format!("{}, {}", existing.as_str(), normalized_header_value)),
+                    );
+                } else {
+                    req.headers
+                        .insert(expect_key, LocalHipStr::from(normalized_header_value));
+                }
+            } else {
+                req.headers.insert(
+                    HeaderOrHipStr::from_str(h.name),
+                    LocalHipStr::from(normalized_header_value),
+                );
+            }
         }
         if req.version >= 11 && !has_valid_host {
             Err(Self::bad_request("missing required Host header"))?;

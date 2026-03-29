@@ -287,6 +287,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_server_expect_100_continue_sends_interim_and_accepts_body() -> anyhow::Result<()>
+    {
+        #[potato::http_post("/expect_continue")]
+        async fn expect_continue(req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text(String::from_utf8_lossy(&req.body).to_string())
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request_headers = concat!(
+            "POST /expect_continue HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Expect: 100-continue\r\n",
+            "Content-Length: 11\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request_headers.as_bytes()).await?;
+
+        let mut interim = [0u8; 25];
+        stream.read_exact(&mut interim).await?;
+        assert_eq!(
+            std::str::from_utf8(&interim)?,
+            "HTTP/1.1 100 Continue\r\n\r\n"
+        );
+
+        stream.write_all(b"Hello World").await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(response_text.contains("Hello World"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_unsupported_expect_header_with_417() -> anyhow::Result<()> {
+        #[potato::http_post("/expect_reject")]
+        async fn expect_reject(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("should not reach")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "POST /expect_reject HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Expect: fancy-feature\r\n",
+            "Content-Length: 5\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 417 Expectation Failed"));
+        assert!(response_text.contains("unsupported Expect header"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_duplicate_expect_when_any_token_unsupported() -> anyhow::Result<()>
+    {
+        #[potato::http_post("/expect_duplicate")]
+        async fn expect_duplicate(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("should not reach")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "POST /expect_duplicate HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Expect: 100-continue\r\n",
+            "Expect: unknown-token\r\n",
+            "Content-Length: 5\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 417 Expectation Failed"));
+        assert!(response_text.contains("unsupported Expect header"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_expect_on_http10_request() -> anyhow::Result<()> {
+        #[potato::http_post("/expect_http10")]
+        async fn expect_http10(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("should not reach")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "POST /expect_http10 HTTP/1.0\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Expect: 100-continue\r\n",
+            "Content-Length: 5\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 417 Expectation Failed"));
+        assert!(response_text.contains("HTTP versions below 1.1"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_server_rejects_transfer_encoding_content_length_conflict() -> anyhow::Result<()> {
         #[potato::http_post("/chunked_req_conflict")]
         async fn chunked_req_conflict(_req: &mut HttpRequest) -> HttpResponse {

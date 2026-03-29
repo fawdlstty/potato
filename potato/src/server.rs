@@ -909,13 +909,6 @@ pub struct HttpServer {
 }
 
 impl HttpServer {
-    fn bad_request_response(payload: impl Into<String>) -> HttpResponse {
-        let mut res = HttpResponse::text(payload.into());
-        res.http_code = 400;
-        res.add_header("Connection".into(), "close".into());
-        res
-    }
-
     pub fn new(addr: impl Into<String>) -> Self {
         HttpServer {
             addr: addr.into(),
@@ -987,9 +980,8 @@ impl HttpServer {
                         match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
                             Ok((req, n)) => (req, n),
                             Err(err) => {
-                                if let Some(msg) = HttpRequest::bad_request_message(&err) {
+                                if let Some(mut res) = HttpRequest::parse_error_response(&err) {
                                     let mut stream_guard = stream.lock().await;
-                                    let mut res = Self::bad_request_response(msg.to_string());
                                     let _ = res
                                         .write_to_stream(&mut stream_guard, CompressMode::None)
                                         .await;
@@ -1071,9 +1063,8 @@ impl HttpServer {
                         match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
                             Ok((req, n)) => (req, n),
                             Err(err) => {
-                                if let Some(msg) = HttpRequest::bad_request_message(&err) {
+                                if let Some(mut res) = HttpRequest::parse_error_response(&err) {
                                     let mut stream_guard = stream.lock().await;
-                                    let mut res = Self::bad_request_response(msg.to_string());
                                     let _ = res
                                         .write_to_stream(&mut stream_guard, CompressMode::None)
                                         .await;
