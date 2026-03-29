@@ -1213,6 +1213,16 @@ impl HttpRequest {
     }
 
     pub fn as_bytes(&self) -> Vec<u8> {
+        let use_chunked = self
+            .get_header_key(HeaderItem::Transfer_Encoding)
+            .map(|encodings| {
+                encodings
+                    .split(',')
+                    .map(|coding| coding.trim())
+                    .any(|coding| coding.eq_ignore_ascii_case("chunked"))
+            })
+            .unwrap_or(false);
+
         let mut req_str = format!("{} {} HTTP/1.1\r\n", self.method, self.url_path);
         for (k, v) in self.headers.iter() {
             if let HeaderOrHipStr::HeaderItem(HeaderItem::Content_Length) = k {
@@ -1220,15 +1230,28 @@ impl HttpRequest {
             }
             req_str.push_str(&format!("{}: {v}\r\n", k.to_str()));
         }
-        req_str.push_str(&format!(
-            "{}: {}\r\n",
-            HeaderItem::Content_Length.to_str(),
-            self.body.len()
-        ));
-        req_str.push_str("\r\n");
-        let mut ret = req_str.as_bytes().to_vec();
-        ret.extend(&self.body[..]);
-        ret
+        if use_chunked {
+            req_str.push_str("\r\n");
+            let mut ret = req_str.as_bytes().to_vec();
+            if self.body.is_empty() {
+                ret.extend_from_slice(b"0\r\n\r\n");
+            } else {
+                ret.extend_from_slice(format!("{:x}\r\n", self.body.len()).as_bytes());
+                ret.extend(&self.body[..]);
+                ret.extend_from_slice(b"\r\n0\r\n\r\n");
+            }
+            ret
+        } else {
+            req_str.push_str(&format!(
+                "{}: {}\r\n",
+                HeaderItem::Content_Length.to_str(),
+                self.body.len()
+            ));
+            req_str.push_str("\r\n");
+            let mut ret = req_str.as_bytes().to_vec();
+            ret.extend(&self.body[..]);
+            ret
+        }
     }
 }
 
@@ -1484,24 +1507,43 @@ impl HttpResponse {
         }
     }
 
+    fn status_disallows_response_body(status: u16) -> bool {
+        (100..200).contains(&status) || status == 204 || status == 304
+    }
+
+    fn method_disallows_response_body(request_method: Option<HttpMethod>) -> bool {
+        request_method == Some(HttpMethod::HEAD)
+    }
+
+    fn should_suppress_response_body(&self, request_method: Option<HttpMethod>) -> bool {
+        Self::status_disallows_response_body(self.http_code)
+            || Self::method_disallows_response_body(request_method)
+    }
+
     pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {
         match &self.body {
             HttpResponseBody::Data(data) => {
+                let suppress_body = Self::status_disallows_response_body(self.http_code);
                 let mut payload_tmp: Vec<u8> = vec![];
                 if cmode == CompressMode::Gzip
                     && data.len() >= 32
                     && self.get_header("Content-Encoding").is_none()
+                    && !suppress_body
                 {
                     if let Ok(compressed_data) = data.compress() {
                         payload_tmp = compressed_data;
                     }
                 }
-                let payload_ref = if payload_tmp.is_empty() {
+                let mut payload_ref = if payload_tmp.is_empty() {
                     cmode = CompressMode::None;
                     data.as_slice()
                 } else {
                     payload_tmp.as_slice()
                 };
+                if suppress_body {
+                    cmode = CompressMode::None;
+                    payload_ref = &[];
+                }
                 //
                 let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
                 let status_str = self.http_code.http_code_to_desp();
@@ -1512,7 +1554,9 @@ impl HttpResponse {
                     self.http_code
                 ));
                 for (key, value) in self.headers.iter() {
-                    if key == "Content-Length" {
+                    if key == "Content-Length"
+                        || (suppress_body && key.eq_ignore_ascii_case("Transfer-Encoding"))
+                    {
                         continue;
                     }
                     ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
@@ -1535,23 +1579,33 @@ impl HttpResponse {
         &mut self,
         stream: &mut crate::utils::tcp_stream::HttpStream,
         cmode: CompressMode,
+        request_method: Option<HttpMethod>,
     ) -> anyhow::Result<()> {
+        let suppress_body = self.should_suppress_response_body(request_method);
         let no_content_encoding = self.get_header("Content-Encoding").is_none();
         match &mut self.body {
             HttpResponseBody::Data(data) => {
                 let mut payload_tmp: Vec<u8> = vec![];
                 let mut cmode = cmode;
-                if cmode == CompressMode::Gzip && data.len() >= 32 && no_content_encoding {
+                if cmode == CompressMode::Gzip
+                    && data.len() >= 32
+                    && no_content_encoding
+                    && !suppress_body
+                {
                     if let Ok(compressed_data) = data.compress() {
                         payload_tmp = compressed_data;
                     }
                 }
-                let payload_ref = if payload_tmp.is_empty() {
+                let mut payload_ref = if payload_tmp.is_empty() {
                     cmode = CompressMode::None;
                     data.as_slice()
                 } else {
                     payload_tmp.as_slice()
                 };
+                if suppress_body {
+                    cmode = CompressMode::None;
+                    payload_ref = &[];
+                }
 
                 let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
                 let status_str = self.http_code.http_code_to_desp();
@@ -1585,7 +1639,9 @@ impl HttpResponse {
                         ret.push_str(&ssformat!(512, "Cache-Control: {cache_control}\r\n"));
                     } else {
                         for (key, value) in self.headers.iter() {
-                            if key == "Content-Length" {
+                            if key == "Content-Length"
+                                || (suppress_body && key.eq_ignore_ascii_case("Transfer-Encoding"))
+                            {
                                 continue;
                             }
                             ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
@@ -1593,7 +1649,9 @@ impl HttpResponse {
                     }
                 } else {
                     for (key, value) in self.headers.iter() {
-                        if key == "Content-Length" {
+                        if key == "Content-Length"
+                            || (suppress_body && key.eq_ignore_ascii_case("Transfer-Encoding"))
+                        {
                             continue;
                         }
                         ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
@@ -1624,7 +1682,9 @@ impl HttpResponse {
                     self.http_code
                 ));
                 for (key, value) in self.headers.iter() {
-                    if key == "Content-Length" {
+                    if key == "Content-Length"
+                        || (suppress_body && key.eq_ignore_ascii_case("Transfer-Encoding"))
+                    {
                         continue;
                     }
                     ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
@@ -1632,6 +1692,10 @@ impl HttpResponse {
                 ret.push_str("\r\n");
                 let header_bytes: Vec<u8> = ret.as_bytes().to_vec();
                 stream.write_all(&header_bytes).await?;
+
+                if suppress_body {
+                    return Ok(());
+                }
 
                 // Send chunks
                 while let Some(chunk) = rx.recv().await {

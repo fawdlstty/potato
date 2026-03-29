@@ -983,7 +983,11 @@ impl HttpServer {
                                 if let Some(mut res) = HttpRequest::parse_error_response(&err) {
                                     let mut stream_guard = stream.lock().await;
                                     let _ = res
-                                        .write_to_stream(&mut stream_guard, CompressMode::None)
+                                        .write_to_stream(
+                                            &mut stream_guard,
+                                            CompressMode::None,
+                                            None,
+                                        )
                                         .await;
                                 }
                                 break;
@@ -1001,10 +1005,11 @@ impl HttpServer {
                         Some(stream_in_req) => {
                             drop(stream_in_req);
                             let write_res = if let Some(stream_mutex) = Arc::get_mut(&mut stream) {
-                                res.write_to_stream(stream_mutex.get_mut(), cmode).await
+                                res.write_to_stream(stream_mutex.get_mut(), cmode, Some(req.method))
+                                    .await
                             } else {
                                 let mut stream = stream.lock().await;
-                                res.write_to_stream(&mut stream, cmode).await
+                                res.write_to_stream(&mut stream, cmode, Some(req.method)).await
                             };
                             match write_res {
                                 Ok(()) => {
@@ -1066,7 +1071,11 @@ impl HttpServer {
                                 if let Some(mut res) = HttpRequest::parse_error_response(&err) {
                                     let mut stream_guard = stream.lock().await;
                                     let _ = res
-                                        .write_to_stream(&mut stream_guard, CompressMode::None)
+                                        .write_to_stream(
+                                            &mut stream_guard,
+                                            CompressMode::None,
+                                            None,
+                                        )
                                         .await;
                                 }
                                 break;
@@ -1084,10 +1093,11 @@ impl HttpServer {
                         Some(stream_in_req) => {
                             drop(stream_in_req);
                             let write_res = if let Some(stream_mutex) = Arc::get_mut(&mut stream) {
-                                res.write_to_stream(stream_mutex.get_mut(), cmode).await
+                                res.write_to_stream(stream_mutex.get_mut(), cmode, Some(req.method))
+                                    .await
                             } else {
                                 let mut stream = stream.lock().await;
-                                res.write_to_stream(&mut stream, cmode).await
+                                res.write_to_stream(&mut stream, cmode, Some(req.method)).await
                             };
                             match write_res {
                                 Ok(()) => {

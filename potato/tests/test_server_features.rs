@@ -33,6 +33,15 @@ mod tests {
         Err(last_err.expect("retry loop must capture error").into())
     }
 
+    fn response_body_bytes(response: &[u8]) -> anyhow::Result<&[u8]> {
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| p + 4)
+            .ok_or_else(|| anyhow::anyhow!("response missing header terminator"))?;
+        Ok(&response[header_end..])
+    }
+
     #[test]
     fn test_connection_header_token_list_parsing_prefers_close() -> anyhow::Result<()> {
         let raw_request = concat!(
@@ -78,6 +87,37 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("request headers should parse completely"))?;
 
         assert!(req.is_websocket());
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_as_bytes_uses_chunked_when_transfer_encoding_present() -> anyhow::Result<()> {
+        let mut req = HttpRequest::new();
+        req.method = potato::HttpMethod::POST;
+        req.url_path = "/chunked".into();
+        req.set_header("Host", "127.0.0.1");
+        req.set_header("Transfer-Encoding", "chunked");
+        req.body = b"Hello".to_vec().into();
+
+        let request_text = String::from_utf8(req.as_bytes())?;
+        assert!(request_text.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!request_text.contains("Content-Length:"));
+        assert!(request_text.ends_with("\r\n\r\n5\r\nHello\r\n0\r\n\r\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_as_bytes_keeps_content_length_without_chunked_header() -> anyhow::Result<()> {
+        let mut req = HttpRequest::new();
+        req.method = potato::HttpMethod::POST;
+        req.url_path = "/plain".into();
+        req.set_header("Host", "127.0.0.1");
+        req.body = b"Hello".to_vec().into();
+
+        let request_text = String::from_utf8(req.as_bytes())?;
+        assert!(!request_text.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(request_text.contains("Content-Length: 5\r\n"));
+        assert!(request_text.ends_with("\r\n\r\nHello"));
         Ok(())
     }
 
@@ -983,6 +1023,118 @@ mod tests {
         stream.read_to_end(&mut response).await?;
         let response_text = String::from_utf8_lossy(&response);
         assert!(response_text.starts_with("HTTP/1.1 204 No Content"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_head_handler_response_never_writes_body() -> anyhow::Result<()> {
+        #[potato::http_head("/head_no_body")]
+        async fn head_no_body(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("must not be sent")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "HEAD /head_no_body HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(response_text.contains("Content-Length: 0\r\n"));
+        assert!(response_body_bytes(&response)?.is_empty());
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_204_response_never_writes_body() -> anyhow::Result<()> {
+        #[potato::http_get("/status_204_no_body")]
+        async fn status_204_no_body(_req: &mut HttpRequest) -> HttpResponse {
+            let mut res = HttpResponse::text("must not be sent");
+            res.http_code = 204;
+            res
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "GET /status_204_no_body HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 204 No Content"));
+        assert!(response_text.contains("Content-Length: 0\r\n"));
+        assert!(response_body_bytes(&response)?.is_empty());
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_304_response_never_writes_body() -> anyhow::Result<()> {
+        #[potato::http_get("/status_304_no_body")]
+        async fn status_304_no_body(_req: &mut HttpRequest) -> HttpResponse {
+            let mut res = HttpResponse::text("must not be sent");
+            res.http_code = 304;
+            res
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "GET /status_304_no_body HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 304 Not Modified"));
+        assert!(response_text.contains("Content-Length: 0\r\n"));
+        assert!(response_body_bytes(&response)?.is_empty());
 
         server_handle.abort();
         Ok(())
