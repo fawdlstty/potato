@@ -229,6 +229,55 @@ pub struct TransferSession {
     pub conns: HashMap<(String, bool, u16), HttpStream>,
 }
 
+fn parse_connection_option_tokens(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_known_hop_by_hop_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Connection")
+        || name.eq_ignore_ascii_case("Keep-Alive")
+        || name.eq_ignore_ascii_case("Proxy-Authenticate")
+        || name.eq_ignore_ascii_case("Proxy-Authorization")
+        || name.eq_ignore_ascii_case("TE")
+        || name.eq_ignore_ascii_case("Trailer")
+        || name.eq_ignore_ascii_case("Transfer-Encoding")
+        || name.eq_ignore_ascii_case("Upgrade")
+        // Widely used de-facto hop-by-hop field in proxy deployments.
+        || name.eq_ignore_ascii_case("Proxy-Connection")
+}
+
+fn strip_hop_by_hop_request_headers(req: &mut HttpRequest) {
+    let connection_tokens = req
+        .get_header_key(HeaderItem::Connection)
+        .map(parse_connection_option_tokens)
+        .unwrap_or_default();
+    req.headers.retain(|key, _| {
+        let header_name = key.to_str();
+        !is_known_hop_by_hop_header(header_name)
+            && !connection_tokens
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case(header_name))
+    });
+}
+
+fn strip_hop_by_hop_response_headers(res: &mut HttpResponse) {
+    let connection_tokens = res
+        .get_header("Connection")
+        .map(parse_connection_option_tokens)
+        .unwrap_or_default();
+    res.headers.retain(|key, _| {
+        let header_name = key.as_ref();
+        !is_known_hop_by_hop_header(header_name)
+            && !connection_tokens
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case(header_name))
+    });
+}
+
 impl TransferSession {
     pub fn from_forward_proxy() -> Self {
         TransferSession {
@@ -416,10 +465,12 @@ impl TransferSession {
             }
         };
 
+        strip_hop_by_hop_request_headers(req);
         req.set_header(HeaderItem::Host, dest_host.clone());
         stream.write_all(&req.as_bytes()).await?;
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
         let (mut res, _) = HttpResponse::from_stream(&mut buf, stream).await?;
+        strip_hop_by_hop_response_headers(&mut res);
 
         if modify_content {
             match res.get_header("Content-Encoding") {
@@ -468,7 +519,6 @@ impl TransferSession {
                     }
                 }
             }
-            res.headers.remove("Transfer-Encoding");
             if let HttpResponseBody::Data(ref body_data) = res.body {
                 res.headers.insert(
                     "Content-Length".to_string().into(),

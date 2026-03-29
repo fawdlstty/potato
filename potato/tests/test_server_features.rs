@@ -809,6 +809,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reverse_proxy_strips_hop_by_hop_request_headers() -> anyhow::Result<()> {
+        #[potato::http_get("/proxy_hop_headers_echo")]
+        async fn proxy_hop_headers_echo(req: &mut HttpRequest) -> HttpResponse {
+            let mut leaked = Vec::new();
+            for header in [
+                "Connection",
+                "Keep-Alive",
+                "Proxy-Authenticate",
+                "Proxy-Authorization",
+                "TE",
+                "Trailer",
+                "Transfer-Encoding",
+                "Upgrade",
+                "Proxy-Connection",
+                "X-Remove-Me",
+            ] {
+                if req.get_header(header).is_some() {
+                    leaked.push(header);
+                }
+            }
+            HttpResponse::text(leaked.join(","))
+        }
+
+        let backend_port = get_test_port();
+        let backend_addr = format!("127.0.0.1:{}", backend_port);
+        let mut backend_server = HttpServer::new(&backend_addr);
+        let backend_handle = tokio::spawn(async move {
+            let _ = backend_server.serve_http().await;
+        });
+
+        let proxy_port = get_test_port();
+        let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+        let mut proxy_server = HttpServer::new(&proxy_addr);
+        proxy_server.configure(|ctx| {
+            ctx.use_reverse_proxy("/proxy", format!("http://{}", backend_addr), false);
+        });
+        let proxy_handle = tokio::spawn(async move {
+            let _ = proxy_server.serve_http().await;
+        });
+
+        sleep(Duration::from_millis(350)).await;
+
+        let mut stream = connect_with_retry(&proxy_addr).await?;
+        let request = format!(
+            concat!(
+                "GET /proxy/proxy_hop_headers_echo HTTP/1.1\r\n",
+                "Host: {}\r\n",
+                "Connection: close, X-Remove-Me\r\n",
+                "Keep-Alive: timeout=5\r\n",
+                "Proxy-Authenticate: Basic realm=\"proxy\"\r\n",
+                "Proxy-Authorization: Basic dGVzdDp0ZXN0\r\n",
+                "TE: trailers\r\n",
+                "Trailer: X-Trace\r\n",
+                "Upgrade: websocket\r\n",
+                "Proxy-Connection: keep-alive\r\n",
+                "X-Remove-Me: leaked\r\n",
+                "\r\n"
+            ),
+            proxy_addr
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        let body = response_body_bytes(&response)?;
+        assert!(body.is_empty());
+
+        proxy_handle.abort();
+        backend_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reverse_proxy_strips_hop_by_hop_response_headers() -> anyhow::Result<()> {
+        #[potato::http_get("/proxy_hop_response_headers")]
+        async fn proxy_hop_response_headers(_req: &mut HttpRequest) -> HttpResponse {
+            let mut res = HttpResponse::text("proxy hop headers stripped");
+            res.add_header("Connection".into(), "keep-alive, X-Upstream-Hop".into());
+            res.add_header("Keep-Alive".into(), "timeout=5".into());
+            res.add_header("Proxy-Authenticate".into(), "Basic realm=\"proxy\"".into());
+            res.add_header("Proxy-Authorization".into(), "Basic dGVzdDp0ZXN0".into());
+            res.add_header("TE".into(), "trailers".into());
+            res.add_header("Trailer".into(), "X-Trace".into());
+            res.add_header("Transfer-Encoding".into(), "chunked".into());
+            res.add_header("Upgrade".into(), "h2c".into());
+            res.add_header("Proxy-Connection".into(), "keep-alive".into());
+            res.add_header("X-Upstream-Hop".into(), "1".into());
+            res
+        }
+
+        let backend_port = get_test_port();
+        let backend_addr = format!("127.0.0.1:{}", backend_port);
+        let mut backend_server = HttpServer::new(&backend_addr);
+        let backend_handle = tokio::spawn(async move {
+            let _ = backend_server.serve_http().await;
+        });
+
+        let proxy_port = get_test_port();
+        let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+        let mut proxy_server = HttpServer::new(&proxy_addr);
+        proxy_server.configure(|ctx| {
+            ctx.use_reverse_proxy("/proxy", format!("http://{}", backend_addr), false);
+        });
+        let proxy_handle = tokio::spawn(async move {
+            let _ = proxy_server.serve_http().await;
+        });
+
+        sleep(Duration::from_millis(350)).await;
+
+        let mut stream = connect_with_retry(&proxy_addr).await?;
+        let request = format!(
+            "GET /proxy/proxy_hop_response_headers HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            proxy_addr
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(!response_text.contains("Connection: keep-alive"));
+        assert!(!response_text.contains("Keep-Alive:"));
+        assert!(!response_text.contains("Proxy-Authenticate:"));
+        assert!(!response_text.contains("Proxy-Authorization:"));
+        assert!(!response_text.contains("TE:"));
+        assert!(!response_text.contains("Trailer:"));
+        assert!(!response_text.contains("Transfer-Encoding:"));
+        assert!(!response_text.contains("Upgrade:"));
+        assert!(!response_text.contains("Proxy-Connection:"));
+        assert!(!response_text.contains("X-Upstream-Hop:"));
+        assert!(response_text.contains("proxy hop headers stripped"));
+
+        proxy_handle.abort();
+        backend_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_server_rejects_authority_form_for_non_connect() -> anyhow::Result<()> {
         let port = get_test_port();
         let server_addr = format!("127.0.0.1:{}", port);
