@@ -15,6 +15,7 @@ fn get_test_port() -> u16 {
 mod tests {
     use super::*;
     use potato::{HttpRequest, HttpResponse, HttpServer};
+    use potato::utils::enums::HttpConnection;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -30,6 +31,54 @@ mod tests {
             }
         }
         Err(last_err.expect("retry loop must capture error").into())
+    }
+
+    #[test]
+    fn test_connection_header_token_list_parsing_prefers_close() -> anyhow::Result<()> {
+        let raw_request = concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: keep-alive, close\r\n",
+            "\r\n"
+        );
+        let (req, _) = HttpRequest::from_headers_part(raw_request.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("request headers should parse completely"))?;
+
+        assert_eq!(req.get_header_connection(), HttpConnection::Close);
+        Ok(())
+    }
+
+    #[test]
+    fn test_connection_header_token_list_detects_upgrade_case_insensitive() -> anyhow::Result<()> {
+        let raw_request = concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: keep-alive, UpGrAdE\r\n",
+            "\r\n"
+        );
+        let (req, _) = HttpRequest::from_headers_part(raw_request.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("request headers should parse completely"))?;
+
+        assert_eq!(req.get_header_connection(), HttpConnection::Upgrade);
+        Ok(())
+    }
+
+    #[test]
+    fn test_websocket_detection_accepts_mixed_connection_tokens() -> anyhow::Result<()> {
+        let raw_request = concat!(
+            "GET /ws HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: keep-alive, Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        );
+        let (req, _) = HttpRequest::from_headers_part(raw_request.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("request headers should parse completely"))?;
+
+        assert!(req.is_websocket());
+        Ok(())
     }
 
     /// 测试服务器创建和基本配置

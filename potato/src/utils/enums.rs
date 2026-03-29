@@ -9,12 +9,24 @@ pub enum HttpConnection {
 
 impl HttpConnection {
     pub fn from_str(val: &str) -> Option<Self> {
-        match val.len() {
-            5 if val.eq_ignore_ascii_case("Close") => Some(Self::Close),
-            7 if val.eq_ignore_ascii_case("Upgrade") => Some(Self::Upgrade),
-            10 if val.eq_ignore_ascii_case("Keep-Alive") => Some(Self::KeepAlive),
-            _ => None,
+        let mut parsed = None;
+        for token in val
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            match token.len() {
+                5 if token.eq_ignore_ascii_case("Close") => return Some(Self::Close),
+                7 if token.eq_ignore_ascii_case("Upgrade") => parsed = Some(Self::Upgrade),
+                10 if token.eq_ignore_ascii_case("Keep-Alive") => {
+                    if parsed.is_none() {
+                        parsed = Some(Self::KeepAlive);
+                    }
+                }
+                _ => {}
+            }
         }
+        parsed
     }
 }
 
