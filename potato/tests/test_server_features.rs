@@ -17,7 +17,7 @@ mod tests {
     use potato::{HttpRequest, HttpResponse, HttpServer};
     use potato::utils::enums::HttpConnection;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpListener, TcpStream};
 
     async fn connect_with_retry(addr: &str) -> anyhow::Result<TcpStream> {
         let mut last_err = None;
@@ -118,6 +118,47 @@ mod tests {
         assert!(!request_text.contains("Transfer-Encoding: chunked\r\n"));
         assert!(request_text.contains("Content-Length: 5\r\n"));
         assert!(request_text.ends_with("\r\n\r\nHello"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_client_decodes_all_chunked_response_chunks() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind(&server_addr).await?;
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut req_buf = [0_u8; 1024];
+            let _ = socket.read(&mut req_buf).await?;
+
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "5\r\nHello\r\n",
+                "1\r\n \r\n",
+                "5\r\nWorld\r\n",
+                "1\r\n!\r\n",
+                "0\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await?;
+            socket.shutdown().await?;
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let url = format!("http://{}/chunked-resp", server_addr);
+        let res = potato::get(&url, vec![]).await?;
+        server_task.await??;
+
+        let body = match res.body {
+            potato::HttpResponseBody::Data(data) => data,
+            potato::HttpResponseBody::Stream(_) => vec![],
+        };
+        assert_eq!(body, b"Hello World!".to_vec());
+
         Ok(())
     }
 

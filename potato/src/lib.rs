@@ -1739,6 +1739,7 @@ impl HttpResponse {
             .get("Transfer-Encoding")
             .is_some_and(|v| v == "chunked")
         {
+            let mut chunked_body = Vec::new();
             loop {
                 let chunked_len = {
                     let mut chunked_len = 0;
@@ -1774,13 +1775,10 @@ impl HttpResponse {
                 while hdr_len + bdy_len + chunked_len + 2 > buf.len() {
                     buf.extend_by_streams(stream).await?;
                 }
-                res.body = HttpResponseBody::Data({
-                    let mut tmp = vec![];
-                    tmp.extend(&buf[(hdr_len + bdy_len)..(hdr_len + bdy_len + chunked_len)]);
-                    tmp
-                });
+                chunked_body.extend(&buf[(hdr_len + bdy_len)..(hdr_len + bdy_len + chunked_len)]);
                 bdy_len += chunked_len + 2;
             }
+            res.body = HttpResponseBody::Data(chunked_body);
         }
 
         Ok((res, hdr_len + bdy_len))
