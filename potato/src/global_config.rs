@@ -1,5 +1,6 @@
 use crate::utils::string::StringUtil;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -8,6 +9,8 @@ static SERVER_JWT_SECRET: LazyLock<RwLock<String>> =
     LazyLock::new(|| RwLock::new(StringUtil::rand(32)));
 static SERVER_WS_PING_DURATION: LazyLock<RwLock<Duration>> =
     LazyLock::new(|| RwLock::new(Duration::from_secs(60)));
+static SERVER_MAX_HEADER_COUNT: AtomicUsize = AtomicUsize::new(48);
+static SERVER_MAX_HEADER_BYTES: AtomicUsize = AtomicUsize::new(16 * 1024);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -31,6 +34,22 @@ impl ServerConfig {
 
     pub async fn get_ws_ping_duration() -> Duration {
         SERVER_WS_PING_DURATION.read().await.clone()
+    }
+
+    pub fn set_max_header_count(limit: usize) {
+        SERVER_MAX_HEADER_COUNT.store(limit.max(1), Ordering::Relaxed);
+    }
+
+    pub fn get_max_header_count() -> usize {
+        SERVER_MAX_HEADER_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub fn set_max_header_bytes(limit: usize) {
+        SERVER_MAX_HEADER_BYTES.store(limit.max(1), Ordering::Relaxed);
+    }
+
+    pub fn get_max_header_bytes() -> usize {
+        SERVER_MAX_HEADER_BYTES.load(Ordering::Relaxed)
     }
 }
 

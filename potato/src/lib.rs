@@ -64,6 +64,7 @@ pub enum PreflightResult {
 pub enum HttpRequestParseError {
     BadRequest(String),
     ExpectationFailed(String),
+    RequestHeaderFieldsTooLarge(String),
 }
 
 impl fmt::Display for HttpRequestParseError {
@@ -71,6 +72,7 @@ impl fmt::Display for HttpRequestParseError {
         match self {
             HttpRequestParseError::BadRequest(msg) => write!(f, "{msg}"),
             HttpRequestParseError::ExpectationFailed(msg) => write!(f, "{msg}"),
+            HttpRequestParseError::RequestHeaderFieldsTooLarge(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -452,11 +454,16 @@ impl HttpRequest {
         anyhow::Error::new(HttpRequestParseError::ExpectationFailed(msg.into()))
     }
 
+    fn request_header_fields_too_large(msg: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(HttpRequestParseError::RequestHeaderFieldsTooLarge(msg.into()))
+    }
+
     pub fn bad_request_message(err: &anyhow::Error) -> Option<&str> {
         err.downcast_ref::<HttpRequestParseError>()
             .and_then(|parse_err| match parse_err {
                 HttpRequestParseError::BadRequest(msg) => Some(msg.as_str()),
                 HttpRequestParseError::ExpectationFailed(_) => None,
+                HttpRequestParseError::RequestHeaderFieldsTooLarge(_) => None,
             })
     }
 
@@ -466,12 +473,28 @@ impl HttpRequest {
                 let (status, msg) = match parse_err {
                     HttpRequestParseError::BadRequest(msg) => (400, msg.as_str()),
                     HttpRequestParseError::ExpectationFailed(msg) => (417, msg.as_str()),
+                    HttpRequestParseError::RequestHeaderFieldsTooLarge(msg) => {
+                        (431, msg.as_str())
+                    }
                 };
                 let mut res = HttpResponse::text(msg.to_string());
                 res.http_code = status;
                 res.add_header("Connection".into(), "close".into());
                 res
             })
+    }
+
+    fn ensure_header_section_size(buf: &[u8], max_header_bytes: usize) -> anyhow::Result<()> {
+        let header_len = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(pos) => pos + 4,
+            None => buf.len(),
+        };
+        if header_len > max_header_bytes {
+            Err(Self::request_header_fields_too_large(format!(
+                "request headers too large: {header_len} bytes exceeds {max_header_bytes} bytes"
+            )))?;
+        }
+        Ok(())
     }
 
     async fn process_expect_header(
@@ -1089,15 +1112,31 @@ impl HttpRequest {
     }
 
     pub fn from_headers_part(buf: &[u8]) -> anyhow::Result<Option<(Self, usize)>> {
-        let mut headers = [httparse::EMPTY_HEADER; 48];
+        let max_header_count = ServerConfig::get_max_header_count();
+        let max_header_bytes = ServerConfig::get_max_header_bytes();
+        Self::ensure_header_section_size(buf, max_header_bytes)?;
+
+        let mut headers = vec![httparse::EMPTY_HEADER; max_header_count];
         let (rreq, n) = {
             let mut req = httparse::Request::new(&mut headers);
-            let n = match httparse::ParserConfig::default().parse_request(&mut req, buf)? {
-                httparse::Status::Complete(n) => n,
-                httparse::Status::Partial => return Ok(None),
+            let n = match httparse::ParserConfig::default().parse_request(&mut req, buf) {
+                Ok(httparse::Status::Complete(n)) => n,
+                Ok(httparse::Status::Partial) => return Ok(None),
+                Err(httparse::Error::TooManyHeaders) => {
+                    Err(Self::request_header_fields_too_large(format!(
+                        "too many request headers: exceeds configured limit {max_header_count}"
+                    )))?
+                }
+                Err(err) => Err(anyhow!(err))?,
             };
             (req, n)
         };
+        let parsed_header_count = rreq.headers.iter().filter(|h| !h.name.is_empty()).count();
+        if parsed_header_count > max_header_count {
+            Err(Self::request_header_fields_too_large(format!(
+                "too many request headers: {parsed_header_count} exceeds {max_header_count}"
+            )))?;
+        }
         let mut req = HttpRequest::new();
         let mut content_length_seen: Option<String> = None;
         let mut host_header_count = 0usize;
@@ -1939,5 +1978,30 @@ mod tests {
         let mut req = HttpRequest::new();
         req.set_header("Accept-Encoding", "gzip;q=xyz");
         assert_eq!(req.get_header_accept_encoding(), CompressMode::None);
+    }
+
+    #[test]
+    fn request_parser_returns_431_for_too_many_headers() {
+        let mut raw = String::from("GET / HTTP/1.1\r\nHost: example.com\r\n");
+        for i in 0..64 {
+            raw.push_str(&format!("X-Header-{i}: value\r\n"));
+        }
+        raw.push_str("\r\n");
+
+        let err = HttpRequest::from_headers_part(raw.as_bytes()).unwrap_err();
+        let res = HttpRequest::parse_error_response(&err).unwrap();
+        assert_eq!(res.http_code, 431);
+    }
+
+    #[test]
+    fn request_parser_returns_431_for_oversized_header_section() {
+        let oversized = "a".repeat(20 * 1024);
+        let raw = format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nX-Large: {oversized}\r\n\r\n"
+        );
+
+        let err = HttpRequest::from_headers_part(raw.as_bytes()).unwrap_err();
+        let res = HttpRequest::parse_error_response(&err).unwrap();
+        assert_eq!(res.http_code, 431);
     }
 }
