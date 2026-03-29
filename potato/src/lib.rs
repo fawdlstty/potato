@@ -680,17 +680,86 @@ impl HttpRequest {
     }
 
     pub fn get_header_accept_encoding(&self) -> CompressMode {
-        for item in self
-            .get_header_key(HeaderItem::Accept_Encoding)
-            .unwrap_or("")
-            .split(',')
-        {
-            match item.trim() {
-                "gzip" => return CompressMode::Gzip,
-                _ => continue,
-            };
+        Self::negotiate_accept_encoding(self.get_header_key(HeaderItem::Accept_Encoding).unwrap_or(""))
+    }
+
+    fn negotiate_accept_encoding(header: &str) -> CompressMode {
+        let mut explicit_gzip_q: Option<u16> = None;
+        let mut wildcard_q: Option<u16> = None;
+
+        for item in header.split(',') {
+            let trimmed = item.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let mut parts = trimmed.split(';');
+            let coding = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+            if coding.is_empty() {
+                continue;
+            }
+
+            let mut quality = 1000u16;
+            let mut malformed_q = false;
+            for param in parts {
+                let param = param.trim();
+                if param.is_empty() {
+                    continue;
+                }
+                let mut key_val = param.splitn(2, '=');
+                let key = key_val.next().unwrap_or("").trim().to_ascii_lowercase();
+                if key != "q" {
+                    continue;
+                }
+                let val = key_val.next().unwrap_or("").trim();
+                if let Some(parsed_q) = Self::parse_qvalue_thousandths(val) {
+                    quality = parsed_q;
+                } else {
+                    malformed_q = true;
+                }
+                break;
+            }
+
+            if malformed_q {
+                continue;
+            }
+
+            match coding.as_str() {
+                "gzip" => {
+                    explicit_gzip_q = Some(explicit_gzip_q.map_or(quality, |prev| prev.max(quality)));
+                }
+                "*" => {
+                    wildcard_q = Some(wildcard_q.map_or(quality, |prev| prev.max(quality)));
+                }
+                _ => {}
+            }
         }
-        CompressMode::None
+
+        let selected_q = explicit_gzip_q.or(wildcard_q).unwrap_or(0);
+        if selected_q > 0 {
+            CompressMode::Gzip
+        } else {
+            CompressMode::None
+        }
+    }
+
+    fn parse_qvalue_thousandths(raw: &str) -> Option<u16> {
+        let val = raw.trim();
+        if val == "1" || val == "1.0" || val == "1.00" || val == "1.000" {
+            return Some(1000);
+        }
+        if val == "0" {
+            return Some(0);
+        }
+        let frac = val.strip_prefix("0.")?;
+        if frac.is_empty() || frac.len() > 3 || !frac.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        let mut digits = frac.to_string();
+        while digits.len() < 3 {
+            digits.push('0');
+        }
+        digits.parse::<u16>().ok()
     }
 
     pub fn get_header_host(&self) -> Option<&str> {
@@ -1831,4 +1900,44 @@ pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
         }
     }
     ret
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompressMode, HttpRequest};
+
+    #[test]
+    fn accept_encoding_supports_simple_gzip_token() {
+        let mut req = HttpRequest::new();
+        req.set_header("Accept-Encoding", "gzip");
+        assert_eq!(req.get_header_accept_encoding(), CompressMode::Gzip);
+    }
+
+    #[test]
+    fn accept_encoding_supports_qvalue_for_gzip() {
+        let mut req = HttpRequest::new();
+        req.set_header("Accept-Encoding", "br;q=1, gzip;q=0.3");
+        assert_eq!(req.get_header_accept_encoding(), CompressMode::Gzip);
+    }
+
+    #[test]
+    fn accept_encoding_uses_wildcard_when_gzip_not_listed() {
+        let mut req = HttpRequest::new();
+        req.set_header("Accept-Encoding", "br;q=1, *;q=0.8");
+        assert_eq!(req.get_header_accept_encoding(), CompressMode::Gzip);
+    }
+
+    #[test]
+    fn accept_encoding_respects_explicit_gzip_zero_over_wildcard() {
+        let mut req = HttpRequest::new();
+        req.set_header("Accept-Encoding", "gzip;q=0, *;q=1");
+        assert_eq!(req.get_header_accept_encoding(), CompressMode::None);
+    }
+
+    #[test]
+    fn accept_encoding_ignores_invalid_qvalue() {
+        let mut req = HttpRequest::new();
+        req.set_header("Accept-Encoding", "gzip;q=xyz");
+        assert_eq!(req.get_header_accept_encoding(), CompressMode::None);
+    }
 }
