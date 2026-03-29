@@ -1,6 +1,7 @@
 use crate::utils::enums::HttpConnection;
 use crate::utils::refstr::HeaderItem;
 use crate::utils::tcp_stream::HttpStream;
+use crate::CompressMode;
 use crate::{HttpHandler, HttpMethod, HttpRequest, HttpResponse, PreflightResult};
 use crate::{RequestHandlerFlag, TransferSession};
 use std::any::TypeId;
@@ -904,6 +905,13 @@ pub struct HttpServer {
 }
 
 impl HttpServer {
+    fn bad_request_response(payload: impl Into<String>) -> HttpResponse {
+        let mut res = HttpResponse::text(payload.into());
+        res.http_code = 400;
+        res.add_header("Connection".into(), "close".into());
+        res
+    }
+
     pub fn new(addr: impl Into<String>) -> Self {
         HttpServer {
             addr: addr.into(),
@@ -974,7 +982,16 @@ impl HttpServer {
                     let (mut req, n) = {
                         match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
                             Ok((req, n)) => (req, n),
-                            Err(_) => break,
+                            Err(err) => {
+                                if let Some(msg) = HttpRequest::bad_request_message(&err) {
+                                    let mut stream_guard = stream.lock().await;
+                                    let mut res = Self::bad_request_response(msg.to_string());
+                                    let _ = res
+                                        .write_to_stream(&mut stream_guard, CompressMode::None)
+                                        .await;
+                                }
+                                break;
+                            }
                         }
                     };
                     req.client_addr = Some(client_addr);
@@ -1049,7 +1066,16 @@ impl HttpServer {
                     let (mut req, n) = {
                         match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
                             Ok((req, n)) => (req, n),
-                            Err(_) => break,
+                            Err(err) => {
+                                if let Some(msg) = HttpRequest::bad_request_message(&err) {
+                                    let mut stream_guard = stream.lock().await;
+                                    let mut res = Self::bad_request_response(msg.to_string());
+                                    let _ = res
+                                        .write_to_stream(&mut stream_guard, CompressMode::None)
+                                        .await;
+                                }
+                                break;
+                            }
                         }
                     };
                     req.client_addr = Some(client_addr);

@@ -277,6 +277,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_server_rejects_http11_request_without_host() -> anyhow::Result<()> {
+        #[potato::http_get("/host_required_missing")]
+        async fn host_required_missing(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("should not reach")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "GET /host_required_missing HTTP/1.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response_text.contains("missing required Host header"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_http11_request_with_empty_host() -> anyhow::Result<()> {
+        #[potato::http_get("/host_required_empty")]
+        async fn host_required_empty(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("should not reach")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "GET /host_required_empty HTTP/1.1\r\n",
+            "Host:   \r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response_text.contains("empty Host header"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_http11_request_with_duplicate_host() -> anyhow::Result<()> {
+        #[potato::http_get("/host_required_duplicate")]
+        async fn host_required_duplicate(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("should not reach")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "GET /host_required_duplicate HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Host: example.com\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response_text.contains("multiple Host headers are not allowed"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_http11_request_with_invalid_host() -> anyhow::Result<()> {
+        #[potato::http_get("/host_required_invalid")]
+        async fn host_required_invalid(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("should not reach")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "GET /host_required_invalid HTTP/1.1\r\n",
+            "Host: bad host\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response_text.contains("invalid Host header"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_chunked_form_body_keeps_existing_body_pair_parsing() -> anyhow::Result<()> {
         #[potato::http_post("/chunked_form_parse")]
         async fn chunked_form_parse(req: &mut HttpRequest) -> HttpResponse {

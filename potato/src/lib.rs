@@ -30,10 +30,12 @@ use sha1::{Digest, Sha1};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::fmt;
 use std::fs::{File, Metadata};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 use std::{collections::HashMap, future::Future, pin::Pin};
@@ -57,6 +59,21 @@ pub enum PreflightResult {
     /// Return 412 Precondition Failed
     PreconditionFailed,
 }
+
+#[derive(Debug)]
+pub enum HttpRequestParseError {
+    BadRequest(String),
+}
+
+impl fmt::Display for HttpRequestParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HttpRequestParseError::BadRequest(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for HttpRequestParseError {}
 
 /// Parse HTTP date format to Unix timestamp
 /// Supports RFC 7231 standard HTTP date formats:
@@ -416,6 +433,16 @@ unsafe impl Send for HttpRequest {}
 unsafe impl Sync for HttpRequest {}
 
 impl HttpRequest {
+    fn bad_request(msg: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(HttpRequestParseError::BadRequest(msg.into()))
+    }
+
+    pub fn bad_request_message(err: &anyhow::Error) -> Option<&str> {
+        err.downcast_ref::<HttpRequestParseError>().map(|parse_err| match parse_err {
+            HttpRequestParseError::BadRequest(msg) => msg.as_str(),
+        })
+    }
+
     pub fn new() -> Self {
         Self {
             method: HttpMethod::GET,
@@ -862,6 +889,8 @@ impl HttpRequest {
         };
         let mut req = HttpRequest::new();
         let mut content_length_seen: Option<String> = None;
+        let mut host_header_count = 0usize;
+        let mut has_valid_host = false;
         req.method = {
             let method = rreq.method.unwrap();
             match method.len() {
@@ -903,8 +932,9 @@ impl HttpRequest {
                 break;
             }
             let header_value = str::from_utf8(h.value)?;
+            let normalized_header_value = header_value.trim();
             if h.name.eq_ignore_ascii_case("Content-Length") {
-                let cl = header_value.trim();
+                let cl = normalized_header_value;
                 if cl.is_empty() {
                     Err(anyhow!("empty Content-Length header"))?;
                 }
@@ -916,10 +946,26 @@ impl HttpRequest {
                     content_length_seen = Some(cl.to_string());
                 }
             }
+            if h.name.eq_ignore_ascii_case("Host") {
+                host_header_count += 1;
+                if host_header_count > 1 {
+                    Err(Self::bad_request("multiple Host headers are not allowed"))?;
+                }
+                if normalized_header_value.is_empty() {
+                    Err(Self::bad_request("empty Host header"))?;
+                }
+                if http::uri::Authority::from_str(normalized_header_value).is_err() {
+                    Err(Self::bad_request("invalid Host header"))?;
+                }
+                has_valid_host = true;
+            }
             req.headers.insert(
                 HeaderOrHipStr::from_str(h.name),
-                LocalHipStr::from(header_value),
+                LocalHipStr::from(normalized_header_value),
             );
+        }
+        if req.version >= 11 && !has_valid_host {
+            Err(Self::bad_request("missing required Host header"))?;
         }
         Ok(Some((req, n)))
     }
