@@ -551,6 +551,109 @@ impl HttpRequest {
             .map_or(0, |val| val.parse::<usize>().unwrap_or(0))
     }
 
+    fn parse_header_content_length(&self) -> anyhow::Result<Option<usize>> {
+        let Some(raw_val) = self.get_header_key(HeaderItem::Content_Length) else {
+            return Ok(None);
+        };
+        let value = raw_val.trim();
+        if value.is_empty() {
+            Err(anyhow!("empty Content-Length header"))?
+        }
+        Ok(Some(value.parse::<usize>()?))
+    }
+
+    fn has_chunked_transfer_encoding(&self) -> anyhow::Result<bool> {
+        let Some(raw_val) = self.get_header_key(HeaderItem::Transfer_Encoding) else {
+            return Ok(false);
+        };
+        let codings: Vec<String> = raw_val
+            .split(',')
+            .map(|part| part.trim().to_ascii_lowercase())
+            .filter(|part| !part.is_empty())
+            .collect();
+        if codings.is_empty() {
+            Err(anyhow!("empty Transfer-Encoding header"))?
+        }
+        if codings.len() == 1 && codings[0] == "chunked" {
+            return Ok(true);
+        }
+        Err(anyhow!("unsupported Transfer-Encoding: {raw_val}"))
+    }
+
+    async fn read_chunked_body(
+        buf: &mut Vec<u8>,
+        stream: &mut HttpStream,
+        hdr_len: usize,
+    ) -> anyhow::Result<(LocalHipByt<'static>, usize)> {
+        let mut cursor = hdr_len;
+        let mut body = Vec::new();
+        let mut tmp_buf = [0u8; 4096];
+
+        loop {
+            let line_end = loop {
+                if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n") {
+                    break cursor + pos;
+                }
+                let n = stream.read(&mut tmp_buf).await?;
+                if n == 0 {
+                    Err(anyhow::Error::msg("connection closed"))?;
+                }
+                buf.extend(&tmp_buf[..n]);
+            };
+
+            let chunk_size = {
+                let size_line = str::from_utf8(&buf[cursor..line_end])?;
+                let size_token = size_line
+                    .split_once(';')
+                    .map_or(size_line, |(size, _)| size)
+                    .trim();
+                if size_token.is_empty() {
+                    Err(anyhow!("invalid chunk size"))?;
+                }
+                usize::from_str_radix(size_token, 16)?
+            };
+            cursor = line_end + 2;
+
+            if chunk_size == 0 {
+                let trailer_end = loop {
+                    let line_start = cursor;
+                    let line_end = loop {
+                        if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n")
+                        {
+                            break cursor + pos;
+                        }
+                        let n = stream.read(&mut tmp_buf).await?;
+                        if n == 0 {
+                            Err(anyhow::Error::msg("connection closed"))?;
+                        }
+                        buf.extend(&tmp_buf[..n]);
+                    };
+                    cursor = line_end + 2;
+                    if line_end == line_start {
+                        break cursor;
+                    }
+                };
+                cursor = trailer_end;
+                break;
+            }
+
+            while buf.len() < cursor + chunk_size + 2 {
+                let n = stream.read(&mut tmp_buf).await?;
+                if n == 0 {
+                    Err(anyhow::Error::msg("connection closed"))?;
+                }
+                buf.extend(&tmp_buf[..n]);
+            }
+            body.extend_from_slice(&buf[cursor..cursor + chunk_size]);
+            if &buf[cursor + chunk_size..cursor + chunk_size + 2] != b"\r\n" {
+                Err(anyhow!("invalid chunk terminator"))?;
+            }
+            cursor += chunk_size + 2;
+        }
+
+        Ok((LocalHipByt::from(body), cursor - hdr_len))
+    }
+
     pub fn get_header_content_type<'a>(&'a self) -> Option<HttpContentType<'a>> {
         HttpContentType::from_str(self.get_header_key(HeaderItem::Content_Type).unwrap_or(""))
     }
@@ -630,18 +733,31 @@ impl HttpRequest {
                 None => continue,
             }
         };
-        let bdy_len = req.get_header_content_length();
-        while hdr_len + bdy_len > buf.len() {
-            let t = stream.read(&mut tmp_buf).await?;
-            if t == 0 {
-                return Err(anyhow::Error::msg("connection closed"));
+        let has_chunked_transfer_encoding = req.has_chunked_transfer_encoding()?;
+        let bdy_len;
+        if has_chunked_transfer_encoding {
+            if req.get_header_key(HeaderItem::Content_Length).is_some() {
+                Err(anyhow!(
+                    "conflicting headers: Transfer-Encoding and Content-Length"
+                ))?;
             }
-            buf.extend(&tmp_buf[0..t]);
+            let (body, consumed_len) = Self::read_chunked_body(buf, stream, hdr_len).await?;
+            req.body = body;
+            bdy_len = consumed_len;
+        } else {
+            let content_length = req.parse_header_content_length()?.unwrap_or(0);
+            while hdr_len + content_length > buf.len() {
+                let t = stream.read(&mut tmp_buf).await?;
+                if t == 0 {
+                    return Err(anyhow::Error::msg("connection closed"));
+                }
+                buf.extend(&tmp_buf[0..t]);
+            }
+            if content_length > 0 {
+                req.body = LocalHipByt::from(&buf[hdr_len..hdr_len + content_length]);
+            }
+            bdy_len = content_length;
         }
-        if bdy_len == 0 {
-            return Ok((req, hdr_len));
-        }
-        req.body = LocalHipByt::from(&buf[hdr_len..hdr_len + bdy_len]);
 
         // 先获取Content-Type的字符串值，避免借用冲突
         let content_type_str = {
@@ -745,6 +861,7 @@ impl HttpRequest {
             (req, n)
         };
         let mut req = HttpRequest::new();
+        let mut content_length_seen: Option<String> = None;
         req.method = {
             let method = rreq.method.unwrap();
             match method.len() {
@@ -785,9 +902,23 @@ impl HttpRequest {
             if h.name == "" {
                 break;
             }
+            let header_value = str::from_utf8(h.value)?;
+            if h.name.eq_ignore_ascii_case("Content-Length") {
+                let cl = header_value.trim();
+                if cl.is_empty() {
+                    Err(anyhow!("empty Content-Length header"))?;
+                }
+                if let Some(prev) = &content_length_seen {
+                    if prev != cl {
+                        Err(anyhow!("conflicting duplicate Content-Length headers"))?;
+                    }
+                } else {
+                    content_length_seen = Some(cl.to_string());
+                }
+            }
             req.headers.insert(
                 HeaderOrHipStr::from_str(h.name),
-                LocalHipStr::from(str::from_utf8(h.value)?),
+                LocalHipStr::from(header_value),
             );
         }
         Ok(Some((req, n)))

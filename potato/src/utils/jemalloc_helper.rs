@@ -1,3 +1,5 @@
+#[cfg(not(target_os = "windows"))]
+use crate::utils::process::ProgramRunner;
 use anyhow::anyhow;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_os = "windows"))]
@@ -6,8 +8,6 @@ use tikv_jemalloc_ctl::*;
 use tokio::fs::{self, File};
 #[cfg(not(target_os = "windows"))]
 use tokio::io::AsyncReadExt;
-#[cfg(not(target_os = "windows"))]
-use crate::utils::process::ProgramRunner;
 
 #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 #[global_allocator]
@@ -91,7 +91,5 @@ pub async fn dump_jemalloc_profile() -> anyhow::Result<Vec<u8>> {
 
 #[cfg(target_os = "windows")]
 pub async fn dump_jemalloc_profile() -> anyhow::Result<Vec<u8>> {
-    Err(anyhow!(
-        "jemalloc profile dump is not available on Windows"
-    ))
+    Err(anyhow!("jemalloc profile dump is not available on Windows"))
 }

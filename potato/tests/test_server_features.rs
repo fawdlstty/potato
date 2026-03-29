@@ -2,6 +2,7 @@
 /// 测试可以不依赖特定路由实现的功能
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
+use std::{env, fs};
 use tokio::time::sleep;
 
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(26000);
@@ -13,7 +14,23 @@ fn get_test_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use potato::HttpServer;
+    use potato::{HttpRequest, HttpResponse, HttpServer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    async fn connect_with_retry(addr: &str) -> anyhow::Result<TcpStream> {
+        let mut last_err = None;
+        for _ in 0..10 {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) => {
+                    last_err = Some(err);
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        Err(last_err.expect("retry loop must capture error").into())
+    }
 
     /// 测试服务器创建和基本配置
     #[tokio::test]
@@ -174,6 +191,417 @@ mod tests {
         // let _shutdown_tx2 = server.shutdown_signal();
 
         println!("✅ Shutdown signal correctly allows only one acquisition");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_accepts_chunked_request_body() -> anyhow::Result<()> {
+        #[potato::http_post("/chunked_req_echo")]
+        async fn chunked_req_echo(req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text(String::from_utf8_lossy(&req.body).to_string())
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "POST /chunked_req_echo HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "5\r\n",
+            "Hello\r\n",
+            "6\r\n",
+            " World\r\n",
+            "0\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+
+        assert!(response_text.starts_with("HTTP/1.1 200"));
+        assert!(response_text.contains("Hello World"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_transfer_encoding_content_length_conflict() -> anyhow::Result<()> {
+        #[potato::http_post("/chunked_req_conflict")]
+        async fn chunked_req_conflict(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("should not reach")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "POST /chunked_req_conflict HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Content-Length: 100\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "5\r\n",
+            "Hello\r\n",
+            "0\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        assert!(response.is_empty());
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chunked_form_body_keeps_existing_body_pair_parsing() -> anyhow::Result<()> {
+        #[potato::http_post("/chunked_form_parse")]
+        async fn chunked_form_parse(req: &mut HttpRequest) -> HttpResponse {
+            let name = req.body_pairs.get("name").map_or("", |v| v.as_ref());
+            HttpResponse::text(name.to_string())
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "POST /chunked_form_parse HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Content-Type: application/x-www-form-urlencoded\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "a\r\n",
+            "name=alice\r\n",
+            "0\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200"));
+        assert!(response_text.contains("alice"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_unsupported_transfer_encoding_chain() -> anyhow::Result<()> {
+        #[potato::http_post("/chunked_te_chain")]
+        async fn chunked_te_chain(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("should not reach")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "POST /chunked_te_chain HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "5\r\n",
+            "Hello\r\n",
+            "0\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        assert!(response.is_empty());
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_connect_method_with_status() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "CONNECT example.com:443 HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 501 Not Implemented"));
+        assert!(response_text.contains("CONNECT method is not implemented"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_head_fallback_uses_get_status_without_body() -> anyhow::Result<()> {
+        #[potato::http_get("/head_fallback_get")]
+        async fn head_fallback_get(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("head fallback payload")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "HEAD /head_fallback_get HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(!response_text.contains("head fallback payload"));
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| p + 4)
+            .ok_or_else(|| anyhow::anyhow!("response missing header terminator"))?;
+        assert_eq!(response.len(), header_end);
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "HEAD /head_fallback_missing HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(!response_text.contains("404 not found"));
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| p + 4)
+            .ok_or_else(|| anyhow::anyhow!("response missing header terminator"))?;
+        assert_eq!(response.len(), header_end);
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_head_route_takes_precedence_over_get_fallback() -> anyhow::Result<()> {
+        #[potato::http_get("/head_precedence")]
+        async fn head_precedence_get(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("from get")
+        }
+
+        #[potato::http_head("/head_precedence")]
+        async fn head_precedence_head(_req: &mut HttpRequest) -> HttpResponse {
+            let mut res = HttpResponse::empty();
+            res.http_code = 204;
+            res
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "HEAD /head_precedence HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 204 No Content"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_conflicting_duplicate_content_length() -> anyhow::Result<()> {
+        #[potato::http_post("/duplicate_content_length")]
+        async fn duplicate_content_length(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("should not reach")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "POST /duplicate_content_length HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Content-Length: 5\r\n",
+            "Content-Length: 6\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "Hello!"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        assert!(response.is_empty());
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_static_file_route_supports_range_partial_content() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let temp_dir = env::temp_dir().join(format!("potato-range-{}", port));
+        fs::create_dir_all(&temp_dir)?;
+        let file_path = temp_dir.join("sample.txt");
+        let file_content = b"HelloRangeWorld";
+        fs::write(&file_path, file_content)?;
+
+        let mut server = HttpServer::new(&server_addr);
+        let static_root = temp_dir.canonicalize()?.to_string_lossy().to_string();
+        server.configure(|ctx| {
+            ctx.use_location_route("/static/", static_root.clone());
+        });
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let headers = vec![potato::Headers::Custom((
+            "Range".to_string(),
+            "bytes=5-9".to_string(),
+        ))];
+        let url = format!("http://{}/static/sample.txt", server_addr);
+        let res = potato::get(&url, headers).await?;
+
+        assert_eq!(res.http_code, 206);
+        assert_eq!(res.get_header("Accept-Ranges"), Some("bytes"));
+        assert_eq!(res.get_header("Content-Range"), Some("bytes 5-9/15"));
+        let body = match res.body {
+            potato::HttpResponseBody::Data(data) => data,
+            potato::HttpResponseBody::Stream(_) => vec![],
+        };
+        assert_eq!(body, b"Range".to_vec());
+
+        server_handle.abort();
+        _ = fs::remove_file(file_path);
+        _ = fs::remove_dir(temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_static_file_route_returns_416_for_unsatisfiable_range() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let temp_dir = env::temp_dir().join(format!("potato-range-{}", port));
+        fs::create_dir_all(&temp_dir)?;
+        let file_path = temp_dir.join("sample.txt");
+        fs::write(&file_path, b"short")?;
+
+        let mut server = HttpServer::new(&server_addr);
+        let static_root = temp_dir.canonicalize()?.to_string_lossy().to_string();
+        server.configure(|ctx| {
+            ctx.use_location_route("/static/", static_root.clone());
+        });
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let headers = vec![potato::Headers::Custom((
+            "Range".to_string(),
+            "bytes=99-100".to_string(),
+        ))];
+        let url = format!("http://{}/static/sample.txt", server_addr);
+        let res = potato::get(&url, headers).await?;
+
+        assert_eq!(res.http_code, 416);
+        assert_eq!(res.get_header("Accept-Ranges"), Some("bytes"));
+        assert_eq!(res.get_header("Content-Range"), Some("bytes */5"));
+
+        server_handle.abort();
+        _ = fs::remove_file(file_path);
+        _ = fs::remove_dir(temp_dir);
         Ok(())
     }
 }
