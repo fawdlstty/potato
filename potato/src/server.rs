@@ -8,6 +8,8 @@ use crate::{
     HttpHandler, HttpMethod, HttpRequest, HttpRequestTargetForm, HttpResponse, PreflightResult,
 };
 use crate::{RequestHandlerFlag, TransferSession};
+#[cfg(feature = "http3")]
+use bytes::Buf;
 #[cfg(feature = "http2")]
 use h2::server as h2_server;
 #[cfg(feature = "http3")]
@@ -31,13 +33,11 @@ use tokio::net::TcpListener;
 use tokio::select;
 use tokio::sync::{oneshot, Mutex};
 #[cfg(any(feature = "tls", feature = "http3"))]
+use tokio_rustls::rustls;
+#[cfg(any(feature = "tls", feature = "http3"))]
 use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
-#[cfg(feature = "http3")]
-use bytes::Buf;
-#[cfg(any(feature = "tls", feature = "http3"))]
-use tokio_rustls::rustls;
 
 type CustomHandler = dyn Fn(
         &mut HttpRequest,
@@ -111,6 +111,60 @@ impl PipeContext {
         }
         if let Some(etag) = etag {
             res.add_header("ETag".into(), etag.to_string().into());
+        }
+    }
+
+    fn add_embedded_validators(res: &mut HttpResponse, meta: Option<&Metadata>, etag: &str) {
+        if let Some(meta) = meta {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                    let modified_time =
+                        chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + duration);
+                    res.add_header(
+                        "Last-Modified".into(),
+                        modified_time
+                            .format("%a, %d %b %Y %H:%M:%S GMT")
+                            .to_string()
+                            .into(),
+                    );
+                }
+            }
+        }
+        res.add_header("ETag".into(), etag.to_string().into());
+    }
+
+    fn should_apply_range_for_embedded(
+        req: &HttpRequest,
+        meta: Option<&Metadata>,
+        etag: &str,
+    ) -> bool {
+        if req.get_header_key(HeaderItem::Range).is_none() {
+            return false;
+        }
+        let Some(if_range) = req.get_header_key(HeaderItem::If_Range) else {
+            return true;
+        };
+        let if_range = if_range.trim();
+        if if_range.is_empty() {
+            return false;
+        }
+        if if_range.starts_with('"') {
+            return etag == if_range;
+        }
+        let Some(meta) = meta else {
+            return false;
+        };
+        let Some(modified_secs) = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+        else {
+            return false;
+        };
+        match crate::parse_http_date(if_range) {
+            Ok(since_timestamp) => modified_secs <= since_timestamp,
+            Err(_) => false,
         }
     }
 
@@ -215,11 +269,13 @@ impl PipeContext {
             PreflightResult::NotModified => {
                 let mut res = HttpResponse::empty();
                 res.http_code = 304;
+                Self::add_static_validators(&mut res, meta, etag.as_deref());
                 return res;
             }
             PreflightResult::PreconditionFailed => {
                 let mut res = HttpResponse::error("Precondition Failed");
                 res.http_code = 412;
+                Self::add_static_validators(&mut res, meta, etag.as_deref());
                 return res;
             }
             PreflightResult::Proceed => {}
@@ -261,7 +317,7 @@ impl PipeContext {
             }
         }
 
-        let mut res = HttpResponse::from_file(path, false, std::fs::metadata(path).ok());
+        let mut res = HttpResponse::from_file(path, false, Some(meta.clone()));
         res.add_header("Accept-Ranges".into(), "bytes".into());
         res
     }
@@ -725,19 +781,29 @@ impl PipeContext {
                             let mut hasher = DefaultHasher::new();
                             item.hash(&mut hasher);
                             let content_hash = hasher.finish();
-                            Some(format!("\"{:x}-{:x}\"", content_hash, item.len()))
+                            format!("\"{:x}-{:x}\"", content_hash, item.len())
                         };
 
                         // Execute preflight check
-                        match req.check_precondition_headers(meta.as_ref(), etag.as_deref()) {
+                        match req.check_precondition_headers(meta.as_ref(), Some(etag.as_str())) {
                             PreflightResult::NotModified => {
                                 let mut res = HttpResponse::empty();
                                 res.http_code = 304;
+                                Self::add_embedded_validators(
+                                    &mut res,
+                                    meta.as_ref(),
+                                    etag.as_str(),
+                                );
                                 return res;
                             }
                             PreflightResult::PreconditionFailed => {
                                 let mut res = HttpResponse::error("Precondition Failed");
                                 res.http_code = 412;
+                                Self::add_embedded_validators(
+                                    &mut res,
+                                    meta.as_ref(),
+                                    etag.as_str(),
+                                );
                                 return res;
                             }
                             PreflightResult::Proceed => {
@@ -745,8 +811,58 @@ impl PipeContext {
                             }
                         }
 
-                        let ret =
-                            HttpResponse::from_mem_file(&req.url_path, item.to_vec(), false, meta);
+                        if Self::should_apply_range_for_embedded(req, meta.as_ref(), etag.as_str())
+                        {
+                            if let Some(parsed_range) =
+                                req.get_header_key(HeaderItem::Range).and_then(|range| {
+                                    Self::parse_single_byte_range(range, item.len() as u64)
+                                })
+                            {
+                                match parsed_range {
+                                    Some((start, end)) => {
+                                        let data = item[start as usize..=end as usize].to_vec();
+                                        let mut res = HttpResponse::from_mem_file(
+                                            &req.url_path,
+                                            data,
+                                            false,
+                                            None,
+                                        );
+                                        res.http_code = 206;
+                                        res.add_header(
+                                            "Content-Range".into(),
+                                            format!("bytes {start}-{end}/{}", item.len()).into(),
+                                        );
+                                        res.add_header("Accept-Ranges".into(), "bytes".into());
+                                        Self::add_embedded_validators(
+                                            &mut res,
+                                            meta.as_ref(),
+                                            etag.as_str(),
+                                        );
+                                        return res;
+                                    }
+                                    None => {
+                                        let mut res = HttpResponse::empty();
+                                        res.http_code = 416;
+                                        res.add_header(
+                                            "Content-Range".into(),
+                                            format!("bytes */{}", item.len()).into(),
+                                        );
+                                        res.add_header("Accept-Ranges".into(), "bytes".into());
+                                        Self::add_embedded_validators(
+                                            &mut res,
+                                            meta.as_ref(),
+                                            etag.as_str(),
+                                        );
+                                        return res;
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut ret =
+                            HttpResponse::from_mem_file(&req.url_path, item.to_vec(), false, None);
+                        ret.add_header("Accept-Ranges".into(), "bytes".into());
+                        Self::add_embedded_validators(&mut ret, meta.as_ref(), etag.as_str());
                         return ret;
                     }
                     continue;
@@ -1415,7 +1531,8 @@ impl HttpServer {
                         }
                         req.body = request_body.into();
 
-                        let res = PipeContext::handle_request(pipe_ctx3.as_ref(), &mut req, 0).await;
+                        let res =
+                            PipeContext::handle_request(pipe_ctx3.as_ref(), &mut req, 0).await;
 
                         let mut response_builder = http::Response::builder().status(res.http_code);
                         for (key, value) in res.headers.iter() {
@@ -1427,7 +1544,8 @@ impl HttpServer {
                             {
                                 continue;
                             }
-                            response_builder = response_builder.header(key.as_ref(), value.as_ref());
+                            response_builder =
+                                response_builder.header(key.as_ref(), value.as_ref());
                         }
                         let response = match response_builder.body(()) {
                             Ok(resp) => resp,
@@ -1445,17 +1563,17 @@ impl HttpServer {
                             match res.body {
                                 crate::HttpResponseBody::Data(data) => {
                                     if !data.is_empty()
-                                        && stream
-                                            .send_data(bytes::Bytes::from(data))
-                                            .await
-                                            .is_err()
+                                        && stream.send_data(bytes::Bytes::from(data)).await.is_err()
                                     {
                                         return;
                                     }
                                 }
                                 crate::HttpResponseBody::Stream(mut rx) => {
                                     while let Some(chunk) = rx.recv().await {
-                                        if stream.send_data(bytes::Bytes::from(chunk)).await.is_err()
+                                        if stream
+                                            .send_data(bytes::Bytes::from(chunk))
+                                            .await
+                                            .is_err()
                                         {
                                             return;
                                         }
@@ -1467,7 +1585,9 @@ impl HttpServer {
                         if !res.trailers.is_empty() {
                             let mut trailers = http::HeaderMap::new();
                             for (key, value) in res.trailers.iter() {
-                                if let Ok(name) = http::header::HeaderName::from_bytes(key.as_bytes()) {
+                                if let Ok(name) =
+                                    http::header::HeaderName::from_bytes(key.as_bytes())
+                                {
                                     if let Ok(value) = http::HeaderValue::from_str(value) {
                                         trailers.insert(name, value);
                                     }

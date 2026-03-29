@@ -136,9 +136,12 @@ impl Session {
         let request_method = req.method;
         sess_impl.stream.write_all(&req.as_bytes()).await?;
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
-        let (res, _) =
-            HttpResponse::from_stream_with_request_method(&mut buf, &mut sess_impl.stream, Some(request_method))
-                .await?;
+        let (res, _) = HttpResponse::from_stream_with_request_method(
+            &mut buf,
+            &mut sess_impl.stream,
+            Some(request_method),
+        )
+        .await?;
         Ok(res)
     }
 

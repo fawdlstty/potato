@@ -26,6 +26,34 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+### HTTPS / HTTP2 / HTTP3
+
+To enable TLS and newer protocols, turn on features first:
+
+```bash
+cargo add potato --features http2,http3
+```
+
+Then choose a startup method as needed (certificate and key are PEM files):
+
+```rust
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut server = potato::HttpServer::new("0.0.0.0:8443");
+
+    // HTTPS (HTTP/1.1 over TLS)
+    // server.serve_https("cert.pem", "key.pem").await
+
+    // HTTP/2 (ALPN negotiates h2, with HTTPS/1.1 fallback)
+    // server.serve_http2("cert.pem", "key.pem").await
+
+    // HTTP/3 (QUIC)
+    server.serve_http3("cert.pem", "key.pem").await
+}
+```
+
+Advanced note: in production, manage cert rotation, ALPN policy, and reverse-proxy config together.
+
 ## Client Side
 
 Example code:

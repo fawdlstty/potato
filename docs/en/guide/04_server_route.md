@@ -24,7 +24,7 @@ server.configure(|ctx| {
 });
 ```
 
-The path refers to the address for requesting documentation. For production environments,尽量 avoid using documentation interfaces or change to complex paths to avoid exposing interfaces.
+The path refers to the documentation URL. In production, prefer disabling docs endpoints or using a non-obvious path to reduce accidental exposure.
 
 ## Local Directory Routing
 
@@ -39,6 +39,13 @@ server.configure(|ctx| {
 ```
 
 The first parameter is the request path, and the second parameter is the local directory address. If a file `/wwwroot/a.json` exists, it can be accessed via the request `/a.json`.
+
+This route also supports common static-resource capabilities:
+
+- Conditional requests: `If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since`
+- Range download: `Range` and `If-Range`
+
+Advanced note: combine this with CDN cache policy and large-file chunk strategy to reduce origin load.
 
 ## Embedded Resource Routing
 

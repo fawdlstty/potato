@@ -40,6 +40,11 @@ server.configure(|ctx| {
 
 第一个参数为请求路径，第二个参数为本地目录地址。假如存在 `/wwwroot/a.json` 文件，那么通过请求 `/a.json` 即可访问此json文件
 
+该路由同时支持常见静态资源能力：
+
+- 条件请求：`If-None-Match`、`If-Modified-Since`、`If-Match`、`If-Unmodified-Since`
+- 分段下载：`Range` 与 `If-Range`
+
 ## 内建资源路由
 
 在configure函数里加入如下代码：

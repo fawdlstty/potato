@@ -14,8 +14,10 @@ fn get_test_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use potato::{HttpRequest, HttpResponse, HttpServer};
     use potato::utils::enums::HttpConnection;
+    use potato::{HttpRequest, HttpResponse, HttpServer};
+    use std::borrow::Cow;
+    use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -1580,6 +1582,112 @@ mod tests {
         server_handle.abort();
         _ = fs::remove_file(file_path);
         _ = fs::remove_dir(temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embedded_route_supports_range_partial_content() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+        let mut assets: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
+        assets.insert("sample.txt".to_string(), Cow::Borrowed(b"HelloRangeWorld"));
+        server.configure(|ctx| {
+            ctx.use_embedded_route("/embed", assets.clone());
+        });
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let headers = vec![potato::Headers::Custom((
+            "Range".to_string(),
+            "bytes=5-9".to_string(),
+        ))];
+        let url = format!("http://{}/embed/sample.txt", server_addr);
+        let res = potato::get(&url, headers).await?;
+
+        assert_eq!(res.http_code, 206);
+        assert_eq!(res.get_header("Accept-Ranges"), Some("bytes"));
+        assert_eq!(res.get_header("Content-Range"), Some("bytes 5-9/15"));
+        let body = match res.body {
+            potato::HttpResponseBody::Data(data) => data,
+            potato::HttpResponseBody::Stream(_) => vec![],
+        };
+        assert_eq!(body, b"Range".to_vec());
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embedded_route_etag_roundtrip_returns_304() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+        let mut assets: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
+        assets.insert("etag.txt".to_string(), Cow::Borrowed(b"etag-body"));
+        server.configure(|ctx| {
+            ctx.use_embedded_route("/embed", assets.clone());
+        });
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let url = format!("http://{}/embed/etag.txt", server_addr);
+        let first = potato::get(&url, vec![]).await?;
+        assert_eq!(first.http_code, 200);
+        let etag = first
+            .get_header("ETag")
+            .ok_or_else(|| anyhow::anyhow!("embedded response missing ETag"))?
+            .to_string();
+
+        let second = potato::get(
+            &url,
+            vec![potato::Headers::Custom((
+                "If-None-Match".to_string(),
+                etag.clone(),
+            ))],
+        )
+        .await?;
+        assert_eq!(second.http_code, 304);
+        assert_eq!(second.get_header("ETag"), Some(etag.as_str()));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embedded_route_returns_416_for_unsatisfiable_range() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+        let mut assets: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
+        assets.insert("sample.txt".to_string(), Cow::Borrowed(b"short"));
+        server.configure(|ctx| {
+            ctx.use_embedded_route("/embed", assets.clone());
+        });
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let headers = vec![potato::Headers::Custom((
+            "Range".to_string(),
+            "bytes=99-100".to_string(),
+        ))];
+        let url = format!("http://{}/embed/sample.txt", server_addr);
+        let res = potato::get(&url, headers).await?;
+
+        assert_eq!(res.http_code, 416);
+        assert_eq!(res.get_header("Accept-Ranges"), Some("bytes"));
+        assert_eq!(res.get_header("Content-Range"), Some("bytes */5"));
+
+        server_handle.abort();
         Ok(())
     }
 }

@@ -502,7 +502,9 @@ impl HttpRequest {
     }
 
     fn request_header_fields_too_large(msg: impl Into<String>) -> anyhow::Error {
-        anyhow::Error::new(HttpRequestParseError::RequestHeaderFieldsTooLarge(msg.into()))
+        anyhow::Error::new(HttpRequestParseError::RequestHeaderFieldsTooLarge(
+            msg.into(),
+        ))
     }
 
     pub fn bad_request_message(err: &anyhow::Error) -> Option<&str> {
@@ -522,9 +524,7 @@ impl HttpRequest {
                     HttpRequestParseError::BadRequest(msg) => (400, msg.as_str()),
                     HttpRequestParseError::NotImplemented(msg) => (501, msg.as_str()),
                     HttpRequestParseError::ExpectationFailed(msg) => (417, msg.as_str()),
-                    HttpRequestParseError::RequestHeaderFieldsTooLarge(msg) => {
-                        (431, msg.as_str())
-                    }
+                    HttpRequestParseError::RequestHeaderFieldsTooLarge(msg) => (431, msg.as_str()),
                 };
                 let mut res = HttpResponse::text(msg.to_string());
                 res.http_code = status;
@@ -644,7 +644,9 @@ impl HttpRequest {
     fn parse_request_target(&mut self, target: &str) -> anyhow::Result<()> {
         if target == "*" {
             if self.method != HttpMethod::OPTIONS {
-                Err(Self::bad_request("asterisk-form request-target requires OPTIONS"))?;
+                Err(Self::bad_request(
+                    "asterisk-form request-target requires OPTIONS",
+                ))?;
             }
             self.target_form = HttpRequestTargetForm::Asterisk;
             self.url_query.clear();
@@ -654,7 +656,9 @@ impl HttpRequest {
 
         if target.starts_with('/') {
             if self.method == HttpMethod::CONNECT {
-                Err(Self::bad_request("CONNECT requires authority-form request-target"))?;
+                Err(Self::bad_request(
+                    "CONNECT requires authority-form request-target",
+                ))?;
             }
             self.target_form = HttpRequestTargetForm::Origin;
             self.parse_path_and_query(target);
@@ -683,7 +687,9 @@ impl HttpRequest {
 
         if http::uri::Authority::from_str(target).is_ok() {
             if self.method != HttpMethod::CONNECT {
-                Err(Self::bad_request("authority-form request-target is only valid for CONNECT"))?;
+                Err(Self::bad_request(
+                    "authority-form request-target is only valid for CONNECT",
+                ))?;
             }
             self.target_form = HttpRequestTargetForm::Authority;
             self.url_query.clear();
@@ -762,10 +768,7 @@ impl HttpRequest {
 
     pub fn get_trailer(&self, key: &str) -> Option<&str> {
         if let Some(header_item) = HeaderItem::try_from_str(key) {
-            if let Some(value) = self
-                .trailers
-                .get(&HeaderOrHipStr::HeaderItem(header_item))
-            {
+            if let Some(value) = self.trailers.get(&HeaderOrHipStr::HeaderItem(header_item)) {
                 return Some(&value[..]);
             }
         }
@@ -775,7 +778,10 @@ impl HttpRequest {
     }
 
     pub fn get_header_accept_encoding(&self) -> CompressMode {
-        Self::negotiate_accept_encoding(self.get_header_key(HeaderItem::Accept_Encoding).unwrap_or(""))
+        Self::negotiate_accept_encoding(
+            self.get_header_key(HeaderItem::Accept_Encoding)
+                .unwrap_or(""),
+        )
     }
 
     fn negotiate_accept_encoding(header: &str) -> CompressMode {
@@ -821,7 +827,8 @@ impl HttpRequest {
 
             match coding.as_str() {
                 "gzip" => {
-                    explicit_gzip_q = Some(explicit_gzip_q.map_or(quality, |prev| prev.max(quality)));
+                    explicit_gzip_q =
+                        Some(explicit_gzip_q.map_or(quality, |prev| prev.max(quality)));
                 }
                 "*" => {
                     wildcard_q = Some(wildcard_q.map_or(quality, |prev| prev.max(quality)));
@@ -912,7 +919,11 @@ impl HttpRequest {
         stream: &mut HttpStream,
         hdr_len: usize,
         allowed_trailers: &HashSet<String>,
-    ) -> anyhow::Result<(LocalHipByt<'static>, HashMap<HeaderOrHipStr, LocalHipStr<'static>>, usize)> {
+    ) -> anyhow::Result<(
+        LocalHipByt<'static>,
+        HashMap<HeaderOrHipStr, LocalHipStr<'static>>,
+        usize,
+    )> {
         let mut cursor = hdr_len;
         let mut body = Vec::new();
         let mut trailers = HashMap::with_capacity(4);
@@ -1077,7 +1088,7 @@ impl HttpRequest {
         if has_chunked_transfer_encoding {
             if req.get_header_key(HeaderItem::Content_Length).is_some() {
                 Err(Self::bad_request(
-                    "conflicting headers: Transfer-Encoding and Content-Length"
+                    "conflicting headers: Transfer-Encoding and Content-Length",
                 ))?;
             }
         } else {
@@ -1255,9 +1266,9 @@ impl HttpRequest {
                 7 if method == "CONNECT" => HttpMethod::CONNECT,
                 8 if method == "PROPFIND" => HttpMethod::PROPFIND,
                 9 if method == "PROPPATCH" => HttpMethod::PROPPATCH,
-                _ => {
-                    Err(Self::not_implemented(format!("unsupported method: {method}")))?
-                }
+                _ => Err(Self::not_implemented(format!(
+                    "unsupported method: {method}"
+                )))?,
             }
         };
         let target = rreq.path.unwrap();
@@ -1300,7 +1311,11 @@ impl HttpRequest {
                 if let Some(existing) = req.headers.get(&expect_key) {
                     req.headers.insert(
                         expect_key,
-                        LocalHipStr::from(format!("{}, {}", existing.as_str(), normalized_header_value)),
+                        LocalHipStr::from(format!(
+                            "{}, {}",
+                            existing.as_str(),
+                            normalized_header_value
+                        )),
                     );
                 } else {
                     req.headers
@@ -1438,7 +1453,8 @@ impl HttpRequest {
             })
             .unwrap_or(false);
 
-        let declared_trailer_names = parse_declared_trailer_names(self.get_header_key(HeaderItem::Trailer));
+        let declared_trailer_names =
+            parse_declared_trailer_names(self.get_header_key(HeaderItem::Trailer));
         let mut outbound_trailers: Vec<(String, String)> = Vec::with_capacity(self.trailers.len());
         for (key, value) in self.trailers.iter() {
             let key_str = key.to_str();
@@ -2086,7 +2102,10 @@ impl HttpResponse {
                 if chunked_len == 0 {
                     loop {
                         loop {
-                            if buf[(hdr_len + bdy_len)..].windows(2).any(|part| part == b"\r\n") {
+                            if buf[(hdr_len + bdy_len)..]
+                                .windows(2)
+                                .any(|part| part == b"\r\n")
+                            {
                                 break;
                             }
                             buf.extend_by_streams(stream).await?;
@@ -2231,9 +2250,7 @@ mod tests {
     #[test]
     fn request_parser_returns_431_for_oversized_header_section() {
         let oversized = "a".repeat(20 * 1024);
-        let raw = format!(
-            "GET / HTTP/1.1\r\nHost: example.com\r\nX-Large: {oversized}\r\n\r\n"
-        );
+        let raw = format!("GET / HTTP/1.1\r\nHost: example.com\r\nX-Large: {oversized}\r\n\r\n");
 
         let err = HttpRequest::from_headers_part(raw.as_bytes()).unwrap_err();
         let res = HttpRequest::parse_error_response(&err).unwrap();

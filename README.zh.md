@@ -5,7 +5,7 @@
 
 [English](README.md) | 简体中文
 
-高性能、简洁语法的HTTP框架。
+高性能、简洁语法的 HTTP 框架，支持 HTTP/1.1、HTTP/2、HTTP/3。
 
 # 用法
 

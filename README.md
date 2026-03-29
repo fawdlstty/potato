@@ -5,7 +5,7 @@
 
 English | [简体中文](README.zh.md)
 
-High-performance, concise syntax HTTP framework.
+High-performance, concise HTTP framework with HTTP/1.1, HTTP/2, and HTTP/3 support.
 
 # Usage
 
