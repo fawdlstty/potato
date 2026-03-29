@@ -19,7 +19,7 @@ pub use utils::refstr::Headers;
 #[cfg(feature = "jemalloc")]
 pub use utils::jemalloc_helper::*;
 
-use anyhow::{anyhow, Error};
+use anyhow::anyhow;
 use chrono::Utc;
 use core::str;
 use hipstr::{LocalHipByt, LocalHipStr};
@@ -63,6 +63,7 @@ pub enum PreflightResult {
 #[derive(Debug)]
 pub enum HttpRequestParseError {
     BadRequest(String),
+    NotImplemented(String),
     ExpectationFailed(String),
     RequestHeaderFieldsTooLarge(String),
 }
@@ -71,6 +72,7 @@ impl fmt::Display for HttpRequestParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HttpRequestParseError::BadRequest(msg) => write!(f, "{msg}"),
+            HttpRequestParseError::NotImplemented(msg) => write!(f, "{msg}"),
             HttpRequestParseError::ExpectationFailed(msg) => write!(f, "{msg}"),
             HttpRequestParseError::RequestHeaderFieldsTooLarge(msg) => write!(f, "{msg}"),
         }
@@ -495,6 +497,10 @@ impl HttpRequest {
         anyhow::Error::new(HttpRequestParseError::ExpectationFailed(msg.into()))
     }
 
+    fn not_implemented(msg: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(HttpRequestParseError::NotImplemented(msg.into()))
+    }
+
     fn request_header_fields_too_large(msg: impl Into<String>) -> anyhow::Error {
         anyhow::Error::new(HttpRequestParseError::RequestHeaderFieldsTooLarge(msg.into()))
     }
@@ -503,6 +509,7 @@ impl HttpRequest {
         err.downcast_ref::<HttpRequestParseError>()
             .and_then(|parse_err| match parse_err {
                 HttpRequestParseError::BadRequest(msg) => Some(msg.as_str()),
+                HttpRequestParseError::NotImplemented(_) => None,
                 HttpRequestParseError::ExpectationFailed(_) => None,
                 HttpRequestParseError::RequestHeaderFieldsTooLarge(_) => None,
             })
@@ -513,6 +520,7 @@ impl HttpRequest {
             .map(|parse_err| {
                 let (status, msg) = match parse_err {
                     HttpRequestParseError::BadRequest(msg) => (400, msg.as_str()),
+                    HttpRequestParseError::NotImplemented(msg) => (501, msg.as_str()),
                     HttpRequestParseError::ExpectationFailed(msg) => (417, msg.as_str()),
                     HttpRequestParseError::RequestHeaderFieldsTooLarge(msg) => {
                         (431, msg.as_str())
@@ -889,12 +897,14 @@ impl HttpRequest {
             .filter(|part| !part.is_empty())
             .collect();
         if codings.is_empty() {
-            Err(anyhow!("empty Transfer-Encoding header"))?
+            Err(Self::bad_request("empty Transfer-Encoding header"))?
         }
         if codings.len() == 1 && codings[0] == "chunked" {
             return Ok(true);
         }
-        Err(anyhow!("unsupported Transfer-Encoding: {raw_val}"))
+        Err(Self::not_implemented(format!(
+            "unsupported Transfer-Encoding: {raw_val}"
+        )))
     }
 
     async fn read_chunked_body(
@@ -1066,12 +1076,15 @@ impl HttpRequest {
         let mut content_length = 0usize;
         if has_chunked_transfer_encoding {
             if req.get_header_key(HeaderItem::Content_Length).is_some() {
-                Err(anyhow!(
+                Err(Self::bad_request(
                     "conflicting headers: Transfer-Encoding and Content-Length"
                 ))?;
             }
         } else {
-            content_length = req.parse_header_content_length()?.unwrap_or(0);
+            content_length = req
+                .parse_header_content_length()
+                .map_err(|err| Self::bad_request(err.to_string()))?
+                .unwrap_or(0);
         }
 
         let has_request_body = has_chunked_transfer_encoding || content_length > 0;
@@ -1242,7 +1255,9 @@ impl HttpRequest {
                 7 if method == "CONNECT" => HttpMethod::CONNECT,
                 8 if method == "PROPFIND" => HttpMethod::PROPFIND,
                 9 if method == "PROPPATCH" => HttpMethod::PROPPATCH,
-                _ => return Err(Error::msg(format!("unrecognized method: {method}"))),
+                _ => {
+                    Err(Self::not_implemented(format!("unsupported method: {method}")))?
+                }
             }
         };
         let target = rreq.path.unwrap();
@@ -1328,6 +1343,8 @@ impl HttpRequest {
         use crate::utils::refstr::HeaderItem;
         use std::time::UNIX_EPOCH;
 
+        let is_get_or_head = matches!(self.method, HttpMethod::GET | HttpMethod::HEAD);
+
         // Get file's last modified time (Unix timestamp in seconds)
         let last_modified_timestamp = meta
             .and_then(|m| m.modified().ok())
@@ -1365,29 +1382,37 @@ impl HttpRequest {
             }
         }
 
-        // Check If-None-Match header (if ETag matches, return 304)
+        // Check If-None-Match header
         if let Some(if_none_match) = self.get_header_key(HeaderItem::If_None_Match) {
             if if_none_match == "*" {
-                // If "*" and resource exists, return 304
+                // If resource exists, GET/HEAD -> 304, others -> 412.
                 if etag.is_some() || meta.is_some() {
-                    return PreflightResult::NotModified;
+                    return if is_get_or_head {
+                        PreflightResult::NotModified
+                    } else {
+                        PreflightResult::PreconditionFailed
+                    };
                 }
             } else if let Some(current_etag) = etag {
-                // Check if ETag is in If-None-Match list
+                // Check if ETag is in If-None-Match list.
                 let match_found = if_none_match
                     .split(',')
                     .map(|s| s.trim())
                     .any(|expected_etag| expected_etag == current_etag);
 
                 if match_found {
-                    return PreflightResult::NotModified;
+                    return if is_get_or_head {
+                        PreflightResult::NotModified
+                    } else {
+                        PreflightResult::PreconditionFailed
+                    };
                 }
             }
         }
 
         // Check If-Modified-Since header (if resource is not modified, return 304)
-        // Note: Only check If-Modified-Since when there's no If-None-Match header
-        if self.get_header_key(HeaderItem::If_None_Match).is_none() {
+        // Note: only applies to GET/HEAD and only when there's no If-None-Match header.
+        if is_get_or_head && self.get_header_key(HeaderItem::If_None_Match).is_none() {
             if let Some(if_modified_since) = self.get_header_key(HeaderItem::If_Modified_Since) {
                 if let Some(last_modified) = last_modified_timestamp {
                     if let Ok(since_timestamp) = parse_http_date(if_modified_since) {
@@ -1759,11 +1784,6 @@ impl HttpResponse {
         request_method == Some(HttpMethod::HEAD)
     }
 
-    fn should_suppress_response_body(&self, request_method: Option<HttpMethod>) -> bool {
-        Self::status_disallows_response_body(self.http_code)
-            || Self::method_disallows_response_body(request_method)
-    }
-
     pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {
         match &self.body {
             HttpResponseBody::Data(data) => {
@@ -1805,8 +1825,10 @@ impl HttpResponse {
                     }
                     ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
                 }
-                ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
-                if cmode == CompressMode::Gzip {
+                if !suppress_body {
+                    ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
+                }
+                if cmode == CompressMode::Gzip && !suppress_body {
                     ret.push_str("Content-Encoding: gzip\r\n");
                 }
                 ret.push_str("\r\n");
@@ -1825,7 +1847,9 @@ impl HttpResponse {
         cmode: CompressMode,
         request_method: Option<HttpMethod>,
     ) -> anyhow::Result<()> {
-        let suppress_body = self.should_suppress_response_body(request_method);
+        let suppress_body_by_status = Self::status_disallows_response_body(self.http_code);
+        let suppress_body_by_method = Self::method_disallows_response_body(request_method);
+        let suppress_body = suppress_body_by_status || suppress_body_by_method;
         let no_content_encoding = self.get_header("Content-Encoding").is_none();
         let declared_trailer_names = parse_declared_trailer_names(self.get_header("Trailer"));
         let mut outbound_stream_trailers: Vec<(String, String)> =
@@ -1847,7 +1871,7 @@ impl HttpResponse {
                 if cmode == CompressMode::Gzip
                     && data.len() >= 32
                     && no_content_encoding
-                    && !suppress_body
+                    && !suppress_body_by_status
                 {
                     if let Ok(compressed_data) = data.compress() {
                         payload_tmp = compressed_data;
@@ -1859,7 +1883,7 @@ impl HttpResponse {
                 } else {
                     payload_tmp.as_slice()
                 };
-                if suppress_body {
+                if suppress_body_by_status {
                     cmode = CompressMode::None;
                     payload_ref = &[];
                 }
@@ -1914,13 +1938,15 @@ impl HttpResponse {
                         ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
                     }
                 }
-                ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
-                if cmode == CompressMode::Gzip {
+                if !suppress_body_by_status {
+                    ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
+                }
+                if cmode == CompressMode::Gzip && !suppress_body_by_status {
                     ret.push_str("Content-Encoding: gzip\r\n");
                 }
                 ret.push_str("\r\n");
 
-                if payload_ref.is_empty() {
+                if suppress_body || payload_ref.is_empty() {
                     stream.write_all(ret.as_bytes()).await?;
                 } else {
                     stream
@@ -1994,6 +2020,14 @@ impl HttpResponse {
         buf: &mut Vec<u8>,
         stream: &mut HttpStream,
     ) -> anyhow::Result<(Self, usize)> {
+        Self::from_stream_with_request_method(buf, stream, None).await
+    }
+
+    pub async fn from_stream_with_request_method(
+        buf: &mut Vec<u8>,
+        stream: &mut HttpStream,
+        request_method: Option<HttpMethod>,
+    ) -> anyhow::Result<(Self, usize)> {
         let (mut res, hdr_len) = loop {
             buf.extend_by_streams(stream).await?;
             match HttpResponse::from_headers_part(&buf[..])? {
@@ -2002,6 +2036,11 @@ impl HttpResponse {
             }
         };
         let mut bdy_len = 0;
+        let skip_body = request_method == Some(HttpMethod::HEAD)
+            || Self::status_disallows_response_body(res.http_code);
+        if skip_body {
+            return Ok((res, hdr_len));
+        }
         if let Some(cnt_len) = res.headers.get("Content-Length") {
             bdy_len = cnt_len.parse::<usize>().unwrap_or(0);
             while hdr_len + bdy_len > buf.len() {

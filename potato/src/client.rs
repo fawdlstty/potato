@@ -133,9 +133,12 @@ impl Session {
             req.apply_header(Headers::Host(sess_impl.unique_host.0.clone()));
         }
         let sess_impl = self.session_impl()?;
+        let request_method = req.method;
         sess_impl.stream.write_all(&req.as_bytes()).await?;
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
-        let (res, _) = HttpResponse::from_stream(&mut buf, &mut sess_impl.stream).await?;
+        let (res, _) =
+            HttpResponse::from_stream_with_request_method(&mut buf, &mut sess_impl.stream, Some(request_method))
+                .await?;
         Ok(res)
     }
 
@@ -467,9 +470,12 @@ impl TransferSession {
 
         strip_hop_by_hop_request_headers(req);
         req.set_header(HeaderItem::Host, dest_host.clone());
+        let request_method = req.method;
         stream.write_all(&req.as_bytes()).await?;
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
-        let (mut res, _) = HttpResponse::from_stream(&mut buf, stream).await?;
+        let (mut res, _) =
+            HttpResponse::from_stream_with_request_method(&mut buf, stream, Some(request_method))
+                .await?;
         strip_hop_by_hop_response_headers(&mut res);
 
         if modify_content {

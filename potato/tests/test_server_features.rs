@@ -702,7 +702,9 @@ mod tests {
 
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await?;
-        assert!(response.is_empty());
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response_text.contains("conflicting headers: Transfer-Encoding and Content-Length"));
 
         server_handle.abort();
         Ok(())
@@ -922,7 +924,9 @@ mod tests {
 
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await?;
-        assert!(response.is_empty());
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 501 Not Implemented"));
+        assert!(response_text.contains("unsupported Transfer-Encoding"));
 
         server_handle.abort();
         Ok(())
@@ -1380,7 +1384,7 @@ mod tests {
         stream.read_to_end(&mut response).await?;
         let response_text = String::from_utf8_lossy(&response);
         assert!(response_text.starts_with("HTTP/1.1 200 OK"));
-        assert!(response_text.contains("Content-Length: 0\r\n"));
+        assert!(response_text.contains("Content-Length: 16\r\n"));
         assert!(response_body_bytes(&response)?.is_empty());
 
         server_handle.abort();
@@ -1418,7 +1422,7 @@ mod tests {
         stream.read_to_end(&mut response).await?;
         let response_text = String::from_utf8_lossy(&response);
         assert!(response_text.starts_with("HTTP/1.1 204 No Content"));
-        assert!(response_text.contains("Content-Length: 0\r\n"));
+        assert!(!response_text.contains("Content-Length:"));
         assert!(response_body_bytes(&response)?.is_empty());
 
         server_handle.abort();
@@ -1456,7 +1460,7 @@ mod tests {
         stream.read_to_end(&mut response).await?;
         let response_text = String::from_utf8_lossy(&response);
         assert!(response_text.starts_with("HTTP/1.1 304 Not Modified"));
-        assert!(response_text.contains("Content-Length: 0\r\n"));
+        assert!(!response_text.contains("Content-Length:"));
         assert!(response_body_bytes(&response)?.is_empty());
 
         server_handle.abort();

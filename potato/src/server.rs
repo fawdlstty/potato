@@ -593,20 +593,28 @@ impl PipeContext {
                                 return res;
                             }
 
-                            let mut res = HttpResponse::not_found();
-                            res.body = crate::HttpResponseBody::Data(vec![]);
-                            return res;
+                            // If no GET fallback exists, continue the pipeline so
+                            // other route handlers (static/custom/proxy) can answer HEAD.
+                            continue;
                         } else if req.method == HttpMethod::OPTIONS {
                             let mut res2 = HttpResponse::html("");
                             let methods_str: Cow<'static, str> = {
-                                let mut options: HashSet<_> =
-                                    [HttpMethod::HEAD, HttpMethod::OPTIONS]
-                                        .into_iter()
-                                        .collect();
+                                let mut options: HashSet<_> = [HttpMethod::OPTIONS]
+                                    .into_iter()
+                                    .collect();
                                 if req.target_form == HttpRequestTargetForm::Asterisk {
                                     options.extend(HANDLERS_FLAT.keys().map(|(_, method)| *method));
+                                    if HANDLERS_FLAT
+                                        .keys()
+                                        .any(|(_, method)| *method == HttpMethod::GET)
+                                    {
+                                        options.insert(HttpMethod::HEAD);
+                                    }
                                 } else if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
                                     options.extend(handlers.keys().map(|p| *p));
+                                    if handlers.contains_key(&HttpMethod::GET) {
+                                        options.insert(HttpMethod::HEAD);
+                                    }
                                 }
                                 options
                                     .into_iter()
@@ -1000,6 +1008,9 @@ impl HttpServer {
                     let conn = req.get_header_connection();
                     let mut res =
                         PipeContext::handle_request(pipe_ctx2.as_ref(), &mut req, 0).await;
+                    if conn != HttpConnection::KeepAlive {
+                        res.add_header("Connection".into(), "close".into());
+                    }
                     let stream_for_write = req.exts.remove(&TypeId::of::<Mutex<HttpStream>>());
                     match stream_for_write {
                         Some(stream_in_req) => {
@@ -1088,6 +1099,9 @@ impl HttpServer {
                     let conn = req.get_header_connection();
                     let mut res =
                         PipeContext::handle_request(pipe_ctx2.as_ref(), &mut req, 0).await;
+                    if conn != HttpConnection::KeepAlive {
+                        res.add_header("Connection".into(), "close".into());
+                    }
                     let stream_for_write = req.exts.remove(&TypeId::of::<Mutex<HttpStream>>());
                     match stream_for_write {
                         Some(stream_in_req) => {
