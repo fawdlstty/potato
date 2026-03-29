@@ -1,19 +1,19 @@
-#[cfg(any(feature = "http2"))]
+#[cfg(feature = "http2")]
 use std::sync::atomic::{AtomicU16, Ordering};
-#[cfg(any(feature = "http2"))]
+#[cfg(feature = "http2")]
 use std::time::Duration;
-#[cfg(any(feature = "http2"))]
+#[cfg(feature = "http2")]
 use tokio::time::sleep;
 
-#[cfg(any(feature = "http2"))]
+#[cfg(feature = "http2")]
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(29000);
 
-#[cfg(any(feature = "http2"))]
+#[cfg(feature = "http2")]
 fn get_test_port() -> u16 {
     PORT_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-#[cfg(any(feature = "http2"))]
+#[cfg(feature = "http2")]
 fn create_test_cert_files() -> anyhow::Result<(
     String,
     String,
@@ -38,7 +38,7 @@ fn create_test_cert_files() -> anyhow::Result<(
     ))
 }
 
-#[cfg(any(feature = "http2"))]
+#[cfg(feature = "http2")]
 fn tls_client_config_with_alpn(
     cert_der: &tokio_rustls::rustls::pki_types::CertificateDer<'static>,
     alpn: Vec<Vec<u8>>,
@@ -55,7 +55,7 @@ fn tls_client_config_with_alpn(
     Ok(config)
 }
 
-#[cfg(any(feature = "http2"))]
+#[cfg(feature = "http2")]
 async fn connect_tls_with_alpn(
     addr: &str,
     cert_der: &tokio_rustls::rustls::pki_types::CertificateDer<'static>,
@@ -72,7 +72,7 @@ async fn connect_tls_with_alpn(
     Ok(connector.connect(server_name, stream).await?)
 }
 
-#[cfg(any(feature = "http2"))]
+#[cfg(feature = "http2")]
 async fn read_all_ignore_tls_close_notify(
     stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
 ) -> anyhow::Result<Vec<u8>> {

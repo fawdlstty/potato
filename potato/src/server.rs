@@ -1,6 +1,6 @@
 use crate::utils::enums::HttpConnection;
 use crate::utils::refstr::HeaderItem;
-#[cfg(feature = "http2")]
+#[cfg(any(feature = "http2", feature = "http3"))]
 use crate::utils::refstr::HeaderOrHipStr;
 use crate::utils::tcp_stream::HttpStream;
 use crate::CompressMode;
@@ -9,7 +9,13 @@ use crate::{
 };
 use crate::{RequestHandlerFlag, TransferSession};
 #[cfg(feature = "http2")]
-use h2::server;
+use h2::server as h2_server;
+#[cfg(feature = "http3")]
+use h3::server as h3_server;
+#[cfg(feature = "http3")]
+use quinn::crypto::rustls::QuicServerConfig;
+#[cfg(feature = "http3")]
+use quinn::{self};
 use std::any::TypeId;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -24,10 +30,14 @@ use std::time::UNIX_EPOCH;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::sync::{oneshot, Mutex};
-#[cfg(feature = "tls")]
+#[cfg(any(feature = "tls", feature = "http3"))]
 use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 #[cfg(feature = "tls")]
-use tokio_rustls::{rustls, TlsAcceptor};
+use tokio_rustls::TlsAcceptor;
+#[cfg(feature = "http3")]
+use bytes::Buf;
+#[cfg(any(feature = "tls", feature = "http3"))]
+use tokio_rustls::rustls;
 
 type CustomHandler = dyn Fn(
         &mut HttpRequest,
@@ -984,6 +994,20 @@ impl HttpServer {
         }
     }
 
+    #[cfg(feature = "http3")]
+    pub async fn serve_http3(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
+        let shutdown_signal = self.shutdown_signal.take();
+        match shutdown_signal {
+            Some(shutdown_signal) => {
+                select! {
+                    result = self.serve_http3_impl(cert_file, key_file) => result,
+                    _ = shutdown_signal => Ok(()),
+                }
+            }
+            None => self.serve_http3_impl(cert_file, key_file).await,
+        }
+    }
+
     fn spawn_http1_connection(
         pipe_ctx: Arc<PipeContext>,
         client_addr: SocketAddr,
@@ -1066,7 +1090,23 @@ impl HttpServer {
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
-    #[cfg(feature = "http2")]
+    #[cfg(feature = "http3")]
+    fn quinn_server_config(cert_file: &str, key_file: &str) -> anyhow::Result<quinn::ServerConfig> {
+        let certs = CertificateDer::pem_file_iter(cert_file)?.collect::<Result<Vec<_>, _>>()?;
+        let key = PrivateKeyDer::from_pem_file(key_file)?;
+
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
+        tls_config.max_early_data_size = u32::MAX;
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+        Ok(quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(tls_config)?,
+        )))
+    }
+
+    #[cfg(any(feature = "http2", feature = "http3"))]
     fn h2_method_to_http_method(method: &http::Method) -> anyhow::Result<HttpMethod> {
         Ok(match method.as_str() {
             "GET" => HttpMethod::GET,
@@ -1092,7 +1132,7 @@ impl HttpServer {
     #[cfg(feature = "http2")]
     async fn handle_h2_request(
         mut req_head: http::Request<h2::RecvStream>,
-        mut respond: server::SendResponse<bytes::Bytes>,
+        mut respond: h2_server::SendResponse<bytes::Bytes>,
         pipe_ctx: Arc<PipeContext>,
         client_addr: SocketAddr,
     ) -> anyhow::Result<()> {
@@ -1264,7 +1304,7 @@ impl HttpServer {
                     return;
                 }
 
-                let mut h2_conn = match server::handshake(stream).await {
+                let mut h2_conn = match h2_server::handshake(stream).await {
                     Ok(conn) => conn,
                     Err(_) => return,
                 };
@@ -1282,5 +1322,167 @@ impl HttpServer {
                 }
             });
         }
+    }
+
+    #[cfg(feature = "http3")]
+    async fn serve_http3_impl(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
+        #[cfg(feature = "jemalloc")]
+        crate::init_jemalloc()?;
+
+        let addr: SocketAddr = self.addr.parse()?;
+        let server_config = Self::quinn_server_config(cert_file, key_file)?;
+        let endpoint = quinn::Endpoint::server(server_config, addr)?;
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
+
+        while let Some(new_conn) = endpoint.accept().await {
+            let pipe_ctx2 = Arc::clone(&pipe_ctx);
+            _ = tokio::task::spawn(async move {
+                let conn = match new_conn.await {
+                    Ok(conn) => conn,
+                    Err(_) => return,
+                };
+                let client_addr = conn.remote_address();
+                let mut h3_conn: h3_server::Connection<_, bytes::Bytes> =
+                    match h3_server::Connection::new(h3_quinn::Connection::new(conn)).await {
+                        Ok(conn) => conn,
+                        Err(_) => return,
+                    };
+
+                loop {
+                    let resolver = match h3_conn.accept().await {
+                        Ok(Some(resolver)) => resolver,
+                        Ok(None) => break,
+                        Err(_) => break,
+                    };
+                    let pipe_ctx3 = Arc::clone(&pipe_ctx2);
+                    _ = tokio::task::spawn(async move {
+                        let (req_head, mut stream) = match resolver.resolve_request().await {
+                            Ok(req_stream) => req_stream,
+                            Err(_) => return,
+                        };
+
+                        let mut req = HttpRequest::new();
+                        req.method = match Self::h2_method_to_http_method(req_head.method()) {
+                            Ok(method) => method,
+                            Err(_) => return,
+                        };
+                        req.target_form = HttpRequestTargetForm::Origin;
+                        req.version = 30;
+                        req.client_addr = Some(client_addr);
+
+                        let path_and_query = req_head
+                            .uri()
+                            .path_and_query()
+                            .map(|v| v.as_str())
+                            .unwrap_or("/");
+                        match path_and_query.split_once('?') {
+                            Some((path, query)) => {
+                                req.url_path = path.into();
+                                req.url_query = query
+                                    .split('&')
+                                    .map(|s| s.split_once('=').unwrap_or((s, "")))
+                                    .map(|(a, b)| (a.into(), b.into()))
+                                    .collect();
+                            }
+                            None => {
+                                req.url_path = path_and_query.into();
+                            }
+                        }
+
+                        if let Some(authority) = req_head.uri().authority() {
+                            req.headers.insert(
+                                HeaderOrHipStr::from_str("Host"),
+                                authority.as_str().into(),
+                            );
+                        }
+                        for (key, value) in req_head.headers().iter() {
+                            if let Ok(value) = value.to_str() {
+                                req.headers
+                                    .insert(HeaderOrHipStr::from_str(key.as_str()), value.into());
+                            }
+                        }
+
+                        let mut request_body = Vec::new();
+                        loop {
+                            match stream.recv_data().await {
+                                Ok(Some(mut chunk)) => {
+                                    request_body
+                                        .extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+                                }
+                                Ok(None) => break,
+                                Err(_) => return,
+                            }
+                        }
+                        req.body = request_body.into();
+
+                        let res = PipeContext::handle_request(pipe_ctx3.as_ref(), &mut req, 0).await;
+
+                        let mut response_builder = http::Response::builder().status(res.http_code);
+                        for (key, value) in res.headers.iter() {
+                            if key.eq_ignore_ascii_case("connection")
+                                || key.eq_ignore_ascii_case("keep-alive")
+                                || key.eq_ignore_ascii_case("proxy-connection")
+                                || key.eq_ignore_ascii_case("transfer-encoding")
+                                || key.eq_ignore_ascii_case("upgrade")
+                            {
+                                continue;
+                            }
+                            response_builder = response_builder.header(key.as_ref(), value.as_ref());
+                        }
+                        let response = match response_builder.body(()) {
+                            Ok(resp) => resp,
+                            Err(_) => return,
+                        };
+                        if stream.send_response(response).await.is_err() {
+                            return;
+                        }
+
+                        let suppress_body = (100..200).contains(&res.http_code)
+                            || res.http_code == 204
+                            || res.http_code == 304
+                            || req.method == HttpMethod::HEAD;
+                        if !suppress_body {
+                            match res.body {
+                                crate::HttpResponseBody::Data(data) => {
+                                    if !data.is_empty()
+                                        && stream
+                                            .send_data(bytes::Bytes::from(data))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                crate::HttpResponseBody::Stream(mut rx) => {
+                                    while let Some(chunk) = rx.recv().await {
+                                        if stream.send_data(bytes::Bytes::from(chunk)).await.is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if !res.trailers.is_empty() {
+                            let mut trailers = http::HeaderMap::new();
+                            for (key, value) in res.trailers.iter() {
+                                if let Ok(name) = http::header::HeaderName::from_bytes(key.as_bytes()) {
+                                    if let Ok(value) = http::HeaderValue::from_str(value) {
+                                        trailers.insert(name, value);
+                                    }
+                                }
+                            }
+                            let _ = stream.send_trailers(trailers).await;
+                        }
+
+                        let _ = stream.finish().await;
+                    });
+                }
+            });
+        }
+
+        endpoint.wait_idle().await;
+        Ok(())
     }
 }
