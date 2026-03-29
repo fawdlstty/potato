@@ -224,6 +224,14 @@ pub enum HttpMethod {
     PROPPATCH,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpRequestTargetForm {
+    Origin,
+    Absolute,
+    Authority,
+    Asterisk,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum CompressMode {
     None,
@@ -418,6 +426,7 @@ unsafe impl Send for PostFile {}
 #[derive(Debug)]
 pub struct HttpRequest {
     pub method: HttpMethod,
+    pub target_form: HttpRequestTargetForm,
     pub url_path: LocalHipStr<'static>,
     pub url_query: HashMap<LocalHipStr<'static>, LocalHipStr<'static>>,
     pub version: u8,
@@ -446,6 +455,7 @@ impl HttpRequest {
     pub fn new() -> Self {
         Self {
             method: HttpMethod::GET,
+            target_form: HttpRequestTargetForm::Origin,
             url_path: LocalHipStr::from("/"),
             url_query: HashMap::with_capacity(16),
             version: 11,
@@ -485,6 +495,76 @@ impl HttpRequest {
         self.exts
             .remove(&TypeId::of::<T>())
             .and_then(|any| any.clone().downcast().ok())
+    }
+
+    fn parse_path_and_query(&mut self, target: &str) {
+        self.url_query.clear();
+        match target.find('?') {
+            Some(p) => {
+                self.url_path = LocalHipStr::from(&target[..p]);
+                self.url_query = target[p + 1..]
+                    .split('&')
+                    .map(|s| s.split_once('=').unwrap_or((s, "")))
+                    .map(|(a, b)| (LocalHipStr::from(a), LocalHipStr::from(b)))
+                    .collect();
+            }
+            None => {
+                self.url_path = LocalHipStr::from(target);
+            }
+        }
+    }
+
+    fn parse_request_target(&mut self, target: &str) -> anyhow::Result<()> {
+        if target == "*" {
+            if self.method != HttpMethod::OPTIONS {
+                Err(Self::bad_request("asterisk-form request-target requires OPTIONS"))?;
+            }
+            self.target_form = HttpRequestTargetForm::Asterisk;
+            self.url_query.clear();
+            self.url_path = LocalHipStr::from("*");
+            return Ok(());
+        }
+
+        if target.starts_with('/') {
+            if self.method == HttpMethod::CONNECT {
+                Err(Self::bad_request("CONNECT requires authority-form request-target"))?;
+            }
+            self.target_form = HttpRequestTargetForm::Origin;
+            self.parse_path_and_query(target);
+            return Ok(());
+        }
+
+        if target.contains("://") {
+            if self.method == HttpMethod::CONNECT {
+                Err(Self::bad_request(
+                    "CONNECT requires authority-form, absolute-form is invalid",
+                ))?;
+            }
+            let uri = target
+                .parse::<Uri>()
+                .map_err(|_| Self::bad_request("invalid absolute-form request-target"))?;
+            if uri.scheme().is_none() || uri.authority().is_none() {
+                Err(Self::bad_request(
+                    "absolute-form request-target must include scheme and authority",
+                ))?;
+            }
+            self.target_form = HttpRequestTargetForm::Absolute;
+            let path_and_query = uri.path_and_query().map(|v| v.as_str()).unwrap_or("/");
+            self.parse_path_and_query(path_and_query);
+            return Ok(());
+        }
+
+        if http::uri::Authority::from_str(target).is_ok() {
+            if self.method != HttpMethod::CONNECT {
+                Err(Self::bad_request("authority-form request-target is only valid for CONNECT"))?;
+            }
+            self.target_form = HttpRequestTargetForm::Authority;
+            self.url_query.clear();
+            self.url_path = LocalHipStr::from(target);
+            return Ok(());
+        }
+
+        Err(Self::bad_request("unsupported request-target form"))
     }
 
     pub fn get_uri(&self, is_https: bool) -> anyhow::Result<http::Uri> {
@@ -913,19 +993,8 @@ impl HttpRequest {
                 _ => return Err(Error::msg(format!("unrecognized method: {method}"))),
             }
         };
-        let url = rreq.path.unwrap();
-        match url.find('?') {
-            Some(p) => {
-                req.url_path = LocalHipStr::from(&url[..p]);
-                req.url_query = url[p + 1..]
-                    .split('&')
-                    .into_iter()
-                    .map(|s| s.split_once('=').unwrap_or((s, "")))
-                    .map(|(a, b)| (LocalHipStr::from(a), LocalHipStr::from(b)))
-                    .collect();
-            }
-            None => req.url_path = LocalHipStr::from(url),
-        }
+        let target = rreq.path.unwrap();
+        req.parse_request_target(target)?;
         req.version = rreq.version.unwrap_or(1) + 10;
         for h in rreq.headers.iter() {
             if h.name == "" {

@@ -527,6 +527,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_server_accepts_absolute_form_request_target() -> anyhow::Result<()> {
+        #[potato::http_get("/abs_form_target")]
+        async fn abs_form_target(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("absolute form ok")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = format!(
+            "GET http://{}/abs_form_target?ok=1 HTTP/1.1\r\nHost: wrong.example\r\nConnection: close\r\n\r\n",
+            server_addr
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(response_text.contains("absolute form ok"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_authority_form_for_non_connect() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "GET example.com:443 HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response_text.contains("authority-form request-target is only valid for CONNECT"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_origin_form_for_connect() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "CONNECT /tunnel HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response_text.contains("CONNECT requires authority-form request-target"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_options_asterisk_uses_server_wide_allow() -> anyhow::Result<()> {
+        #[potato::http_get("/asterisk_get")]
+        async fn asterisk_get(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("ok")
+        }
+
+        #[potato::http_post("/asterisk_post")]
+        async fn asterisk_post(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("ok")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "OPTIONS * HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(response_text.contains("Allow:"));
+        assert!(response_text.contains("GET"));
+        assert!(response_text.contains("POST"));
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "GET * HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response_text.contains("asterisk-form request-target requires OPTIONS"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_server_head_fallback_uses_get_status_without_body() -> anyhow::Result<()> {
         #[potato::http_get("/head_fallback_get")]
         async fn head_fallback_get(_req: &mut HttpRequest) -> HttpResponse {

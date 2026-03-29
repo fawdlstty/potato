@@ -2,7 +2,9 @@ use crate::utils::enums::HttpConnection;
 use crate::utils::refstr::HeaderItem;
 use crate::utils::tcp_stream::HttpStream;
 use crate::CompressMode;
-use crate::{HttpHandler, HttpMethod, HttpRequest, HttpResponse, PreflightResult};
+use crate::{
+    HttpHandler, HttpMethod, HttpRequest, HttpRequestTargetForm, HttpResponse, PreflightResult,
+};
 use crate::{RequestHandlerFlag, TransferSession};
 use std::any::TypeId;
 use std::borrow::Cow;
@@ -601,7 +603,9 @@ impl PipeContext {
                                     [HttpMethod::HEAD, HttpMethod::OPTIONS]
                                         .into_iter()
                                         .collect();
-                                if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
+                                if req.target_form == HttpRequestTargetForm::Asterisk {
+                                    options.extend(HANDLERS_FLAT.keys().map(|(_, method)| *method));
+                                } else if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
                                     options.extend(handlers.keys().map(|p| *p));
                                 }
                                 options
