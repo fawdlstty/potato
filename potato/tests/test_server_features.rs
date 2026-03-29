@@ -121,6 +121,25 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_request_as_bytes_writes_declared_chunked_trailers() -> anyhow::Result<()> {
+        let mut req = HttpRequest::new();
+        req.method = potato::HttpMethod::POST;
+        req.url_path = "/chunked-trailer".into();
+        req.set_header("Host", "127.0.0.1");
+        req.set_header("Transfer-Encoding", "chunked");
+        req.set_header("Trailer", "X-Trace");
+        req.body = b"Hello".to_vec().into();
+        req.set_trailer("X-Trace", "trace-1");
+        req.set_trailer("X-Ignored", "should-not-send");
+
+        let request_text = String::from_utf8(req.as_bytes())?;
+        assert!(request_text.contains("Trailer: X-Trace\r\n"));
+        assert!(!request_text.contains("X-Ignored: should-not-send\r\n"));
+        assert!(request_text.ends_with("\r\n\r\n5\r\nHello\r\n0\r\nX-Trace: trace-1\r\n\r\n"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_client_decodes_all_chunked_response_chunks() -> anyhow::Result<()> {
         let port = get_test_port();
@@ -158,6 +177,48 @@ mod tests {
             potato::HttpResponseBody::Stream(_) => vec![],
         };
         assert_eq!(body, b"Hello World!".to_vec());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_client_decodes_chunked_response_trailers() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind(&server_addr).await?;
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut req_buf = [0_u8; 1024];
+            let _ = socket.read(&mut req_buf).await?;
+
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Trailer: X-Trace\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "5\r\nHello\r\n",
+                "0\r\n",
+                "X-Trace: trace-xyz\r\n",
+                "\r\n"
+            );
+            socket.write_all(response.as_bytes()).await?;
+            socket.shutdown().await?;
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let url = format!("http://{}/chunked-trailer-resp", server_addr);
+        let res = potato::get(&url, vec![]).await?;
+        server_task.await??;
+
+        let body = match &res.body {
+            potato::HttpResponseBody::Data(data) => data.clone(),
+            potato::HttpResponseBody::Stream(_) => vec![],
+        };
+        assert_eq!(body, b"Hello".to_vec());
+        assert_eq!(res.get_trailer("X-Trace"), Some("trace-xyz"));
 
         Ok(())
     }
@@ -362,6 +423,87 @@ mod tests {
 
         assert!(response_text.starts_with("HTTP/1.1 200"));
         assert!(response_text.contains("Hello World"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_accepts_declared_chunked_request_trailers() -> anyhow::Result<()> {
+        #[potato::http_post("/chunked_req_trailer_echo")]
+        async fn chunked_req_trailer_echo(req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text(req.get_trailer("X-Trace").unwrap_or(""))
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "POST /chunked_req_trailer_echo HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Trailer: X-Trace\r\n",
+            "\r\n",
+            "5\r\nHello\r\n",
+            "0\r\n",
+            "X-Trace: trace-req\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(response_text.contains("trace-req"));
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_undeclared_chunked_request_trailers() -> anyhow::Result<()> {
+        #[potato::http_post("/chunked_req_trailer_reject")]
+        async fn chunked_req_trailer_reject(_req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text("unreachable")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+
+        let mut stream = connect_with_retry(&server_addr).await?;
+        let request = concat!(
+            "POST /chunked_req_trailer_reject HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Connection: close\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "\r\n",
+            "5\r\nHello\r\n",
+            "0\r\n",
+            "X-Trace: undeclared\r\n",
+            "\r\n"
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response_text.contains("unexpected trailer field"));
 
         server_handle.abort();
         Ok(())

@@ -38,7 +38,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
-use std::{collections::HashMap, future::Future, pin::Pin};
+use std::{collections::HashMap, collections::HashSet, future::Future, pin::Pin};
 use strum::Display;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::Mutex;
@@ -78,6 +78,46 @@ impl fmt::Display for HttpRequestParseError {
 }
 
 impl std::error::Error for HttpRequestParseError {}
+
+fn parse_declared_trailer_names(raw: Option<&str>) -> HashSet<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect::<HashSet<_>>()
+    })
+    .unwrap_or_default()
+}
+
+fn is_forbidden_trailer_field(name: &str) -> bool {
+    // RFC 9110/9112: trailers must not carry framing or hop-by-hop control fields.
+    matches!(
+        name,
+        "transfer-encoding"
+            | "content-length"
+            | "trailer"
+            | "host"
+            | "connection"
+            | "keep-alive"
+            | "te"
+            | "upgrade"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+    )
+}
+
+fn parse_trailer_line(line: &[u8]) -> anyhow::Result<(String, String)> {
+    let line = str::from_utf8(line)?.trim();
+    let (name, value) = line
+        .split_once(':')
+        .ok_or_else(|| anyhow!("invalid trailer field line"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        Err(anyhow!("empty trailer field name"))?;
+    }
+    Ok((name.to_string(), value.trim().to_string()))
+}
 
 /// Parse HTTP date format to Unix timestamp
 /// Supports RFC 7231 standard HTTP date formats:
@@ -435,6 +475,7 @@ pub struct HttpRequest {
     pub url_query: HashMap<LocalHipStr<'static>, LocalHipStr<'static>>,
     pub version: u8,
     pub headers: HashMap<HeaderOrHipStr, LocalHipStr<'static>>,
+    pub trailers: HashMap<HeaderOrHipStr, LocalHipStr<'static>>,
     pub body: LocalHipByt<'static>,
     pub body_pairs: HashMap<LocalHipStr<'static>, LocalHipStr<'static>>,
     pub body_files: HashMap<LocalHipStr<'static>, PostFile>,
@@ -537,6 +578,7 @@ impl HttpRequest {
             url_query: HashMap::with_capacity(16),
             version: 11,
             headers: HashMap::with_capacity(16),
+            trailers: HashMap::with_capacity(4),
             body: LocalHipByt::new(),
             body_pairs: HashMap::with_capacity(16),
             body_files: HashMap::with_capacity(4),
@@ -702,6 +744,28 @@ impl HttpRequest {
         self.headers.get(&key.into()).map(|a| &a[..])
     }
 
+    pub fn set_trailer(
+        &mut self,
+        key: impl Into<HeaderOrHipStr>,
+        value: impl Into<LocalHipStr<'static>>,
+    ) {
+        self.trailers.insert(key.into(), value.into());
+    }
+
+    pub fn get_trailer(&self, key: &str) -> Option<&str> {
+        if let Some(header_item) = HeaderItem::try_from_str(key) {
+            if let Some(value) = self
+                .trailers
+                .get(&HeaderOrHipStr::HeaderItem(header_item))
+            {
+                return Some(&value[..]);
+            }
+        }
+        self.trailers
+            .get(&HeaderOrHipStr::HipStr(LocalHipStr::from(key)))
+            .map(|a| &a[..])
+    }
+
     pub fn get_header_accept_encoding(&self) -> CompressMode {
         Self::negotiate_accept_encoding(self.get_header_key(HeaderItem::Accept_Encoding).unwrap_or(""))
     }
@@ -837,9 +901,11 @@ impl HttpRequest {
         buf: &mut Vec<u8>,
         stream: &mut HttpStream,
         hdr_len: usize,
-    ) -> anyhow::Result<(LocalHipByt<'static>, usize)> {
+        allowed_trailers: &HashSet<String>,
+    ) -> anyhow::Result<(LocalHipByt<'static>, HashMap<HeaderOrHipStr, LocalHipStr<'static>>, usize)> {
         let mut cursor = hdr_len;
         let mut body = Vec::new();
+        let mut trailers = HashMap::with_capacity(4);
         let mut tmp_buf = [0u8; 4096];
 
         loop {
@@ -885,6 +951,16 @@ impl HttpRequest {
                     if line_end == line_start {
                         break cursor;
                     }
+
+                    let (name, value) = parse_trailer_line(&buf[line_start..line_end])?;
+                    let name_lower = name.to_ascii_lowercase();
+                    if is_forbidden_trailer_field(&name_lower) {
+                        Err(anyhow!("forbidden trailer field: {name}"))?;
+                    }
+                    if !allowed_trailers.contains(&name_lower) {
+                        Err(anyhow!("unexpected trailer field: {name}"))?;
+                    }
+                    trailers.insert(HeaderOrHipStr::from_str(&name), value.into());
                 };
                 cursor = trailer_end;
                 break;
@@ -904,7 +980,7 @@ impl HttpRequest {
             cursor += chunk_size + 2;
         }
 
-        Ok((LocalHipByt::from(body), cursor - hdr_len))
+        Ok((LocalHipByt::from(body), trailers, cursor - hdr_len))
     }
 
     pub fn get_header_content_type<'a>(&'a self) -> Option<HttpContentType<'a>> {
@@ -1003,8 +1079,14 @@ impl HttpRequest {
 
         let bdy_len;
         if has_chunked_transfer_encoding {
-            let (body, consumed_len) = Self::read_chunked_body(buf, stream, hdr_len).await?;
+            let allowed_trailers =
+                parse_declared_trailer_names(req.get_header_key(HeaderItem::Trailer));
+            let (body, trailers, consumed_len) =
+                Self::read_chunked_body(buf, stream, hdr_len, &allowed_trailers)
+                    .await
+                    .map_err(|err| Self::bad_request(err.to_string()))?;
             req.body = body;
+            req.trailers = trailers;
             bdy_len = consumed_len;
         } else {
             while hdr_len + content_length > buf.len() {
@@ -1331,6 +1413,20 @@ impl HttpRequest {
             })
             .unwrap_or(false);
 
+        let declared_trailer_names = parse_declared_trailer_names(self.get_header_key(HeaderItem::Trailer));
+        let mut outbound_trailers: Vec<(String, String)> = Vec::with_capacity(self.trailers.len());
+        for (key, value) in self.trailers.iter() {
+            let key_str = key.to_str();
+            let lower = key_str.to_ascii_lowercase();
+            if is_forbidden_trailer_field(&lower) {
+                continue;
+            }
+            if !declared_trailer_names.is_empty() && !declared_trailer_names.contains(&lower) {
+                continue;
+            }
+            outbound_trailers.push((key_str.to_string(), value.to_string()));
+        }
+
         let mut req_str = format!("{} {} HTTP/1.1\r\n", self.method, self.url_path);
         for (k, v) in self.headers.iter() {
             if let HeaderOrHipStr::HeaderItem(HeaderItem::Content_Length) = k {
@@ -1339,14 +1435,38 @@ impl HttpRequest {
             req_str.push_str(&format!("{}: {v}\r\n", k.to_str()));
         }
         if use_chunked {
+            if declared_trailer_names.is_empty() && !outbound_trailers.is_empty() {
+                let trailer_names = outbound_trailers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                req_str.push_str(&format!("Trailer: {trailer_names}\r\n"));
+            }
             req_str.push_str("\r\n");
             let mut ret = req_str.as_bytes().to_vec();
             if self.body.is_empty() {
-                ret.extend_from_slice(b"0\r\n\r\n");
+                if outbound_trailers.is_empty() {
+                    ret.extend_from_slice(b"0\r\n\r\n");
+                } else {
+                    ret.extend_from_slice(b"0\r\n");
+                    for (name, value) in outbound_trailers.iter() {
+                        ret.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+                    }
+                    ret.extend_from_slice(b"\r\n");
+                }
             } else {
                 ret.extend_from_slice(format!("{:x}\r\n", self.body.len()).as_bytes());
                 ret.extend(&self.body[..]);
-                ret.extend_from_slice(b"\r\n0\r\n\r\n");
+                if outbound_trailers.is_empty() {
+                    ret.extend_from_slice(b"\r\n0\r\n\r\n");
+                } else {
+                    ret.extend_from_slice(b"\r\n0\r\n");
+                    for (name, value) in outbound_trailers.iter() {
+                        ret.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+                    }
+                    ret.extend_from_slice(b"\r\n");
+                }
             }
             ret
         } else {
@@ -1374,6 +1494,7 @@ pub struct HttpResponse {
     pub version: String,
     pub http_code: u16,
     pub headers: HashMap<Cow<'static, str>, Cow<'static, str>>,
+    pub trailers: HashMap<Cow<'static, str>, Cow<'static, str>>,
     pub body: HttpResponseBody,
 }
 unsafe impl Send for HttpResponse {}
@@ -1384,6 +1505,7 @@ impl Clone for HttpResponse {
             version: self.version.clone(),
             http_code: self.http_code,
             headers: self.headers.clone(),
+            trailers: self.trailers.clone(),
             body: match &self.body {
                 HttpResponseBody::Data(data) => HttpResponseBody::Data(data.clone()),
                 HttpResponseBody::Stream(_) => panic!("Cannot clone Stream response"),
@@ -1400,6 +1522,7 @@ macro_rules! make_resp_by_text {
                 version: "HTTP/1.1".into(),
                 http_code: 200,
                 headers: Self::default_headers($cnt_type),
+                trailers: HashMap::with_capacity(4),
                 body: HttpResponseBody::Data(body.as_bytes().to_vec()),
             }
         }
@@ -1413,6 +1536,7 @@ macro_rules! make_resp_by_binary {
                 version: "HTTP/1.1".into(),
                 http_code: 200,
                 headers: Self::default_headers($cnt_type),
+                trailers: HashMap::with_capacity(4),
                 body: HttpResponseBody::Data(body.to_vec()),
             }
         }
@@ -1461,6 +1585,7 @@ impl HttpResponse {
             version: "".into(),
             http_code: 0,
             headers: HashMap::with_capacity(16),
+            trailers: HashMap::with_capacity(4),
             body: HttpResponseBody::Data(vec![]),
         }
     }
@@ -1495,6 +1620,7 @@ impl HttpResponse {
                 ("Content-Type".into(), "application/octet-stream".into()),
             ]
             .into(),
+            trailers: HashMap::with_capacity(4),
             body: HttpResponseBody::Stream(rx),
         }
     }
@@ -1509,6 +1635,7 @@ impl HttpResponse {
                 ("Content-Type".into(), content_type.into().into()),
             ]
             .into(),
+            trailers: HashMap::with_capacity(4),
             body: HttpResponseBody::Stream(rx),
         }
     }
@@ -1611,8 +1738,17 @@ impl HttpResponse {
                 ("Sec-WebSocket-Accept".into(), ws_accept.into()),
             ]
             .into(),
+            trailers: HashMap::with_capacity(4),
             body: HttpResponseBody::Data(vec![]),
         }
+    }
+
+    pub fn add_trailer(&mut self, key: Cow<'static, str>, value: Cow<'static, str>) {
+        self.trailers.insert(key, value);
+    }
+
+    pub fn get_trailer(&self, key: &str) -> Option<&str> {
+        self.trailers.get(key).map(|v| v.as_ref())
     }
 
     fn status_disallows_response_body(status: u16) -> bool {
@@ -1691,6 +1827,19 @@ impl HttpResponse {
     ) -> anyhow::Result<()> {
         let suppress_body = self.should_suppress_response_body(request_method);
         let no_content_encoding = self.get_header("Content-Encoding").is_none();
+        let declared_trailer_names = parse_declared_trailer_names(self.get_header("Trailer"));
+        let mut outbound_stream_trailers: Vec<(String, String)> =
+            Vec::with_capacity(self.trailers.len());
+        for (key, value) in self.trailers.iter() {
+            let lower = key.to_ascii_lowercase();
+            if is_forbidden_trailer_field(&lower) {
+                continue;
+            }
+            if !declared_trailer_names.is_empty() && !declared_trailer_names.contains(&lower) {
+                continue;
+            }
+            outbound_stream_trailers.push((key.to_string(), value.to_string()));
+        }
         match &mut self.body {
             HttpResponseBody::Data(data) => {
                 let mut payload_tmp: Vec<u8> = vec![];
@@ -1797,6 +1946,14 @@ impl HttpResponse {
                     }
                     ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
                 }
+                if declared_trailer_names.is_empty() && !outbound_stream_trailers.is_empty() {
+                    let trailer_names = outbound_stream_trailers
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    ret.push_str(&ssformat!(512, "Trailer: {trailer_names}\r\n"));
+                }
                 ret.push_str("\r\n");
                 let header_bytes: Vec<u8> = ret.as_bytes().to_vec();
                 stream.write_all(&header_bytes).await?;
@@ -1817,7 +1974,17 @@ impl HttpResponse {
                     stream.write_all(b"\r\n").await?;
                 }
                 // Send final chunk (length 0)
-                stream.write_all(b"0\r\n\r\n").await?;
+                if outbound_stream_trailers.is_empty() {
+                    stream.write_all(b"0\r\n\r\n").await?;
+                } else {
+                    stream.write_all(b"0\r\n").await?;
+                    for (name, value) in outbound_stream_trailers.iter() {
+                        stream
+                            .write_all(format!("{name}: {value}\r\n").as_bytes())
+                            .await?;
+                    }
+                    stream.write_all(b"\r\n").await?;
+                }
             }
         }
         Ok(())
@@ -1848,6 +2015,7 @@ impl HttpResponse {
             .is_some_and(|v| v == "chunked")
         {
             let mut chunked_body = Vec::new();
+            let allowed_trailers = parse_declared_trailer_names(res.get_header("Trailer"));
             loop {
                 let chunked_len = {
                     let mut chunked_len = 0;
@@ -1877,7 +2045,35 @@ impl HttpResponse {
                     chunked_len
                 };
                 if chunked_len == 0 {
-                    bdy_len += 2;
+                    loop {
+                        loop {
+                            if buf[(hdr_len + bdy_len)..].windows(2).any(|part| part == b"\r\n") {
+                                break;
+                            }
+                            buf.extend_by_streams(stream).await?;
+                        }
+
+                        let line_start = hdr_len + bdy_len;
+                        let rel_line_end = buf[line_start..]
+                            .windows(2)
+                            .position(|part| part == b"\r\n")
+                            .ok_or_else(|| anyhow!("invalid trailer terminator"))?;
+                        let line_end = line_start + rel_line_end;
+                        bdy_len += rel_line_end + 2;
+                        if rel_line_end == 0 {
+                            break;
+                        }
+
+                        let (name, value) = parse_trailer_line(&buf[line_start..line_end])?;
+                        let name_lower = name.to_ascii_lowercase();
+                        if is_forbidden_trailer_field(&name_lower) {
+                            Err(anyhow!("forbidden trailer field: {name}"))?;
+                        }
+                        if !allowed_trailers.contains(&name_lower) {
+                            Err(anyhow!("unexpected trailer field: {name}"))?;
+                        }
+                        res.trailers.insert(name.into(), value.into());
+                    }
                     break;
                 }
                 while hdr_len + bdy_len + chunked_len + 2 > buf.len() {
