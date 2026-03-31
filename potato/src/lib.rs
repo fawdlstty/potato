@@ -121,6 +121,18 @@ fn parse_trailer_line(line: &[u8]) -> anyhow::Result<(String, String)> {
     Ok((name.to_string(), value.trim().to_string()))
 }
 
+fn parse_transfer_encoding_tokens(raw: &str) -> anyhow::Result<Vec<String>> {
+    let codings = raw
+        .split(',')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if codings.is_empty() {
+        Err(anyhow!("empty Transfer-Encoding header"))?;
+    }
+    Ok(codings)
+}
+
 /// Parse HTTP date format to Unix timestamp
 /// Supports RFC 7231 standard HTTP date formats:
 /// - RFC 1123: "Mon, 06 Nov 1994 08:49:37 GMT"
@@ -641,6 +653,27 @@ impl HttpRequest {
         }
     }
 
+    fn request_target(&self) -> String {
+        if matches!(
+            self.target_form,
+            HttpRequestTargetForm::Asterisk | HttpRequestTargetForm::Authority
+        ) {
+            return self.url_path.to_string();
+        }
+        let mut target = self.url_path.to_string();
+        if !self.url_query.is_empty() {
+            target.push_str(&self.query_string());
+        }
+        target
+    }
+
+    fn request_version_line(&self) -> String {
+        if self.version >= 10 {
+            return format!("HTTP/1.{}", self.version - 10);
+        }
+        "HTTP/1.1".to_string()
+    }
+
     fn parse_request_target(&mut self, target: &str) -> anyhow::Result<()> {
         if target == "*" {
             if self.method != HttpMethod::OPTIONS {
@@ -725,7 +758,8 @@ impl HttpRequest {
         let uri = url.parse::<Uri>()?;
         let mut req = Self::new();
         req.method = method;
-        req.url_path = LocalHipStr::from(uri.path());
+        req.target_form = HttpRequestTargetForm::Origin;
+        req.parse_path_and_query(uri.path_and_query().map(|v| v.as_str()).unwrap_or("/"));
         req.headers.insert(
             HeaderOrHipStr::from_str("Host"),
             uri.host().unwrap_or("localhost").into(),
@@ -1468,7 +1502,12 @@ impl HttpRequest {
             outbound_trailers.push((key_str.to_string(), value.to_string()));
         }
 
-        let mut req_str = format!("{} {} HTTP/1.1\r\n", self.method, self.url_path);
+        let mut req_str = format!(
+            "{} {} {}\r\n",
+            self.method,
+            self.request_target(),
+            self.request_version_line()
+        );
         for (k, v) in self.headers.iter() {
             if let HeaderOrHipStr::HeaderItem(HeaderItem::Content_Length) = k {
                 continue;
@@ -1651,14 +1690,15 @@ impl HttpResponse {
         Self::html("")
     }
 
-    /// Create a SSE response with chunked transfer encoding
-    pub fn sse(rx: Receiver<Vec<u8>>) -> Self {
+    pub fn chunked(rx: Receiver<Vec<u8>>) -> Self {
         Self {
             version: "HTTP/1.1".into(),
             http_code: 200,
             headers: [
                 ("Transfer-Encoding".into(), "chunked".into()),
                 ("Content-Type".into(), "application/octet-stream".into()),
+                ("Cache-Control".into(), "no-cache".into()),
+                ("Connection".into(), "keep-alive".into()),
             ]
             .into(),
             trailers: HashMap::with_capacity(4),
@@ -1666,19 +1706,11 @@ impl HttpResponse {
         }
     }
 
-    /// Create a SSE response with custom content type
-    pub fn sse_with_content_type(rx: Receiver<Vec<u8>>, content_type: impl Into<String>) -> Self {
-        Self {
-            version: "HTTP/1.1".into(),
-            http_code: 200,
-            headers: [
-                ("Transfer-Encoding".into(), "chunked".into()),
-                ("Content-Type".into(), content_type.into().into()),
-            ]
-            .into(),
-            trailers: HashMap::with_capacity(4),
-            body: HttpResponseBody::Stream(rx),
-        }
+    /// Create a SSE response with chunked transfer encoding
+    pub fn sse(rx: Receiver<Vec<u8>>) -> Self {
+        let mut res = Self::chunked(rx);
+        res.add_header("Content-Type".into(), "text/event-stream".into());
+        res
     }
 
     pub fn from_file(path: &str, download: bool, meta: Option<Metadata>) -> Self {
@@ -1800,6 +1832,108 @@ impl HttpResponse {
         request_method == Some(HttpMethod::HEAD)
     }
 
+    fn transfer_encoding_has_chunked(raw: &str) -> anyhow::Result<bool> {
+        let codings = parse_transfer_encoding_tokens(raw)?;
+        if codings.iter().any(|coding| coding == "chunked") {
+            if codings.last().is_some_and(|coding| coding == "chunked") {
+                return Ok(true);
+            }
+            Err(anyhow!(
+                "invalid Transfer-Encoding order: chunked must be final coding"
+            ))?;
+        }
+        Err(anyhow!("unsupported Transfer-Encoding: {raw}"))
+    }
+
+    async fn read_chunked_body(
+        buf: &mut Vec<u8>,
+        stream: &mut HttpStream,
+        hdr_len: usize,
+        allowed_trailers: &HashSet<String>,
+    ) -> anyhow::Result<(
+        Vec<u8>,
+        HashMap<Cow<'static, str>, Cow<'static, str>>,
+        usize,
+    )> {
+        let mut cursor = hdr_len;
+        let mut body = Vec::new();
+        let mut trailers = HashMap::with_capacity(4);
+        let mut tmp_buf = [0u8; 4096];
+
+        loop {
+            let line_end = loop {
+                if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n") {
+                    break cursor + pos;
+                }
+                let n = stream.read(&mut tmp_buf).await?;
+                if n == 0 {
+                    Err(anyhow::Error::msg("connection closed"))?;
+                }
+                buf.extend(&tmp_buf[..n]);
+            };
+
+            let chunk_size = {
+                let size_line = str::from_utf8(&buf[cursor..line_end])?;
+                let size_token = size_line
+                    .split_once(';')
+                    .map_or(size_line, |(size, _)| size)
+                    .trim();
+                if size_token.is_empty() {
+                    Err(anyhow!("invalid chunk size"))?;
+                }
+                usize::from_str_radix(size_token, 16)?
+            };
+            cursor = line_end + 2;
+
+            if chunk_size == 0 {
+                loop {
+                    let line_start = cursor;
+                    let line_end = loop {
+                        if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n")
+                        {
+                            break cursor + pos;
+                        }
+                        let n = stream.read(&mut tmp_buf).await?;
+                        if n == 0 {
+                            Err(anyhow::Error::msg("connection closed"))?;
+                        }
+                        buf.extend(&tmp_buf[..n]);
+                    };
+                    cursor = line_end + 2;
+                    if line_end == line_start {
+                        break;
+                    }
+
+                    let (name, value) = parse_trailer_line(&buf[line_start..line_end])?;
+                    let name_lower = name.to_ascii_lowercase();
+                    if is_forbidden_trailer_field(&name_lower) {
+                        Err(anyhow!("forbidden trailer field: {name}"))?;
+                    }
+                    if !allowed_trailers.contains(&name_lower) {
+                        Err(anyhow!("unexpected trailer field: {name}"))?;
+                    }
+                    trailers.insert(name.into(), value.into());
+                }
+                break;
+            }
+
+            while buf.len() < cursor + chunk_size + 2 {
+                let n = stream.read(&mut tmp_buf).await?;
+                if n == 0 {
+                    Err(anyhow::Error::msg("connection closed"))?;
+                }
+                buf.extend(&tmp_buf[..n]);
+            }
+            body.extend_from_slice(&buf[cursor..cursor + chunk_size]);
+            if &buf[cursor + chunk_size..cursor + chunk_size + 2] != b"\r\n" {
+                Err(anyhow!("invalid chunk terminator"))?;
+            }
+            cursor += chunk_size + 2;
+        }
+
+        Ok((body, trailers, cursor - hdr_len))
+    }
+
     pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {
         match &self.body {
             HttpResponseBody::Data(data) => {
@@ -1834,9 +1968,7 @@ impl HttpResponse {
                     self.http_code
                 ));
                 for (key, value) in self.headers.iter() {
-                    if key == "Content-Length"
-                        || (suppress_body && key.eq_ignore_ascii_case("Transfer-Encoding"))
-                    {
+                    if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
                         continue;
                     }
                     ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
@@ -1937,7 +2069,7 @@ impl HttpResponse {
                     } else {
                         for (key, value) in self.headers.iter() {
                             if key == "Content-Length"
-                                || (suppress_body && key.eq_ignore_ascii_case("Transfer-Encoding"))
+                                || key.eq_ignore_ascii_case("Transfer-Encoding")
                             {
                                 continue;
                             }
@@ -1946,8 +2078,7 @@ impl HttpResponse {
                     }
                 } else {
                     for (key, value) in self.headers.iter() {
-                        if key == "Content-Length"
-                            || (suppress_body && key.eq_ignore_ascii_case("Transfer-Encoding"))
+                        if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding")
                         {
                             continue;
                         }
@@ -2057,90 +2188,30 @@ impl HttpResponse {
         if skip_body {
             return Ok((res, hdr_len));
         }
-        if let Some(cnt_len) = res.headers.get("Content-Length") {
+        let has_chunked_transfer_encoding =
+            if let Some(raw_te) = res.headers.get("Transfer-Encoding") {
+                Self::transfer_encoding_has_chunked(raw_te)?
+            } else {
+                false
+            };
+        if has_chunked_transfer_encoding && res.headers.contains_key("Content-Length") {
+            Err(anyhow!(
+                "conflicting headers: Transfer-Encoding and Content-Length"
+            ))?;
+        }
+        if has_chunked_transfer_encoding {
+            let allowed_trailers = parse_declared_trailer_names(res.get_header("Trailer"));
+            let (chunked_body, trailers, consumed_len) =
+                Self::read_chunked_body(buf, stream, hdr_len, &allowed_trailers).await?;
+            bdy_len = consumed_len;
+            res.trailers = trailers;
+            res.body = HttpResponseBody::Data(chunked_body);
+        } else if let Some(cnt_len) = res.headers.get("Content-Length") {
             bdy_len = cnt_len.parse::<usize>().unwrap_or(0);
             while hdr_len + bdy_len > buf.len() {
                 buf.extend_by_streams(stream).await?;
             }
             res.body = HttpResponseBody::Data(buf[hdr_len..hdr_len + bdy_len].to_vec());
-        // to_ref_buf
-        } else if res
-            .headers
-            .get("Transfer-Encoding")
-            .is_some_and(|v| v == "chunked")
-        {
-            let mut chunked_body = Vec::new();
-            let allowed_trailers = parse_declared_trailer_names(res.get_header("Trailer"));
-            loop {
-                let chunked_len = {
-                    let mut chunked_len = 0;
-                    let mut is_fin = false;
-                    for c in buf[(hdr_len + bdy_len)..].iter() {
-                        bdy_len += 1;
-                        match *c {
-                            b'\r' => continue,
-                            b'\n' => {
-                                is_fin = true;
-                                break;
-                            }
-                            b'0'..=b'9' => chunked_len = chunked_len * 16 + (*c - b'0') as usize,
-                            b'a'..=b'z' => {
-                                chunked_len = chunked_len * 16 + (*c - b'a' + 10) as usize
-                            }
-                            b'A'..=b'Z' => {
-                                chunked_len = chunked_len * 16 + (*c - b'A' + 10) as usize
-                            }
-                            _ => Err(anyhow!("unexpected char: {}", *c as char))?,
-                        }
-                    }
-                    if !is_fin {
-                        buf.extend_by_streams(stream).await?;
-                        continue;
-                    }
-                    chunked_len
-                };
-                if chunked_len == 0 {
-                    loop {
-                        loop {
-                            if buf[(hdr_len + bdy_len)..]
-                                .windows(2)
-                                .any(|part| part == b"\r\n")
-                            {
-                                break;
-                            }
-                            buf.extend_by_streams(stream).await?;
-                        }
-
-                        let line_start = hdr_len + bdy_len;
-                        let rel_line_end = buf[line_start..]
-                            .windows(2)
-                            .position(|part| part == b"\r\n")
-                            .ok_or_else(|| anyhow!("invalid trailer terminator"))?;
-                        let line_end = line_start + rel_line_end;
-                        bdy_len += rel_line_end + 2;
-                        if rel_line_end == 0 {
-                            break;
-                        }
-
-                        let (name, value) = parse_trailer_line(&buf[line_start..line_end])?;
-                        let name_lower = name.to_ascii_lowercase();
-                        if is_forbidden_trailer_field(&name_lower) {
-                            Err(anyhow!("forbidden trailer field: {name}"))?;
-                        }
-                        if !allowed_trailers.contains(&name_lower) {
-                            Err(anyhow!("unexpected trailer field: {name}"))?;
-                        }
-                        res.trailers.insert(name.into(), value.into());
-                    }
-                    break;
-                }
-                while hdr_len + bdy_len + chunked_len + 2 > buf.len() {
-                    buf.extend_by_streams(stream).await?;
-                }
-                chunked_body.extend(&buf[(hdr_len + bdy_len)..(hdr_len + bdy_len + chunked_len)]);
-                bdy_len += chunked_len + 2;
-            }
-            res.body = HttpResponseBody::Data(chunked_body);
         }
 
         Ok((res, hdr_len + bdy_len))
@@ -2158,16 +2229,52 @@ impl HttpResponse {
         };
 
         let mut req = HttpResponse::new();
+        let mut content_length_seen: Option<String> = None;
+        let mut transfer_encoding_seen = false;
         req.version = format!("HTTP/1.{}", rres.version.unwrap_or(0));
         req.http_code = rres.code.unwrap_or(0);
         for h in rres.headers.iter() {
             if h.name == "" {
                 break;
             }
+            let header_value = str::from_utf8(h.value)?.trim();
+            if h.name.eq_ignore_ascii_case("Content-Length") {
+                if header_value.is_empty() {
+                    Err(anyhow!("empty Content-Length header"))?;
+                }
+                if let Some(prev) = &content_length_seen {
+                    if prev != header_value {
+                        Err(anyhow!("conflicting duplicate Content-Length headers"))?;
+                    }
+                } else {
+                    content_length_seen = Some(header_value.to_string());
+                    req.headers
+                        .insert("Content-Length".into(), header_value.to_string().into());
+                }
+                continue;
+            }
+            if h.name.eq_ignore_ascii_case("Transfer-Encoding") {
+                if header_value.is_empty() {
+                    Err(anyhow!("empty Transfer-Encoding header"))?;
+                }
+                transfer_encoding_seen = true;
+                if let Some(existing) = req.headers.get_mut("Transfer-Encoding") {
+                    *existing = format!("{}, {}", existing.as_ref(), header_value).into();
+                } else {
+                    req.headers
+                        .insert("Transfer-Encoding".into(), header_value.to_string().into());
+                }
+                continue;
+            }
             req.headers.insert(
                 h.name.http_std_case().into(),
-                str::from_utf8(h.value).unwrap_or("").to_string().into(),
+                header_value.to_string().into(),
             );
+        }
+        if transfer_encoding_seen && content_length_seen.is_some() {
+            Err(anyhow!(
+                "conflicting headers: Transfer-Encoding and Content-Length"
+            ))?;
         }
         Ok(Some((req, n)))
     }
@@ -2197,7 +2304,7 @@ pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompressMode, HttpRequest};
+    use super::{CompressMode, HttpMethod, HttpRequest, HttpResponse};
 
     #[test]
     fn accept_encoding_supports_simple_gzip_token() {
@@ -2255,5 +2362,42 @@ mod tests {
         let err = HttpRequest::from_headers_part(raw.as_bytes()).unwrap_err();
         let res = HttpRequest::parse_error_response(&err).unwrap();
         assert_eq!(res.http_code, 431);
+    }
+
+    #[test]
+    fn request_serialization_includes_query_and_version() {
+        let (mut req, _, _) =
+            HttpRequest::from_url("http://example.com/search?q=rust", HttpMethod::GET).unwrap();
+        req.version = 10;
+        let serialized = String::from_utf8(req.as_bytes()).unwrap();
+
+        assert!(serialized.starts_with("GET /search?q=rust HTTP/1.0\r\n"));
+    }
+
+    #[test]
+    fn response_parser_rejects_conflicting_duplicate_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n";
+        assert!(HttpResponse::from_headers_part(raw).is_err());
+    }
+
+    #[test]
+    fn response_parser_rejects_transfer_encoding_content_length_conflict() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n";
+        assert!(HttpResponse::from_headers_part(raw).is_err());
+    }
+
+    #[test]
+    fn response_transfer_encoding_supports_case_insensitive_lists() {
+        assert!(HttpResponse::transfer_encoding_has_chunked("gzip, Chunked").unwrap());
+    }
+
+    #[test]
+    fn response_data_serialization_omits_transfer_encoding() {
+        let mut res = HttpResponse::text("hello");
+        res.add_header("Transfer-Encoding".into(), "chunked".into());
+
+        let serialized = String::from_utf8(res.as_bytes(CompressMode::None)).unwrap();
+        assert!(serialized.contains("Content-Length: 5\r\n"));
+        assert!(!serialized.contains("Transfer-Encoding:"));
     }
 }

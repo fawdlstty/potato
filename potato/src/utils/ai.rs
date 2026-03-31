@@ -39,12 +39,7 @@ impl OpenAISender {
         let payload = format!("data: {root}\n\n");
         obj.tx.send(payload.into_bytes()).await?;
 
-        let mut res = crate::HttpResponse::sse(rx);
-        res.add_header("Content-Type".into(), "text/event-stream".into());
-        res.add_header("Cache-Control".into(), "no-cache".into());
-        res.add_header("Connection".into(), "keep-alive".into());
-        //
-        Ok((obj, res))
+        Ok((obj, crate::HttpResponse::sse(rx)))
     }
 
     pub async fn send(&self, message: impl Into<String>) -> anyhow::Result<()> {
@@ -127,12 +122,7 @@ impl ClaudeSender {
         let payload = format!("event: content_block_start\ndata: {root}\n\n");
         tx.send(payload.into_bytes()).await?;
 
-        let mut res = crate::HttpResponse::sse(rx);
-        res.add_header("Content-Type".into(), "text/event-stream".into());
-        res.add_header("Cache-Control".into(), "no-cache".into());
-        res.add_header("Connection".into(), "keep-alive".into());
-        //
-        Ok((Self { tx }, res))
+        Ok((Self { tx }, crate::HttpResponse::sse(rx)))
     }
 
     pub async fn send(&self, message: impl Into<String>) -> anyhow::Result<()> {
