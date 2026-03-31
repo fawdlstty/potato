@@ -668,10 +668,13 @@ impl HttpRequest {
     }
 
     fn request_version_line(&self) -> String {
-        if self.version >= 10 {
-            return format!("HTTP/1.{}", self.version - 10);
+        match self.version {
+            10 => "HTTP/1.0".to_string(),
+            11 => "HTTP/1.1".to_string(),
+            // Request-line serialization is HTTP/1.x only. Non-H1 internal markers
+            // (e.g. 20/30 for H2/H3) must not leak into an HTTP/1 request line.
+            _ => "HTTP/1.1".to_string(),
         }
-        "HTTP/1.1".to_string()
     }
 
     fn parse_request_target(&mut self, target: &str) -> anyhow::Result<()> {
@@ -762,7 +765,10 @@ impl HttpRequest {
         req.parse_path_and_query(uri.path_and_query().map(|v| v.as_str()).unwrap_or("/"));
         req.headers.insert(
             HeaderOrHipStr::from_str("Host"),
-            uri.host().unwrap_or("localhost").into(),
+            uri.authority()
+                .map(|authority| authority.as_str())
+                .unwrap_or("localhost")
+                .into(),
         );
         let use_ssl = uri.scheme() == Some(&Scheme::HTTPS);
         let port = uri.port_u16().unwrap_or(if use_ssl { 443 } else { 80 });
@@ -2372,6 +2378,22 @@ mod tests {
         let serialized = String::from_utf8(req.as_bytes()).unwrap();
 
         assert!(serialized.starts_with("GET /search?q=rust HTTP/1.0\r\n"));
+    }
+
+    #[test]
+    fn request_serialization_falls_back_to_http11_for_non_h1_versions() {
+        let (mut req, _, _) = HttpRequest::from_url("http://example.com/", HttpMethod::GET).unwrap();
+        req.version = 20;
+        let serialized = String::from_utf8(req.as_bytes()).unwrap();
+
+        assert!(serialized.starts_with("GET / HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn from_url_host_header_keeps_non_default_port() {
+        let (req, _, _) = HttpRequest::from_url("http://example.com:8080/demo", HttpMethod::GET)
+            .unwrap();
+        assert_eq!(req.get_header("Host"), Some("example.com:8080"));
     }
 
     #[test]

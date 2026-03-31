@@ -1245,6 +1245,39 @@ impl HttpServer {
         })
     }
 
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    fn is_h2_h3_forbidden_response_header(name: &str) -> bool {
+        name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("keep-alive")
+            || name.eq_ignore_ascii_case("proxy-connection")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("upgrade")
+            || name.eq_ignore_ascii_case("te")
+            || name.eq_ignore_ascii_case("trailer")
+    }
+
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    fn is_forbidden_trailer_for_h2_h3(name: &str) -> bool {
+        name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("trailer")
+            || name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("keep-alive")
+            || name.eq_ignore_ascii_case("te")
+            || name.eq_ignore_ascii_case("upgrade")
+            || name.eq_ignore_ascii_case("proxy-authenticate")
+            || name.eq_ignore_ascii_case("proxy-authorization")
+    }
+
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    fn should_suppress_response_body(status: u16, request_method: HttpMethod) -> bool {
+        (100..200).contains(&status)
+            || status == 204
+            || status == 304
+            || request_method == HttpMethod::HEAD
+    }
+
     #[cfg(feature = "http2")]
     async fn handle_h2_request(
         mut req_head: http::Request<h2::RecvStream>,
@@ -1277,15 +1310,23 @@ impl HttpServer {
             }
         }
 
-        if let Some(authority) = req_head.uri().authority() {
-            req.headers
-                .insert(HeaderOrHipStr::from_str("Host"), authority.as_str().into());
-        }
+        let authority = req_head.uri().authority().map(|v| v.as_str().to_string());
         for (key, value) in req_head.headers().iter() {
             if let Ok(value) = value.to_str() {
                 req.headers
                     .insert(HeaderOrHipStr::from_str(key.as_str()), value.into());
             }
+        }
+        if let Some(authority) = authority {
+            if let Some(host) = req.get_header("Host") {
+                if !host.eq_ignore_ascii_case(&authority) {
+                    let head = http::Response::builder().status(400).body(())?;
+                    let _ = respond.send_response(head, true)?;
+                    return Ok(());
+                }
+            }
+            req.headers
+                .insert(HeaderOrHipStr::from_str("Host"), authority.into());
         }
 
         let body_stream = req_head.body_mut();
@@ -1298,34 +1339,59 @@ impl HttpServer {
 
         let res = PipeContext::handle_request(pipe_ctx.as_ref(), &mut req, 0).await;
 
+        let suppress_body = Self::should_suppress_response_body(res.http_code, req.method);
         let mut response_builder = http::Response::builder().status(res.http_code);
         for (key, value) in res.headers.iter() {
-            if key.eq_ignore_ascii_case("connection")
-                || key.eq_ignore_ascii_case("keep-alive")
-                || key.eq_ignore_ascii_case("proxy-connection")
-                || key.eq_ignore_ascii_case("transfer-encoding")
-                || key.eq_ignore_ascii_case("upgrade")
-            {
+            if Self::is_h2_h3_forbidden_response_header(key) {
                 continue;
             }
             response_builder = response_builder.header(key.as_ref(), value.as_ref());
         }
 
+        let mut trailers = http::HeaderMap::new();
+        for (key, value) in res.trailers.iter() {
+            if Self::is_forbidden_trailer_for_h2_h3(key) {
+                continue;
+            }
+            if let Ok(name) = http::header::HeaderName::from_bytes(key.as_bytes()) {
+                if let Ok(value) = http::HeaderValue::from_str(value) {
+                    trailers.insert(name, value);
+                }
+            }
+        }
+        let has_trailers = !trailers.is_empty();
+
+        if suppress_body {
+            let head = response_builder.body(())?;
+            let _ = respond.send_response(head, true)?;
+            return Ok(());
+        }
+
         match res.body {
             crate::HttpResponseBody::Data(data) => {
                 let head = response_builder.body(())?;
-                let mut send = respond.send_response(head, data.is_empty())?;
+                let mut send = respond.send_response(head, data.is_empty() && !has_trailers)?;
                 if !data.is_empty() {
-                    send.send_data(data.into(), true)?;
+                    send.send_data(data.into(), !has_trailers)?;
+                }
+                if has_trailers {
+                    send.send_trailers(trailers)?;
                 }
             }
             crate::HttpResponseBody::Stream(mut rx) => {
                 let head = response_builder.body(())?;
                 let mut send = respond.send_response(head, false)?;
                 while let Some(chunk) = rx.recv().await {
+                    if chunk.is_empty() {
+                        continue;
+                    }
                     send.send_data(chunk.into(), false)?;
                 }
-                send.send_data(Vec::<u8>::new().into(), true)?;
+                if has_trailers {
+                    send.send_trailers(trailers)?;
+                } else {
+                    send.send_data(Vec::<u8>::new().into(), true)?;
+                }
             }
         }
         Ok(())
@@ -1505,17 +1571,27 @@ impl HttpServer {
                             }
                         }
 
-                        if let Some(authority) = req_head.uri().authority() {
-                            req.headers.insert(
-                                HeaderOrHipStr::from_str("Host"),
-                                authority.as_str().into(),
-                            );
-                        }
+                        let authority = req_head.uri().authority().map(|v| v.as_str().to_string());
                         for (key, value) in req_head.headers().iter() {
                             if let Ok(value) = value.to_str() {
                                 req.headers
                                     .insert(HeaderOrHipStr::from_str(key.as_str()), value.into());
                             }
+                        }
+                        if let Some(authority) = authority {
+                            if let Some(host) = req.get_header("Host") {
+                                if !host.eq_ignore_ascii_case(&authority) {
+                                    let response = match http::Response::builder().status(400).body(()) {
+                                        Ok(resp) => resp,
+                                        Err(_) => return,
+                                    };
+                                    let _ = stream.send_response(response).await;
+                                    let _ = stream.finish().await;
+                                    return;
+                                }
+                            }
+                            req.headers
+                                .insert(HeaderOrHipStr::from_str("Host"), authority.into());
                         }
 
                         let mut request_body = Vec::new();
@@ -1536,12 +1612,7 @@ impl HttpServer {
 
                         let mut response_builder = http::Response::builder().status(res.http_code);
                         for (key, value) in res.headers.iter() {
-                            if key.eq_ignore_ascii_case("connection")
-                                || key.eq_ignore_ascii_case("keep-alive")
-                                || key.eq_ignore_ascii_case("proxy-connection")
-                                || key.eq_ignore_ascii_case("transfer-encoding")
-                                || key.eq_ignore_ascii_case("upgrade")
-                            {
+                            if Self::is_h2_h3_forbidden_response_header(key) {
                                 continue;
                             }
                             response_builder =
@@ -1555,10 +1626,8 @@ impl HttpServer {
                             return;
                         }
 
-                        let suppress_body = (100..200).contains(&res.http_code)
-                            || res.http_code == 204
-                            || res.http_code == 304
-                            || req.method == HttpMethod::HEAD;
+                        let suppress_body =
+                            Self::should_suppress_response_body(res.http_code, req.method);
                         if !suppress_body {
                             match res.body {
                                 crate::HttpResponseBody::Data(data) => {
@@ -1585,6 +1654,9 @@ impl HttpServer {
                         if !res.trailers.is_empty() {
                             let mut trailers = http::HeaderMap::new();
                             for (key, value) in res.trailers.iter() {
+                                if Self::is_forbidden_trailer_for_h2_h3(key) {
+                                    continue;
+                                }
                                 if let Ok(name) =
                                     http::header::HeaderName::from_bytes(key.as_bytes())
                                 {

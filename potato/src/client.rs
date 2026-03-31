@@ -80,14 +80,14 @@ impl SessionImpl {
                     .with_no_client_auth();
                 let connector = TlsConnector::from(Arc::new(config));
                 let dnsname = ServerName::try_from(host.clone())?;
-                let stream = TcpStream::connect(format!("{host}:{port}")).await?;
+                let stream = TcpStream::connect((host.as_str(), port)).await?;
                 let stream = connector.connect(dnsname, stream).await?;
                 HttpStream::from_client_tls(stream)
             }
             #[cfg(not(feature = "tls"))]
             true => Err(anyhow!("unsupported tls during non-tls build"))?,
             false => {
-                let stream = TcpStream::connect(format!("{host}:{port}")).await?;
+                let stream = TcpStream::connect((host.as_str(), port)).await?;
                 HttpStream::from_tcp(stream)
             }
         };
@@ -113,7 +113,11 @@ impl Session {
         url: &str,
     ) -> anyhow::Result<HttpRequest> {
         let (mut req, use_ssl, port) = HttpRequest::from_url(url, method)?;
-        let host = req.get_header_host().unwrap_or("127.0.0.1").to_string();
+        let host = url
+            .parse::<http::Uri>()?
+            .host()
+            .unwrap_or("127.0.0.1")
+            .to_string();
         let mut is_same_host = false;
         if let Some(sess_impl) = &mut self.sess_impl {
             let (host1, use_ssl1, port1) = &sess_impl.unique_host;
@@ -128,10 +132,7 @@ impl Session {
         Ok(req)
     }
 
-    pub async fn do_request(&mut self, mut req: HttpRequest) -> anyhow::Result<HttpResponse> {
-        if let Some(sess_impl) = &mut self.sess_impl {
-            req.apply_header(Headers::Host(sess_impl.unique_host.0.clone()));
-        }
+    pub async fn do_request(&mut self, req: HttpRequest) -> anyhow::Result<HttpResponse> {
         let sess_impl = self.session_impl()?;
         let request_method = req.method;
         sess_impl.stream.write_all(&req.as_bytes()).await?;
@@ -256,6 +257,20 @@ fn is_known_hop_by_hop_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("Proxy-Connection")
 }
 
+fn format_host_header_value(host: &str, port: u16, use_ssl: bool) -> String {
+    let normalized_host = if host.contains(':') && !host.starts_with('[') && !host.ends_with(']') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let default_port = if use_ssl { 443 } else { 80 };
+    if port == default_port {
+        normalized_host
+    } else {
+        format!("{normalized_host}:{port}")
+    }
+}
+
 fn strip_hop_by_hop_request_headers(req: &mut HttpRequest) {
     let connection_tokens = req
         .get_header_key(HeaderItem::Connection)
@@ -354,15 +369,28 @@ impl TransferSession {
 
             (host.to_string(), use_ssl, port)
         } else {
-            let host = req.get_header_host().unwrap_or("localhost").to_string();
+            let host_header = req.get_header("Host").unwrap_or("localhost");
+            let authority = host_header
+                .parse::<http::uri::Authority>()
+                .ok()
+                .or_else(|| format!("{host_header}:80").parse::<http::uri::Authority>().ok());
+            let host = authority
+                .as_ref()
+                .map(|a| a.host())
+                .unwrap_or("localhost")
+                .to_string();
 
             let (use_ssl, port) = if req.method == HttpMethod::CONNECT {
                 (true, 443)
             } else {
-                let host_header = req.get_header("Host").unwrap_or(&host);
-                let port_from_header = host_header
-                    .split_once(':')
-                    .map(|(_, p)| p.parse::<u16>().unwrap_or(80));
+                let port_from_header = authority
+                    .as_ref()
+                    .and_then(|a| a.port_u16())
+                    .or_else(|| {
+                        host_header
+                            .split_once(':')
+                            .and_then(|(_, p)| p.parse::<u16>().ok())
+                    });
 
                 let use_ssl = req
                     .get_header("X-Forwarded-Proto")
@@ -452,7 +480,7 @@ impl TransferSession {
                             let connector = TlsConnector::from(Arc::new(config));
                             let dnsname = ServerName::try_from(dest_host.clone())?;
                             let tcp_stream =
-                                TcpStream::connect(format!("{}:{}", dest_host, dest_port)).await?;
+                                TcpStream::connect((dest_host.as_str(), dest_port)).await?;
                             let tls_stream = connector.connect(dnsname, tcp_stream).await?;
                             HttpStream::from_client_tls(tls_stream)
                         }
@@ -460,7 +488,7 @@ impl TransferSession {
                         true => Err(anyhow!("unsupported tls during non-tls build"))?,
                         false => {
                             let tcp_stream =
-                                TcpStream::connect(format!("{}:{}", dest_host, dest_port)).await?;
+                                TcpStream::connect((dest_host.as_str(), dest_port)).await?;
                             HttpStream::from_tcp(tcp_stream)
                         }
                     },
@@ -472,7 +500,11 @@ impl TransferSession {
         };
 
         strip_hop_by_hop_request_headers(req);
-        req.set_header(HeaderItem::Host, dest_host.clone());
+        req.version = 11;
+        req.set_header(
+            HeaderItem::Host,
+            format_host_header_value(&dest_host, dest_port, dest_use_ssl),
+        );
         let request_method = req.method;
         stream.write_all(&req.as_bytes()).await?;
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -678,4 +710,27 @@ pub struct SshJumpboxInfo {
     pub port: u16,
     pub username: String,
     pub password: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_host_header_value;
+
+    #[test]
+    fn host_header_formatter_handles_domain() {
+        assert_eq!(format_host_header_value("example.com", 80, false), "example.com");
+        assert_eq!(
+            format_host_header_value("example.com", 8080, false),
+            "example.com:8080"
+        );
+    }
+
+    #[test]
+    fn host_header_formatter_wraps_ipv6_literal() {
+        assert_eq!(format_host_header_value("2001:db8::1", 80, false), "[2001:db8::1]");
+        assert_eq!(
+            format_host_header_value("2001:db8::1", 8080, false),
+            "[2001:db8::1]:8080"
+        );
+    }
 }

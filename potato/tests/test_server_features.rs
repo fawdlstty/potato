@@ -1138,6 +1138,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reverse_proxy_sets_host_with_non_default_port() -> anyhow::Result<()> {
+        #[potato::http_get("/proxy_host_echo")]
+        async fn proxy_host_echo(req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text(req.get_header("Host").unwrap_or(""))
+        }
+
+        let backend_port = get_test_port();
+        let backend_addr = format!("127.0.0.1:{}", backend_port);
+        let mut backend_server = HttpServer::new(&backend_addr);
+        let backend_handle = tokio::spawn(async move {
+            let _ = backend_server.serve_http().await;
+        });
+
+        let proxy_port = get_test_port();
+        let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+        let mut proxy_server = HttpServer::new(&proxy_addr);
+        proxy_server.configure(|ctx| {
+            ctx.use_reverse_proxy("/proxy", format!("http://{}", backend_addr), false);
+        });
+        let proxy_handle = tokio::spawn(async move {
+            let _ = proxy_server.serve_http().await;
+        });
+
+        sleep(Duration::from_millis(350)).await;
+
+        let mut stream = connect_with_retry(&proxy_addr).await?;
+        let request = format!(
+            "GET /proxy/proxy_host_echo HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            proxy_addr
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        let body = response_body_bytes(&response)?;
+        assert_eq!(String::from_utf8_lossy(body), backend_addr);
+
+        proxy_handle.abort();
+        backend_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_server_rejects_authority_form_for_non_connect() -> anyhow::Result<()> {
         let port = get_test_port();
         let server_addr = format!("127.0.0.1:{}", port);

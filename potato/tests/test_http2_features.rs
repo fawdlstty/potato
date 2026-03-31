@@ -113,6 +113,25 @@ mod http2_tests {
         potato::HttpResponse::text("h2-ok")
     }
 
+    #[potato::http_get("/http2_head_no_body")]
+    async fn http2_head_no_body(_: &mut potato::HttpRequest) -> potato::HttpResponse {
+        potato::HttpResponse::text("head-body-must-not-be-sent")
+    }
+
+    #[potato::http_get("/http2_204_no_body")]
+    async fn http2_204_no_body(_: &mut potato::HttpRequest) -> potato::HttpResponse {
+        let mut res = potato::HttpResponse::text("status-204-must-not-have-body");
+        res.http_code = 204;
+        res
+    }
+
+    #[potato::http_get("/http2_trailers")]
+    async fn http2_trailers(_: &mut potato::HttpRequest) -> potato::HttpResponse {
+        let mut res = potato::HttpResponse::text("with-trailer");
+        res.add_trailer("X-Trace".into(), "h2-trace".into());
+        res
+    }
+
     #[tokio::test]
     async fn test_serve_http2_accepts_https_http11_fallback() -> anyhow::Result<()> {
         let port = get_test_port();
@@ -173,6 +192,102 @@ mod http2_tests {
             bytes.extend_from_slice(&chunk?);
         }
         assert_eq!(bytes, b"h2-ok".to_vec());
+
+        conn_handle.abort();
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_http2_head_response_has_no_body() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let (cert_file, key_file, cert) = create_test_cert_files()?;
+
+        let mut server = potato::HttpServer::new(&addr);
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http2(&cert_file, &key_file).await;
+        });
+        sleep(Duration::from_millis(350)).await;
+
+        let tls_stream = connect_tls_with_alpn(&addr, &cert, vec![b"h2".to_vec()]).await?;
+        let (mut sender, connection) = client::handshake(tls_stream).await?;
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let request = http::Request::builder()
+            .method("HEAD")
+            .uri("https://localhost/http2_head_no_body")
+            .body(())?;
+        let (response_future, _) = sender.send_request(request, true)?;
+        let response = response_future.await?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+        assert!(bytes.is_empty());
+
+        conn_handle.abort();
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_http2_204_and_trailers_semantics() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let (cert_file, key_file, cert) = create_test_cert_files()?;
+
+        let mut server = potato::HttpServer::new(&addr);
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http2(&cert_file, &key_file).await;
+        });
+        sleep(Duration::from_millis(350)).await;
+
+        let tls_stream = connect_tls_with_alpn(&addr, &cert, vec![b"h2".to_vec()]).await?;
+        let (mut sender, connection) = client::handshake(tls_stream).await?;
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let request_204 = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/http2_204_no_body")
+            .body(())?;
+        let (response_future_204, _) = sender.send_request(request_204, true)?;
+        let response_204 = response_future_204.await?;
+        assert_eq!(response_204.status(), http::StatusCode::NO_CONTENT);
+        let mut body_204 = response_204.into_body();
+        let mut bytes_204 = Vec::new();
+        while let Some(chunk) = body_204.data().await {
+            bytes_204.extend_from_slice(&chunk?);
+        }
+        assert!(bytes_204.is_empty());
+
+        let request_trailer = http::Request::builder()
+            .method("GET")
+            .uri("https://localhost/http2_trailers")
+            .body(())?;
+        let (response_future_trailer, _) = sender.send_request(request_trailer, true)?;
+        let response_trailer = response_future_trailer.await?;
+        assert_eq!(response_trailer.status(), http::StatusCode::OK);
+        let mut body = response_trailer.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+        assert_eq!(bytes, b"with-trailer".to_vec());
+
+        let trailers = body.trailers().await?;
+        let trace = trailers
+            .as_ref()
+            .and_then(|map| map.get("x-trace"))
+            .and_then(|val| val.to_str().ok());
+        assert_eq!(trace, Some("h2-trace"));
 
         conn_handle.abort();
         server_handle.abort();
