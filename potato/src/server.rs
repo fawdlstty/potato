@@ -25,7 +25,7 @@ use std::fs::Metadata;
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
@@ -75,7 +75,7 @@ static HANDLERS_FLAT: LazyLock<HashMap<(&'static str, HttpMethod), &'static Requ
 #[derive(Clone)]
 pub enum PipeContextItem {
     Handlers(bool),
-    LocationRoute((String, String)),
+    LocationRoute((String, String, bool)),
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
     Custom(CustomHandler),
@@ -91,6 +91,24 @@ pub struct PipeContext {
 }
 
 impl PipeContext {
+    fn sanitize_location_route_path(loc_path: &str, request_suffix: &str) -> Option<PathBuf> {
+        let mut path = PathBuf::from(loc_path);
+        for component in Path::new(request_suffix).components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => path.push(part),
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        Some(path)
+    }
+
+    fn path_stays_inside_root(path: &Path, root: &Path) -> bool {
+        std::fs::canonicalize(path)
+            .map(|resolved| resolved.starts_with(root))
+            .unwrap_or(false)
+    }
+
     fn static_file_etag(meta: &Metadata) -> Option<String> {
         if let Ok(modified) = meta.modified() {
             if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
@@ -346,10 +364,19 @@ impl PipeContext {
         self.items.push(PipeContextItem::Handlers(allow_cors));
     }
 
-    pub fn use_location_route(&mut self, url_path: impl Into<String>, loc_path: impl Into<String>) {
+    pub fn use_location_route(
+        &mut self,
+        url_path: impl Into<String>,
+        loc_path: impl Into<String>,
+        allow_symlink_escape: bool,
+    ) {
         let (url_path, loc_path) = (url_path.into(), loc_path.into());
         self.items
-            .push(PipeContextItem::LocationRoute((url_path, loc_path)));
+            .push(PipeContextItem::LocationRoute((
+                url_path,
+                loc_path,
+                allow_symlink_escape,
+            )));
     }
 
     pub fn use_embedded_route(
@@ -738,61 +765,61 @@ impl PipeContext {
                         }
                     }
                 }
-                PipeContextItem::LocationRoute((url_path, loc_path)) => {
+                PipeContextItem::LocationRoute((url_path, loc_path, allow_symlink_escape)) => {
                     if !req.url_path.starts_with(url_path) {
                         continue;
                     }
-                    let static_root = {
-                        let mut root = match PathBuf::from(loc_path).canonicalize() {
-                            Ok(root) => root.to_string_lossy().to_string(),
-                            Err(_) => continue,
-                        };
-                        if root.starts_with("\\\\?\\") {
-                            root.drain(..4);
-                        }
-                        #[cfg(target_os = "windows")]
-                        {
-                            root = root.to_ascii_lowercase();
-                        }
-                        root
+                    let canonical_root = if *allow_symlink_escape {
+                        None
+                    } else {
+                        std::fs::canonicalize(loc_path).ok()
                     };
-                    let mut path = PathBuf::new();
-                    path.push(loc_path);
-                    path.push(&req.url_path[url_path.len()..]);
-                    if let Ok(path) = path.canonicalize() {
-                        let mut temp_path = path.to_string_lossy().to_string();
-                        if temp_path.starts_with("\\\\?\\") {
-                            temp_path.drain(..4);
-                        }
-                        #[cfg(target_os = "windows")]
-                        {
-                            temp_path = temp_path.to_ascii_lowercase();
-                        }
-                        if !temp_path.starts_with(&static_root) {
-                            return HttpResponse::error("url path over directory");
-                        }
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            if meta.is_file() {
-                                if let Some(path) = path.to_str() {
-                                    return Self::from_static_file(req, path, &meta);
+                    let req_suffix = req.url_path[url_path.len()..].trim_start_matches('/');
+                    let path = match Self::sanitize_location_route_path(loc_path, req_suffix) {
+                        Some(path) => path,
+                        None => return HttpResponse::error("url path over directory"),
+                    };
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if meta.is_file() {
+                            if let Some(root) = canonical_root.as_ref() {
+                                if !Self::path_stays_inside_root(&path, root) {
+                                    return HttpResponse::error("url path over directory");
                                 }
-                            } else if meta.is_dir() {
-                                let mut tmp_path = path.clone();
-                                tmp_path.push("index.htm");
-                                if let Ok(tmp_meta) = std::fs::metadata(&tmp_path) {
-                                    if tmp_meta.is_file() {
-                                        if let Some(path) = tmp_path.to_str() {
-                                            return Self::from_static_file(req, path, &tmp_meta);
+                            }
+                            if let Some(path) = path.to_str() {
+                                return Self::from_static_file(req, path, &meta);
+                            }
+                        } else if meta.is_dir() {
+                            if let Some(root) = canonical_root.as_ref() {
+                                if !Self::path_stays_inside_root(&path, root) {
+                                    return HttpResponse::error("url path over directory");
+                                }
+                            }
+                            let mut tmp_path = path.clone();
+                            tmp_path.push("index.htm");
+                            if let Ok(tmp_meta) = std::fs::metadata(&tmp_path) {
+                                if tmp_meta.is_file() {
+                                    if let Some(root) = canonical_root.as_ref() {
+                                        if !Self::path_stays_inside_root(&tmp_path, root) {
+                                            return HttpResponse::error("url path over directory");
                                         }
                                     }
+                                    if let Some(path) = tmp_path.to_str() {
+                                        return Self::from_static_file(req, path, &tmp_meta);
+                                    }
                                 }
-                                let mut tmp_path = path.clone();
-                                tmp_path.push("index.html");
-                                if let Ok(tmp_meta) = std::fs::metadata(&tmp_path) {
-                                    if tmp_meta.is_file() {
-                                        if let Some(path) = tmp_path.to_str() {
-                                            return Self::from_static_file(req, path, &tmp_meta);
+                            }
+                            let mut tmp_path = path.clone();
+                            tmp_path.push("index.html");
+                            if let Ok(tmp_meta) = std::fs::metadata(&tmp_path) {
+                                if tmp_meta.is_file() {
+                                    if let Some(root) = canonical_root.as_ref() {
+                                        if !Self::path_stays_inside_root(&tmp_path, root) {
+                                            return HttpResponse::error("url path over directory");
                                         }
+                                    }
+                                    if let Some(path) = tmp_path.to_str() {
+                                        return Self::from_static_file(req, path, &tmp_meta);
                                     }
                                 }
                             }

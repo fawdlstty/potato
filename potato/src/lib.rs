@@ -1113,14 +1113,15 @@ impl HttpRequest {
     ) -> anyhow::Result<(Self, usize)> {
         let mut tmp_buf = [0u8; 4096];
         let (mut req, hdr_len) = loop {
-            let n = stream.read(&mut tmp_buf).await?;
-            if n == 0 {
-                return Err(anyhow::Error::msg("connection closed"));
-            }
-            buf.extend(&tmp_buf[0..n]);
             match HttpRequest::from_headers_part(&buf[..])? {
                 Some((req, hdr_len)) => break (req, hdr_len),
-                None => continue,
+                None => {
+                    let n = stream.read(&mut tmp_buf).await?;
+                    if n == 0 {
+                        return Err(anyhow::Error::msg("connection closed"));
+                    }
+                    buf.extend(&tmp_buf[0..n]);
+                }
             }
         };
         let has_chunked_transfer_encoding = req.has_chunked_transfer_encoding()?;
@@ -2226,10 +2227,11 @@ impl HttpResponse {
         request_method: Option<HttpMethod>,
     ) -> anyhow::Result<(Self, usize)> {
         let (mut res, hdr_len) = loop {
-            buf.extend_by_streams(stream).await?;
             match HttpResponse::from_headers_part(&buf[..])? {
                 Some((res, hdr_len)) => break (res, hdr_len),
-                None => continue,
+                None => {
+                    buf.extend_by_streams(stream).await?;
+                }
             }
         };
         let mut bdy_len = 0;

@@ -33,12 +33,17 @@ Add the following code in the configure function:
 ```rust
 server.configure(|ctx| {
     // ...
-    ctx.use_location_route("/", "/wwwroot");
+    ctx.use_location_route("/", "/wwwroot", false);
     // ...
 });
 ```
 
-The first parameter is the request path, and the second parameter is the local directory address. If a file `/wwwroot/a.json` exists, it can be accessed via the request `/a.json`.
+The first parameter is the request path, the second parameter is the local directory path, and the third parameter controls whether symlinks are allowed to escape `wwwroot`:
+
+- `true`: allow symlinks inside `wwwroot` to point to files/directories outside `wwwroot`
+- `false`: block symlink escape outside `wwwroot`
+
+If a file `/wwwroot/a.json` exists, it can be accessed via the request `/a.json`.
 
 This route also supports common static-resource capabilities:
 

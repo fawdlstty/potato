@@ -33,12 +33,17 @@ server.configure(|ctx| {
 ```rust
 server.configure(|ctx| {
     // ...
-    ctx.use_location_route("/", "/wwwroot");
+    ctx.use_location_route("/", "/wwwroot", false);
     // ...
 });
 ```
 
-第一个参数为请求路径，第二个参数为本地目录地址。假如存在 `/wwwroot/a.json` 文件，那么通过请求 `/a.json` 即可访问此json文件
+第一个参数为请求路径，第二个参数为本地目录地址，第三个参数用于控制软连接是否允许越过 `wwwroot`：
+
+- `true`：允许 `wwwroot` 内软连接指向目录外部文件/目录
+- `false`：不允许软连接越界，越界访问会被拦截
+
+假如存在 `/wwwroot/a.json` 文件，那么通过请求 `/a.json` 即可访问此 json 文件。
 
 该路由同时支持常见静态资源能力：
 

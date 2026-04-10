@@ -672,8 +672,9 @@ mod tests {
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
             // 使用当前目录作为静态文件目录
-            ctx.use_location_route("/", ".");
+            ctx.use_location_route("/", ".", false);
         });
+        let shutdown_signal = server.shutdown_signal();
 
         let server_handle = tokio::spawn(async move {
             let _ = server.serve_http().await;
@@ -694,7 +695,8 @@ mod tests {
             }
         }
 
-        server_handle.abort();
+        _ = shutdown_signal.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(3), server_handle).await;
         Ok(())
     }
 

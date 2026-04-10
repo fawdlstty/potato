@@ -15,7 +15,8 @@ fn get_test_port() -> u16 {
 mod tests {
     use super::*;
     use potato::utils::enums::HttpConnection;
-    use potato::{HttpRequest, HttpResponse, HttpServer};
+    use potato::server::PipeContext;
+    use potato::{HttpMethod, HttpRequest, HttpResponse, HttpServer};
     use std::borrow::Cow;
     use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -42,6 +43,20 @@ mod tests {
             .map(|p| p + 4)
             .ok_or_else(|| anyhow::anyhow!("response missing header terminator"))?;
         Ok(&response[header_end..])
+    }
+
+    fn response_body_data(res: potato::HttpResponse) -> Vec<u8> {
+        match res.body {
+            potato::HttpResponseBody::Data(data) => data,
+            potato::HttpResponseBody::Stream(_) => vec![],
+        }
+    }
+
+    fn static_get_request(path: &str) -> HttpRequest {
+        let mut req = HttpRequest::new();
+        req.method = HttpMethod::GET;
+        req.url_path = path.into();
+        req
     }
 
     #[test]
@@ -1563,7 +1578,7 @@ mod tests {
         let mut server = HttpServer::new(&server_addr);
         let static_root = temp_dir.canonicalize()?.to_string_lossy().to_string();
         server.configure(|ctx| {
-            ctx.use_location_route("/static/", static_root.clone());
+            ctx.use_location_route("/static/", static_root.clone(), false);
         });
 
         let server_handle = tokio::spawn(async move {
@@ -1605,7 +1620,7 @@ mod tests {
         let mut server = HttpServer::new(&server_addr);
         let static_root = temp_dir.canonicalize()?.to_string_lossy().to_string();
         server.configure(|ctx| {
-            ctx.use_location_route("/static/", static_root.clone());
+            ctx.use_location_route("/static/", static_root.clone(), false);
         });
 
         let server_handle = tokio::spawn(async move {
@@ -1627,6 +1642,120 @@ mod tests {
         server_handle.abort();
         _ = fs::remove_file(file_path);
         _ = fs::remove_dir(temp_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_location_route_blocks_parent_path_segments() -> anyhow::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let temp_dir = env::temp_dir().join(format!("potato-location-route-block-{unique}"));
+        let static_root = temp_dir.join("wwwroot");
+        let outside_file = temp_dir.join("outside.txt");
+
+        _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&static_root)?;
+        fs::write(&outside_file, b"outside")?;
+
+        let mut ctx = PipeContext::new();
+        ctx.use_location_route("/static/", static_root.to_string_lossy().to_string(), false);
+
+        let mut req = static_get_request("/static/../outside.txt");
+        let res = PipeContext::handle_request(&ctx, &mut req, 0).await;
+
+        assert_eq!(res.http_code, 500);
+        assert_eq!(String::from_utf8(response_body_data(res))?, "url path over directory");
+
+        _ = fs::remove_dir_all(temp_dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_location_route_allows_symlink_root_and_symlink_children() -> anyhow::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let temp_dir = env::temp_dir().join(format!("potato-location-route-symlink-{unique}"));
+        let real_root = temp_dir.join("real-root");
+        let outside_assets = temp_dir.join("outside-assets");
+        let symlink_root = temp_dir.join("wwwroot");
+        let symlink_child = real_root.join("assets");
+
+        _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&real_root)?;
+        fs::create_dir_all(&outside_assets)?;
+        fs::write(real_root.join("direct.txt"), b"direct")?;
+        fs::write(outside_assets.join("linked.txt"), b"linked")?;
+
+        std::os::unix::fs::symlink(&real_root, &symlink_root)?;
+        std::os::unix::fs::symlink(&outside_assets, &symlink_child)?;
+
+        let mut ctx = PipeContext::new();
+        ctx.use_location_route("/static/", symlink_root.to_string_lossy().to_string(), true);
+
+        let mut direct_req = static_get_request("/static/direct.txt");
+        let direct_res = PipeContext::handle_request(&ctx, &mut direct_req, 0).await;
+        assert_eq!(direct_res.http_code, 200);
+        assert_eq!(response_body_data(direct_res), b"direct".to_vec());
+
+        let mut linked_req = static_get_request("/static/assets/linked.txt");
+        let linked_res = PipeContext::handle_request(&ctx, &mut linked_req, 0).await;
+        assert_eq!(linked_res.http_code, 200);
+        assert_eq!(response_body_data(linked_res), b"linked".to_vec());
+
+        let mut traversal_req = static_get_request("/static/../outside-assets/linked.txt");
+        let traversal_res = PipeContext::handle_request(&ctx, &mut traversal_req, 0).await;
+        assert_eq!(traversal_res.http_code, 500);
+        assert_eq!(
+            String::from_utf8(response_body_data(traversal_res))?,
+            "url path over directory"
+        );
+
+        _ = fs::remove_file(symlink_child);
+        _ = fs::remove_file(symlink_root);
+        _ = fs::remove_dir_all(temp_dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_location_route_blocks_symlink_escape_when_disabled() -> anyhow::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let temp_dir = env::temp_dir().join(format!("potato-location-route-symlink-deny-{unique}"));
+        let real_root = temp_dir.join("real-root");
+        let outside_assets = temp_dir.join("outside-assets");
+        let symlink_child = real_root.join("assets");
+
+        _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&real_root)?;
+        fs::create_dir_all(&outside_assets)?;
+        fs::write(real_root.join("direct.txt"), b"direct")?;
+        fs::write(outside_assets.join("linked.txt"), b"linked")?;
+
+        std::os::unix::fs::symlink(&outside_assets, &symlink_child)?;
+
+        let mut ctx = PipeContext::new();
+        ctx.use_location_route("/static/", real_root.to_string_lossy().to_string(), false);
+
+        let mut direct_req = static_get_request("/static/direct.txt");
+        let direct_res = PipeContext::handle_request(&ctx, &mut direct_req, 0).await;
+        assert_eq!(direct_res.http_code, 200);
+        assert_eq!(response_body_data(direct_res), b"direct".to_vec());
+
+        let mut linked_req = static_get_request("/static/assets/linked.txt");
+        let linked_res = PipeContext::handle_request(&ctx, &mut linked_req, 0).await;
+        assert_eq!(linked_res.http_code, 500);
+        assert_eq!(
+            String::from_utf8(response_body_data(linked_res))?,
+            "url path over directory"
+        );
+
+        _ = fs::remove_file(symlink_child);
+        _ = fs::remove_dir_all(temp_dir);
         Ok(())
     }
 
