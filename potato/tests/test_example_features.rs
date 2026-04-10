@@ -666,12 +666,18 @@ mod tests {
 
         server.configure(move |ctx| {
             let called = middleware_called_clone.clone();
+            ctx.use_custom_sync(move |req| {
+                if req.url_path == "/sync" {
+                    return Some(HttpResponse::text("custom middleware sync"));
+                }
+                None
+            });
             ctx.use_custom(move |_req| {
                 let called = called.clone();
                 Box::pin(async move {
                     let mut flag = called.lock().await;
                     *flag = true;
-                    Ok(Some(HttpResponse::text("custom middleware response")))
+                    Some(HttpResponse::text("custom middleware async"))
                 })
             });
             ctx.use_handlers(false);
@@ -683,11 +689,10 @@ mod tests {
 
         sleep(Duration::from_millis(300)).await;
 
-        // 测试自定义中间件
-        let url = format!("http://{}/any_path", server_addr);
-        match potato::get(&url, vec![]).await {
+        let sync_url = format!("http://{}/sync", server_addr);
+        match potato::get(&sync_url, vec![]).await {
             Ok(res) => {
-                println!("Custom middleware response: {}", res.http_code);
+                println!("Custom sync middleware response: {}", res.http_code);
                 let body = match &res.body {
                     potato::HttpResponseBody::Data(data) => {
                         String::from_utf8(data.clone()).unwrap_or_default()
@@ -696,10 +701,29 @@ mod tests {
                 };
                 println!("Response body: {}", body);
                 assert!(res.http_code == 200);
-                assert!(body.contains("custom middleware"));
+                assert!(body.contains("custom middleware sync"));
             }
             Err(e) => {
-                println!("Custom middleware request error: {}", e);
+                println!("Custom sync middleware request error: {}", e);
+            }
+        }
+
+        let url = format!("http://{}/any_path", server_addr);
+        match potato::get(&url, vec![]).await {
+            Ok(res) => {
+                println!("Custom async middleware response: {}", res.http_code);
+                let body = match &res.body {
+                    potato::HttpResponseBody::Data(data) => {
+                        String::from_utf8(data.clone()).unwrap_or_default()
+                    }
+                    potato::HttpResponseBody::Stream(_) => "stream response".to_string(),
+                };
+                println!("Response body: {}", body);
+                assert!(res.http_code == 200);
+                assert!(body.contains("custom middleware async"));
+            }
+            Err(e) => {
+                println!("Custom async middleware request error: {}", e);
             }
         }
 

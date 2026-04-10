@@ -94,11 +94,17 @@ sudo apt install libjemalloc-dev graphviz ghostscript
 server.configure(|ctx| {
     // ...
     ctx.use_custom(|req| async { Some(HttpResponse::text("hello")) });
+    ctx.use_custom_sync(|req| Some(HttpResponse::text("hello")));
     // ...
 });
 ```
 
-`use_custom` 函数允许您插入自定义的请求处理逻辑，它接收一个异步闭包，该闭包接收请求并返回一个可选的响应。如果返回 Some(response)，则直接返回该响应，不再执行后续的中间件或处理器；如果返回 None，则继续执行后续的中间件或处理器。
+`use_custom` 函数允许您插入异步自定义请求处理逻辑；`use_custom_sync` 则用于同步自定义处理逻辑。
+
+- 异步闭包：`ctx.use_custom(|req| async { ... })`
+- 同步闭包：`ctx.use_custom_sync(|req| { ... })`
+
+如果返回 `Some(response)`，则直接返回该响应，不再执行后续的中间件或处理器；如果返回 `None`，则继续执行后续的中间件或处理器。对于 `use_custom_sync`，框架会按同步方式直接调用，不会通过异步包装来模拟同步。
 
 ## WebDAV 路由
 

@@ -96,11 +96,17 @@ Add the following code in the configure function:
 server.configure(|ctx| {
     // ...
     ctx.use_custom(|req| async { Some(HttpResponse::text("hello")) });
+    ctx.use_custom_sync(|req| Some(HttpResponse::text("hello")));
     // ...
 });
 ```
 
-The `use_custom` function allows you to insert custom request processing logic. It takes an asynchronous closure that receives a request and returns an optional response. If it returns Some(response), the response is returned directly without executing subsequent middleware or handlers; if it returns None, subsequent middleware or handlers continue to execute.
+The `use_custom` function lets you insert async custom request handling logic, while `use_custom_sync` is for sync custom handling logic.
+
+- Async closure: `ctx.use_custom(|req| async { ... })`
+- Sync closure: `ctx.use_custom_sync(|req| { ... })`
+
+If it returns `Some(response)`, the response is returned immediately and later middleware/handlers are skipped. If it returns `None`, processing continues. For `use_custom_sync`, the framework invokes it on a purely synchronous path (not by wrapping it into an async call).
 
 ## WebDAV Routing
 

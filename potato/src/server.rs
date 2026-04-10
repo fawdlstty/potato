@@ -39,11 +39,19 @@ use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKey
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
-type CustomHandler = dyn Fn(
+type AsyncCustomHandler = dyn Fn(
         &mut HttpRequest,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<HttpResponse>>> + Send + '_>>
+    ) -> Pin<Box<dyn Future<Output = Option<HttpResponse>> + Send + '_>>
     + Send
     + Sync;
+
+type SyncCustomHandler = dyn Fn(&mut HttpRequest) -> Option<HttpResponse> + Send + Sync;
+
+#[derive(Clone)]
+pub enum CustomHandler {
+    Sync(Arc<SyncCustomHandler>),
+    Async(Arc<AsyncCustomHandler>),
+}
 
 static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static RequestHandlerFlag>>> =
     LazyLock::new(|| {
@@ -72,7 +80,7 @@ pub enum PipeContextItem {
     LocationRoute((String, String)),
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
-    Custom(Arc<CustomHandler>),
+    Custom(CustomHandler),
     ReverseProxy(String, String, bool),
     #[cfg(feature = "jemalloc")]
     Jemalloc(String),
@@ -365,17 +373,40 @@ impl PipeContext {
         self.items.push(PipeContextItem::EmbeddedRoute(ret));
     }
 
-    pub fn use_custom<F>(&mut self, callback: F)
+    pub fn use_custom<F, Fut>(&mut self, callback: F)
+    where
+        F: Fn(&mut HttpRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<HttpResponse>> + Send + 'static,
+    {
+        self.items
+            .push(PipeContextItem::Custom(CustomHandler::Async(Arc::new(
+                move |req| {
+                    let fut = callback(req);
+                    Box::pin(async move { fut.await })
+                },
+            ))));
+    }
+
+    pub fn use_custom_sync<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut HttpRequest) -> Option<HttpResponse> + Send + Sync + 'static,
+    {
+        self.items
+            .push(PipeContextItem::Custom(CustomHandler::Sync(Arc::new(callback))));
+    }
+
+    pub fn use_custom_async<F>(&mut self, callback: F)
     where
         F: for<'a> Fn(
                 &'a mut HttpRequest,
             ) -> Pin<
-                Box<dyn Future<Output = anyhow::Result<Option<HttpResponse>>> + Send + 'a>,
+                Box<dyn Future<Output = Option<HttpResponse>> + Send + 'a>,
             > + Send
             + Sync
             + 'static,
     {
-        self.items.push(PipeContextItem::Custom(Arc::new(callback)));
+        self.items
+            .push(PipeContextItem::Custom(CustomHandler::Async(Arc::new(callback))));
     }
 
     pub fn use_reverse_proxy(
@@ -868,10 +899,15 @@ impl PipeContext {
                     continue;
                 }
                 PipeContextItem::FinalRoute(res) => return res.clone(),
-                PipeContextItem::Custom(handler) => match handler.as_ref()(req).await {
-                    Ok(Some(res)) => return res,
-                    Ok(None) => continue,
-                    Err(err) => return HttpResponse::error(format!("{err}")),
+                PipeContextItem::Custom(handler) => match handler {
+                    CustomHandler::Sync(handler) => match handler.as_ref()(req) {
+                        Some(res) => return res,
+                        None => continue,
+                    },
+                    CustomHandler::Async(handler) => match handler.as_ref()(req).await {
+                        Some(res) => return res,
+                        None => continue,
+                    },
                 },
                 PipeContextItem::ReverseProxy(path, proxy_url, modify_content) => {
                     if !req.url_path.starts_with(path) {
