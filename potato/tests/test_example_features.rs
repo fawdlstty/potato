@@ -14,6 +14,8 @@ fn get_test_port() -> u16 {
 mod tests {
     use super::*;
     use potato::{Headers, HttpRequest, HttpResponse, HttpServer, Session, Websocket, WsFrame};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{LazyLock, Mutex};
 
     /// 测试基础 HTTP 服务器功能 - examples/server/00_http_server.rs
     #[tokio::test]
@@ -122,6 +124,216 @@ mod tests {
 
         server_handle.abort();
         println!("✅ Handler args test completed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_preprocess_postprocess_hooks() -> anyhow::Result<()> {
+        static HOOK_ORDER_LOG: LazyLock<Mutex<Vec<&'static str>>> =
+            LazyLock::new(|| Mutex::new(vec![]));
+        static PRE_ASYNC_RESULT_UNIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static PRE_ASYNC_RESULT_OPTION_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static PRE_SYNC_UNIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static PRE_SYNC_OPTION_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static PRE_ASYNC_OPTION_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static POST_SYNC_UNIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static POST_ASYNC_RESULT_UNIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static HANDLER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        PRE_ASYNC_RESULT_UNIT_COUNT.store(0, AtomicOrdering::Relaxed);
+        PRE_ASYNC_RESULT_OPTION_COUNT.store(0, AtomicOrdering::Relaxed);
+        PRE_SYNC_UNIT_COUNT.store(0, AtomicOrdering::Relaxed);
+        PRE_SYNC_OPTION_COUNT.store(0, AtomicOrdering::Relaxed);
+        PRE_ASYNC_OPTION_COUNT.store(0, AtomicOrdering::Relaxed);
+        POST_SYNC_UNIT_COUNT.store(0, AtomicOrdering::Relaxed);
+        POST_ASYNC_RESULT_UNIT_COUNT.store(0, AtomicOrdering::Relaxed);
+        HANDLER_COUNT.store(0, AtomicOrdering::Relaxed);
+        HOOK_ORDER_LOG.lock().unwrap().clear();
+
+        fn body_to_string(res: &potato::HttpResponse) -> String {
+            match &res.body {
+                potato::HttpResponseBody::Data(data) => String::from_utf8(data.clone()).unwrap(),
+                potato::HttpResponseBody::Stream(_) => "stream response".to_string(),
+            }
+        }
+
+        fn append_body(res: &mut HttpResponse, value: &str) {
+            if let potato::HttpResponseBody::Data(body) = &mut res.body {
+                body.extend_from_slice(value.as_bytes());
+            }
+        }
+
+        #[potato::preprocess]
+        async fn pre_async_result_unit(_req: &mut potato::HttpRequest) -> anyhow::Result<()> {
+            PRE_ASYNC_RESULT_UNIT_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            HOOK_ORDER_LOG.lock().unwrap().push("pre_async_result_unit");
+            Ok(())
+        }
+
+        #[potato::preprocess]
+        async fn pre_async_result_option(
+            req: &mut potato::HttpRequest,
+        ) -> anyhow::Result<Option<potato::HttpResponse>> {
+            PRE_ASYNC_RESULT_OPTION_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            HOOK_ORDER_LOG
+                .lock()
+                .unwrap()
+                .push("pre_async_result_option");
+            let mode = req
+                .url_query
+                .get(&potato::hipstr::LocalHipStr::from("mode"))
+                .map(|v| v.as_str())
+                .unwrap_or_default();
+            if mode == "skip2" {
+                Ok(Some(potato::HttpResponse::text("pre_skip2")))
+            } else {
+                Ok(None)
+            }
+        }
+
+        #[potato::preprocess]
+        fn pre_sync_unit(_req: &mut potato::HttpRequest) {
+            PRE_SYNC_UNIT_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            HOOK_ORDER_LOG.lock().unwrap().push("pre_sync_unit");
+        }
+
+        #[potato::preprocess]
+        fn pre_sync_option(req: &mut potato::HttpRequest) -> Option<potato::HttpResponse> {
+            PRE_SYNC_OPTION_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            HOOK_ORDER_LOG.lock().unwrap().push("pre_sync_option");
+            let mode = req
+                .url_query
+                .get(&potato::hipstr::LocalHipStr::from("mode"))
+                .map(|v| v.as_str())
+                .unwrap_or_default();
+            if mode == "skip" {
+                Some(potato::HttpResponse::text("pre_skip"))
+            } else {
+                None
+            }
+        }
+
+        #[potato::preprocess]
+        async fn pre_async_option(_req: &mut potato::HttpRequest) -> Option<potato::HttpResponse> {
+            PRE_ASYNC_OPTION_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            HOOK_ORDER_LOG.lock().unwrap().push("pre_async_option");
+            None
+        }
+
+        #[potato::postprocess]
+        fn post_sync_unit(_req: &mut potato::HttpRequest, res: &mut potato::HttpResponse) {
+            POST_SYNC_UNIT_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            HOOK_ORDER_LOG.lock().unwrap().push("post_sync_unit");
+            append_body(res, "|post_sync");
+        }
+
+        #[potato::postprocess]
+        async fn post_async_result_unit(
+            _req: &mut potato::HttpRequest,
+            res: &mut potato::HttpResponse,
+        ) -> anyhow::Result<()> {
+            POST_ASYNC_RESULT_UNIT_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            HOOK_ORDER_LOG
+                .lock()
+                .unwrap()
+                .push("post_async_result_unit");
+            append_body(res, "|post_async");
+            Ok(())
+        }
+
+        #[potato::http_get("/pipeline_hooks")]
+        #[potato::preprocess(pre_async_result_unit, pre_async_result_option)]
+        #[potato::preprocess(pre_sync_unit)]
+        #[potato::preprocess(pre_sync_option, pre_async_option)]
+        #[potato::postprocess(post_sync_unit)]
+        #[potato::postprocess(post_async_result_unit)]
+        async fn pipeline_hooks() -> potato::HttpResponse {
+            HANDLER_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            HOOK_ORDER_LOG.lock().unwrap().push("handler");
+            potato::HttpResponse::text("handler")
+        }
+
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+        let mut server = HttpServer::new(&server_addr);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+
+        sleep(Duration::from_millis(300)).await;
+
+        let normal = potato::get(&format!("http://{}/pipeline_hooks", server_addr), vec![]).await?;
+        assert_eq!(normal.http_code, 200);
+        assert_eq!(body_to_string(&normal), "handler|post_sync|post_async");
+        assert_eq!(
+            HOOK_ORDER_LOG.lock().unwrap().clone(),
+            vec![
+                "pre_async_result_unit",
+                "pre_async_result_option",
+                "pre_sync_unit",
+                "pre_sync_option",
+                "pre_async_option",
+                "handler",
+                "post_sync_unit",
+                "post_async_result_unit",
+            ]
+        );
+        HOOK_ORDER_LOG.lock().unwrap().clear();
+
+        let short = potato::get(
+            &format!("http://{}/pipeline_hooks?mode=skip", server_addr),
+            vec![],
+        )
+        .await?;
+        assert_eq!(short.http_code, 200);
+        assert_eq!(body_to_string(&short), "pre_skip|post_sync|post_async");
+        assert_eq!(
+            HOOK_ORDER_LOG.lock().unwrap().clone(),
+            vec![
+                "pre_async_result_unit",
+                "pre_async_result_option",
+                "pre_sync_unit",
+                "pre_sync_option",
+                "post_sync_unit",
+                "post_async_result_unit",
+            ]
+        );
+        HOOK_ORDER_LOG.lock().unwrap().clear();
+
+        let short2 = potato::get(
+            &format!("http://{}/pipeline_hooks?mode=skip2", server_addr),
+            vec![],
+        )
+        .await?;
+        assert_eq!(short2.http_code, 200);
+        assert_eq!(body_to_string(&short2), "pre_skip2|post_sync|post_async");
+        assert_eq!(
+            HOOK_ORDER_LOG.lock().unwrap().clone(),
+            vec![
+                "pre_async_result_unit",
+                "pre_async_result_option",
+                "post_sync_unit",
+                "post_async_result_unit",
+            ]
+        );
+
+        assert_eq!(HANDLER_COUNT.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(PRE_ASYNC_RESULT_UNIT_COUNT.load(AtomicOrdering::Relaxed), 3);
+        assert_eq!(
+            PRE_ASYNC_RESULT_OPTION_COUNT.load(AtomicOrdering::Relaxed),
+            3
+        );
+        assert_eq!(PRE_SYNC_UNIT_COUNT.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(PRE_SYNC_OPTION_COUNT.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(PRE_ASYNC_OPTION_COUNT.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(POST_SYNC_UNIT_COUNT.load(AtomicOrdering::Relaxed), 3);
+        assert_eq!(
+            POST_ASYNC_RESULT_UNIT_COUNT.load(AtomicOrdering::Relaxed),
+            3
+        );
+
+        server_handle.abort();
         Ok(())
     }
 

@@ -36,3 +36,31 @@ ServerConfig::set_jwt_secret("AAABBBCCC").await;
 ```
 
 When a function annotation includes an authentication parameter, if authentication fails, a 401 status code will be returned and the handler function will not be called.
+
+## Preprocess and Postprocess
+
+You can stack `preprocess` and `postprocess` annotations on a handler to run fixed-signature hooks before and after the handler.
+
+```rust
+#[potato::preprocess]
+async fn pre1(req: &mut potato::HttpRequest) -> anyhow::Result<Option<potato::HttpResponse>> {
+    Ok(None)
+}
+
+#[potato::postprocess]
+async fn post1(req: &mut potato::HttpRequest, res: &mut potato::HttpResponse) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[potato::http_get("/hello")]
+#[potato::preprocess(pre1)]
+#[potato::postprocess(post1)]
+#[potato::postprocess(post2)]
+async fn hello() -> potato::HttpResponse {
+    potato::HttpResponse::html("hello world")
+}
+```
+
+- `preprocess` hooks run in declaration order; if one returns an `HttpResponse`, the handler is skipped but `postprocess` hooks still run.
+- `postprocess` hooks run in declaration order and can mutate the final `HttpResponse` in place.
+- `preprocess`/`postprocess` can be split across multiple annotation lines; execution order is left-to-right and top-to-bottom.

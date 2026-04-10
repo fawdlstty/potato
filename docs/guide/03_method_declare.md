@@ -50,3 +50,36 @@ async fn upload(file1: PostFile) -> HttpResponse {
 ## 返回类型
 
 处理函数返回类型有四种选择：`()`、`anyhow::Result<()>`、`HttpResponse`、`anyhow::Result<HttpResponse>`
+
+## 预处理/后处理函数声明
+
+`preprocess` 与 `postprocess` 都支持 `async fn` 或普通 `fn`。
+
+预处理函数签名固定为：
+
+```rust
+#[potato::preprocess]
+fn pre(req: &mut potato::HttpRequest) -> ...
+```
+
+可选返回类型：`anyhow::Result<Option<potato::HttpResponse>>`、`Option<potato::HttpResponse>`、`anyhow::Result<()>`、`()`
+
+后处理函数签名固定为：
+
+```rust
+#[potato::postprocess]
+fn post(req: &mut potato::HttpRequest, res: &mut potato::HttpResponse) -> ...
+```
+
+可选返回类型：`anyhow::Result<()>`、`()`
+
+同一个 handler 上可重复标注多行，例如：
+
+```rust
+#[potato::preprocess(pre1)]
+#[potato::preprocess(pre2, pre3)]
+#[potato::postprocess(post1)]
+#[potato::postprocess(post2)]
+```
+
+执行顺序按“从左到右、从上到下”展开。

@@ -373,7 +373,11 @@ impl TransferSession {
             let authority = host_header
                 .parse::<http::uri::Authority>()
                 .ok()
-                .or_else(|| format!("{host_header}:80").parse::<http::uri::Authority>().ok());
+                .or_else(|| {
+                    format!("{host_header}:80")
+                        .parse::<http::uri::Authority>()
+                        .ok()
+                });
             let host = authority
                 .as_ref()
                 .map(|a| a.host())
@@ -383,10 +387,8 @@ impl TransferSession {
             let (use_ssl, port) = if req.method == HttpMethod::CONNECT {
                 (true, 443)
             } else {
-                let port_from_header = authority
-                    .as_ref()
-                    .and_then(|a| a.port_u16())
-                    .or_else(|| {
+                let port_from_header =
+                    authority.as_ref().and_then(|a| a.port_u16()).or_else(|| {
                         host_header
                             .split_once(':')
                             .and_then(|(_, p)| p.parse::<u16>().ok())
@@ -718,7 +720,10 @@ mod tests {
 
     #[test]
     fn host_header_formatter_handles_domain() {
-        assert_eq!(format_host_header_value("example.com", 80, false), "example.com");
+        assert_eq!(
+            format_host_header_value("example.com", 80, false),
+            "example.com"
+        );
         assert_eq!(
             format_host_header_value("example.com", 8080, false),
             "example.com:8080"
@@ -727,7 +732,10 @@ mod tests {
 
     #[test]
     fn host_header_formatter_wraps_ipv6_literal() {
-        assert_eq!(format_host_header_value("2001:db8::1", 80, false), "[2001:db8::1]");
+        assert_eq!(
+            format_host_header_value("2001:db8::1", 80, false),
+            "[2001:db8::1]"
+        );
         assert_eq!(
             format_host_header_value("2001:db8::1", 8080, false),
             "[2001:db8::1]:8080"

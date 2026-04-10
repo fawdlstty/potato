@@ -2,7 +2,7 @@ mod utils;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
-use quote::{quote, ToTokens};
+use quote::{format_ident, quote, ToTokens};
 use rand::Rng;
 use serde_json::json;
 use std::{collections::HashSet, sync::LazyLock};
@@ -21,6 +21,215 @@ fn random_ident() -> Ident {
     let mut rng = rand::thread_rng();
     let value = format!("__potato_id_{}", rng.r#gen::<u64>());
     Ident::new(&value, Span::call_site())
+}
+
+fn attr_last_ident(attr: &syn::Attribute) -> Option<String> {
+    attr.meta
+        .path()
+        .segments
+        .iter()
+        .last()
+        .map(|segment| segment.ident.to_string())
+}
+
+fn parse_hook_attr_items(attr: &syn::Attribute, attr_name: &str) -> Vec<Ident> {
+    let parser = syn::punctuated::Punctuated::<Ident, syn::Token![,]>::parse_terminated;
+    let idents = attr.parse_args_with(parser).unwrap_or_else(|err| {
+        panic!("invalid `{attr_name}` annotation: {err}");
+    });
+    if idents.is_empty() {
+        panic!("`{attr_name}` annotation requires at least one function name");
+    }
+    idents.into_iter().collect()
+}
+
+fn collect_handler_hooks(root_fn: &mut syn::ItemFn) -> (Vec<Ident>, Vec<Ident>) {
+    enum HookKind {
+        Pre,
+        Post,
+    }
+    let mut hooks = vec![];
+    let mut new_attrs = Vec::with_capacity(root_fn.attrs.len());
+    for attr in root_fn.attrs.iter() {
+        match attr_last_ident(attr).as_deref() {
+            Some("preprocess") => {
+                hooks.extend(
+                    parse_hook_attr_items(attr, "preprocess")
+                        .into_iter()
+                        .map(|item| (HookKind::Pre, item)),
+                );
+            }
+            Some("postprocess") => {
+                hooks.extend(
+                    parse_hook_attr_items(attr, "postprocess")
+                        .into_iter()
+                        .map(|item| (HookKind::Post, item)),
+                );
+            }
+            _ => new_attrs.push(attr.clone()),
+        }
+    }
+    root_fn.attrs = new_attrs;
+    let mut preprocess_fns = vec![];
+    let mut postprocess_fns = vec![];
+    for (kind, hook) in hooks.into_iter() {
+        match kind {
+            HookKind::Pre => preprocess_fns.push(hook),
+            HookKind::Post => postprocess_fns.push(hook),
+        }
+    }
+    (preprocess_fns, postprocess_fns)
+}
+
+fn validate_preprocess_signature(root_fn: &syn::ItemFn) -> String {
+    if root_fn.sig.inputs.len() != 1 {
+        panic!("`preprocess` function must accept exactly one argument");
+    }
+    let arg = root_fn.sig.inputs.first().unwrap();
+    let arg_type_str = match arg {
+        syn::FnArg::Typed(arg) => arg.ty.to_token_stream().to_string().type_simplify(),
+        _ => panic!("`preprocess` function does not support receiver argument"),
+    };
+    if arg_type_str != "& mut HttpRequest" {
+        panic!(
+            "`preprocess` argument type must be `&mut potato::HttpRequest`, got `{arg_type_str}`"
+        );
+    }
+    let ret_type = root_fn
+        .sig
+        .output
+        .to_token_stream()
+        .to_string()
+        .type_simplify();
+    match &ret_type[..] {
+        "Result<Option<HttpResponse>>" | "Option<HttpResponse>" | "Result<()>" | "()" => {}
+        _ => panic!(
+            "unsupported `preprocess` return type: `{ret_type}`, expected `anyhow::Result<Option<potato::HttpResponse>>`, `Option<potato::HttpResponse>`, `anyhow::Result<()>`, or `()`"
+        ),
+    }
+    ret_type
+}
+
+fn validate_postprocess_signature(root_fn: &syn::ItemFn) -> String {
+    if root_fn.sig.inputs.len() != 2 {
+        panic!("`postprocess` function must accept exactly two arguments");
+    }
+    let mut arg_types = vec![];
+    for arg in root_fn.sig.inputs.iter() {
+        match arg {
+            syn::FnArg::Typed(arg) => {
+                arg_types.push(arg.ty.to_token_stream().to_string().type_simplify())
+            }
+            _ => panic!("`postprocess` function does not support receiver argument"),
+        }
+    }
+    if arg_types[0] != "& mut HttpRequest" {
+        panic!(
+            "`postprocess` first argument must be `&mut potato::HttpRequest`, got `{}`",
+            arg_types[0]
+        );
+    }
+    if arg_types[1] != "& mut HttpResponse" {
+        panic!(
+            "`postprocess` second argument must be `&mut potato::HttpResponse`, got `{}`",
+            arg_types[1]
+        );
+    }
+    let ret_type = root_fn
+        .sig
+        .output
+        .to_token_stream()
+        .to_string()
+        .type_simplify();
+    match &ret_type[..] {
+        "Result<()>" | "()" => {}
+        _ => panic!(
+            "unsupported `postprocess` return type: `{ret_type}`, expected `anyhow::Result<()>` or `()`"
+        ),
+    }
+    ret_type
+}
+
+fn preprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return input;
+    }
+    let root_fn = syn::parse_macro_input!(input as syn::ItemFn);
+    let fn_name = root_fn.sig.ident.clone();
+    let wrap_name = format_ident!("__potato_preprocess_adapter_{}", fn_name);
+    let is_async = root_fn.sig.asyncness.is_some();
+    let ret_type = validate_preprocess_signature(&root_fn);
+    let body = if is_async {
+        match &ret_type[..] {
+            "Result<Option<HttpResponse>>" => quote! { #fn_name(req).await },
+            "Option<HttpResponse>" => quote! { Ok(#fn_name(req).await) },
+            "Result<()>" => quote! { #fn_name(req).await.map(|_| None) },
+            "()" => quote! {
+                #fn_name(req).await;
+                Ok(None)
+            },
+            _ => unreachable!(),
+        }
+    } else {
+        match &ret_type[..] {
+            "Result<Option<HttpResponse>>" => quote! { #fn_name(req) },
+            "Option<HttpResponse>" => quote! { Ok(#fn_name(req)) },
+            "Result<()>" => quote! { #fn_name(req).map(|_| None) },
+            "()" => quote! {
+                #fn_name(req);
+                Ok(None)
+            },
+            _ => unreachable!(),
+        }
+    };
+    quote! {
+        #root_fn
+
+        #[doc(hidden)]
+        async fn #wrap_name(req: &mut potato::HttpRequest) -> anyhow::Result<Option<potato::HttpResponse>> {
+            #body
+        }
+    }
+    .into()
+}
+
+fn postprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return input;
+    }
+    let root_fn = syn::parse_macro_input!(input as syn::ItemFn);
+    let fn_name = root_fn.sig.ident.clone();
+    let wrap_name = format_ident!("__potato_postprocess_adapter_{}", fn_name);
+    let is_async = root_fn.sig.asyncness.is_some();
+    let ret_type = validate_postprocess_signature(&root_fn);
+    let body = if is_async {
+        match &ret_type[..] {
+            "Result<()>" => quote! { #fn_name(req, res).await },
+            "()" => quote! {
+                #fn_name(req, res).await;
+                Ok(())
+            },
+            _ => unreachable!(),
+        }
+    } else {
+        match &ret_type[..] {
+            "Result<()>" => quote! { #fn_name(req, res) },
+            "()" => quote! {
+                #fn_name(req, res);
+                Ok(())
+            },
+            _ => unreachable!(),
+        }
+    };
+    quote! {
+        #root_fn
+
+        #[doc(hidden)]
+        async fn #wrap_name(req: &mut potato::HttpRequest, res: &mut potato::HttpResponse) -> anyhow::Result<()> {
+            #body
+        }
+    }
+    .into()
 }
 
 fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> TokenStream {
@@ -63,7 +272,16 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
         (route_path, oauth_arg)
     };
-    let root_fn = syn::parse_macro_input!(input as syn::ItemFn);
+    let mut root_fn = syn::parse_macro_input!(input as syn::ItemFn);
+    let (preprocess_fns, postprocess_fns) = collect_handler_hooks(&mut root_fn);
+    let preprocess_adapters: Vec<Ident> = preprocess_fns
+        .iter()
+        .map(|name| format_ident!("__potato_preprocess_adapter_{}", name))
+        .collect();
+    let postprocess_adapters: Vec<Ident> = postprocess_fns
+        .iter()
+        .map(|name| format_ident!("__potato_postprocess_adapter_{}", name))
+        .collect();
     let doc_show = {
         let mut doc_show = true;
         for attr in root_fn.attrs.iter() {
@@ -229,7 +447,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             #fn_name(#(#arg_names),*)
         }},
     };
-    let wrap_func_body = if is_async {
+    let handler_wrap_func_body = if is_async {
         match &ret_type[..] {
             "Result<()>" => quote! {
                 match #call_expr.await {
@@ -274,6 +492,63 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 #call_expr
             },
             _ => panic!("unsupported ret type: {ret_type}"),
+        }
+    };
+    let wrap_func_body = if is_async {
+        quote! {
+            let mut __potato_pre_response: Option<potato::HttpResponse> = None;
+            #(
+                if __potato_pre_response.is_none() {
+                    __potato_pre_response = match #preprocess_adapters(req).await {
+                        Ok(Some(ret)) => Some(ret),
+                        Ok(None) => None,
+                        Err(err) => Some(potato::HttpResponse::error(format!("{err:?}"))),
+                    };
+                }
+            )*
+
+            let mut __potato_response = match __potato_pre_response {
+                Some(ret) => ret,
+                None => #handler_wrap_func_body,
+            };
+
+            #(
+                if let Err(err) = #postprocess_adapters(req, &mut __potato_response).await {
+                    return potato::HttpResponse::error(format!("{err:?}"));
+                }
+            )*
+
+            __potato_response
+        }
+    } else {
+        quote! {
+            let mut __potato_pre_response: Option<potato::HttpResponse> = None;
+            #(
+                if __potato_pre_response.is_none() {
+                    __potato_pre_response = match tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(#preprocess_adapters(req))
+                    }) {
+                        Ok(Some(ret)) => Some(ret),
+                        Ok(None) => None,
+                        Err(err) => Some(potato::HttpResponse::error(format!("{err:?}"))),
+                    };
+                }
+            )*
+
+            let mut __potato_response = match __potato_pre_response {
+                Some(ret) => ret,
+                None => #handler_wrap_func_body,
+            };
+
+            #(
+                if let Err(err) = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(#postprocess_adapters(req, &mut __potato_response))
+                }) {
+                    return potato::HttpResponse::error(format!("{err:?}"));
+                }
+            )*
+
+            __potato_response
         }
     };
     let doc_args = serde_json::to_string(&doc_args).unwrap();
@@ -350,6 +625,16 @@ pub fn http_options(attr: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "HEAD")
+}
+
+#[proc_macro_attribute]
+pub fn preprocess(attr: TokenStream, input: TokenStream) -> TokenStream {
+    preprocess_macro(attr, input)
+}
+
+#[proc_macro_attribute]
+pub fn postprocess(attr: TokenStream, input: TokenStream) -> TokenStream {
+    postprocess_macro(attr, input)
 }
 
 #[proc_macro]

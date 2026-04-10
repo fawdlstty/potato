@@ -39,9 +39,7 @@ use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKey
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
-type AsyncCustomHandler = dyn Fn(
-        &mut HttpRequest,
-    ) -> Pin<Box<dyn Future<Output = Option<HttpResponse>> + Send + '_>>
+type AsyncCustomHandler = dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = Option<HttpResponse>> + Send + '_>>
     + Send
     + Sync;
 
@@ -392,21 +390,25 @@ impl PipeContext {
         F: Fn(&mut HttpRequest) -> Option<HttpResponse> + Send + Sync + 'static,
     {
         self.items
-            .push(PipeContextItem::Custom(CustomHandler::Sync(Arc::new(callback))));
+            .push(PipeContextItem::Custom(CustomHandler::Sync(Arc::new(
+                callback,
+            ))));
     }
 
     pub fn use_custom_async<F>(&mut self, callback: F)
     where
         F: for<'a> Fn(
                 &'a mut HttpRequest,
-            ) -> Pin<
-                Box<dyn Future<Output = Option<HttpResponse>> + Send + 'a>,
-            > + Send
+            )
+                -> Pin<Box<dyn Future<Output = Option<HttpResponse>> + Send + 'a>>
+            + Send
             + Sync
             + 'static,
     {
         self.items
-            .push(PipeContextItem::Custom(CustomHandler::Async(Arc::new(callback))));
+            .push(PipeContextItem::Custom(CustomHandler::Async(Arc::new(
+                callback,
+            ))));
     }
 
     pub fn use_reverse_proxy(
@@ -1617,10 +1619,11 @@ impl HttpServer {
                         if let Some(authority) = authority {
                             if let Some(host) = req.get_header("Host") {
                                 if !host.eq_ignore_ascii_case(&authority) {
-                                    let response = match http::Response::builder().status(400).body(()) {
-                                        Ok(resp) => resp,
-                                        Err(_) => return,
-                                    };
+                                    let response =
+                                        match http::Response::builder().status(400).body(()) {
+                                            Ok(resp) => resp,
+                                            Err(_) => return,
+                                        };
                                     let _ = stream.send_response(response).await;
                                     let _ = stream.finish().await;
                                     return;

@@ -2382,7 +2382,8 @@ mod tests {
 
     #[test]
     fn request_serialization_falls_back_to_http11_for_non_h1_versions() {
-        let (mut req, _, _) = HttpRequest::from_url("http://example.com/", HttpMethod::GET).unwrap();
+        let (mut req, _, _) =
+            HttpRequest::from_url("http://example.com/", HttpMethod::GET).unwrap();
         req.version = 20;
         let serialized = String::from_utf8(req.as_bytes()).unwrap();
 
@@ -2391,8 +2392,8 @@ mod tests {
 
     #[test]
     fn from_url_host_header_keeps_non_default_port() {
-        let (req, _, _) = HttpRequest::from_url("http://example.com:8080/demo", HttpMethod::GET)
-            .unwrap();
+        let (req, _, _) =
+            HttpRequest::from_url("http://example.com:8080/demo", HttpMethod::GET).unwrap();
         assert_eq!(req.get_header("Host"), Some("example.com:8080"));
     }
 

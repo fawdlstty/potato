@@ -36,3 +36,31 @@ ServerConfig::set_jwt_secret("AAABBBCCC").await;
 ```
 
 当函数标注鉴权参数后，鉴权不通过，会返回401状态码，且不会实际调用处理函数。
+
+## 预处理与后处理
+
+可以在处理函数上叠加 `preprocess`、`postprocess` 标注，用于在处理函数前后执行固定签名的钩子函数。
+
+```rust
+#[potato::preprocess]
+async fn pre1(req: &mut potato::HttpRequest) -> anyhow::Result<Option<potato::HttpResponse>> {
+    Ok(None)
+}
+
+#[potato::postprocess]
+async fn post1(req: &mut potato::HttpRequest, res: &mut potato::HttpResponse) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[potato::http_get("/hello")]
+#[potato::preprocess(pre1)]
+#[potato::postprocess(post1)]
+#[potato::postprocess(post2)]
+async fn hello() -> potato::HttpResponse {
+    potato::HttpResponse::html("hello world")
+}
+```
+
+- `preprocess` 按声明顺序执行；若某个预处理返回 `HttpResponse`，会跳过实际 handler，但仍会继续执行 `postprocess`。
+- `postprocess` 按声明顺序执行，接收最终 `HttpResponse` 并可原地修改。
+- `preprocess`/`postprocess` 支持拆分多行声明，顺序按“从左到右、从上到下”执行。

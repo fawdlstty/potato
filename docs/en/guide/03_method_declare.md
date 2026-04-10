@@ -50,3 +50,36 @@ async fn upload(file1: PostFile) -> HttpResponse {
 ## Return Types
 
 Handler functions have four return type options: `()`, `anyhow::Result<()>`, `HttpResponse`, `anyhow::Result<HttpResponse>`
+
+## Preprocess/Postprocess Function Declaration
+
+Both `preprocess` and `postprocess` support `async fn` and regular `fn`.
+
+Preprocess function signature:
+
+```rust
+#[potato::preprocess]
+fn pre(req: &mut potato::HttpRequest) -> ...
+```
+
+Supported return types: `anyhow::Result<Option<potato::HttpResponse>>`, `Option<potato::HttpResponse>`, `anyhow::Result<()>`, `()`
+
+Postprocess function signature:
+
+```rust
+#[potato::postprocess]
+fn post(req: &mut potato::HttpRequest, res: &mut potato::HttpResponse) -> ...
+```
+
+Supported return types: `anyhow::Result<()>`, `()`
+
+You can repeat hook annotations on the same handler, for example:
+
+```rust
+#[potato::preprocess(pre1)]
+#[potato::preprocess(pre2, pre3)]
+#[potato::postprocess(post1)]
+#[potato::postprocess(post2)]
+```
+
+Execution order is expanded left-to-right and top-to-bottom.
