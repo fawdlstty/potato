@@ -1575,6 +1575,50 @@ pub enum HttpResponseBody {
     Stream(Receiver<Vec<u8>>),
 }
 
+pub struct HttpResponseBodyStream<'a> {
+    body: &'a mut HttpResponseBody,
+    data_consumed: bool,
+}
+
+impl HttpResponseBody {
+    pub async fn data(&mut self) -> &[u8] {
+        if let HttpResponseBody::Stream(mut rx) = std::mem::replace(self, HttpResponseBody::Data(vec![])) {
+            let mut data = Vec::with_capacity(1024);
+            while let Some(chunk) = rx.recv().await {
+                data.extend_from_slice(&chunk);
+            }
+            *self = HttpResponseBody::Data(data);
+        }
+        match self {
+            HttpResponseBody::Data(data) => data.as_slice(),
+            HttpResponseBody::Stream(_) => unreachable!("stream body should be converted to data"),
+        }
+    }
+
+    pub fn stream_data(&mut self) -> HttpResponseBodyStream<'_> {
+        HttpResponseBodyStream {
+            body: self,
+            data_consumed: false,
+        }
+    }
+}
+
+impl HttpResponseBodyStream<'_> {
+    pub async fn next(&mut self) -> Option<Vec<u8>> {
+        match self.body {
+            HttpResponseBody::Data(data) => {
+                if self.data_consumed {
+                    None
+                } else {
+                    self.data_consumed = true;
+                    Some(data.clone())
+                }
+            }
+            HttpResponseBody::Stream(rx) => rx.recv().await,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct HttpResponse {
     pub version: String,

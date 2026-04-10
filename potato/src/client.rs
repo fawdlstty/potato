@@ -6,6 +6,96 @@ use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody, SERVER_STR}
 use anyhow::anyhow;
 use std::collections::HashMap;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::Sender;
+
+fn transfer_encoding_has_chunked(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|item| item.trim().eq_ignore_ascii_case("chunked"))
+}
+
+fn response_disallows_body(http_code: u16) -> bool {
+    (100..200).contains(&http_code) || http_code == 204 || http_code == 304
+}
+
+fn is_sse_response(res: &HttpResponse) -> bool {
+    let is_sse = res
+        .get_header("Content-Type")
+        .map(|v| {
+            v.split(';')
+                .next()
+                .map(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let has_chunked = res
+        .get_header("Transfer-Encoding")
+        .map(transfer_encoding_has_chunked)
+        .unwrap_or(false);
+    is_sse && has_chunked
+}
+
+async fn stream_chunked_body_to_channel(
+    mut stream: HttpStream,
+    mut buf: Vec<u8>,
+    tx: Sender<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let mut cursor = 0usize;
+    let mut tmp_buf = [0u8; 8192];
+    loop {
+        let line_end = loop {
+            if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n") {
+                break cursor + pos;
+            }
+            let n = stream.read(&mut tmp_buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&tmp_buf[..n]);
+        };
+
+        let size_line = std::str::from_utf8(&buf[cursor..line_end])?;
+        let size_token = size_line
+            .split_once(';')
+            .map_or(size_line, |(size, _)| size)
+            .trim();
+        if size_token.is_empty() {
+            return Err(anyhow!("invalid chunk size"));
+        }
+        let chunk_size = usize::from_str_radix(size_token, 16)?;
+        cursor = line_end + 2;
+
+        if chunk_size == 0 {
+            return Ok(());
+        }
+
+        while buf.len() < cursor + chunk_size + 2 {
+            let n = stream.read(&mut tmp_buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&tmp_buf[..n]);
+        }
+
+        if &buf[cursor + chunk_size..cursor + chunk_size + 2] != b"\r\n" {
+            return Err(anyhow!("invalid chunk terminator"));
+        }
+
+        if tx
+            .send(buf[cursor..cursor + chunk_size].to_vec())
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        cursor += chunk_size + 2;
+        if cursor > 8192 {
+            buf.drain(..cursor);
+            cursor = 0;
+        }
+    }
+}
 
 macro_rules! define_session_method {
     ($fn_name:ident, $method:ident) => {
@@ -133,10 +223,49 @@ impl Session {
     }
 
     pub async fn do_request(&mut self, req: HttpRequest) -> anyhow::Result<HttpResponse> {
-        let sess_impl = self.session_impl()?;
         let request_method = req.method;
-        sess_impl.stream.write_all(&req.as_bytes()).await?;
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        let mut sse_response: Option<HttpResponse> = None;
+        {
+            let sess_impl = self.session_impl()?;
+            sess_impl.stream.write_all(&req.as_bytes()).await?;
+            loop {
+                if let Some((res, hdr_len)) = HttpResponse::from_headers_part(&buf[..])? {
+                    if request_method != HttpMethod::HEAD
+                        && !response_disallows_body(res.http_code)
+                        && is_sse_response(&res)
+                    {
+                        let (tx, rx) = tokio::sync::mpsc::channel(64);
+                        let body_buf = buf[hdr_len..].to_vec();
+                        let mut res = res;
+                        res.body = HttpResponseBody::Stream(rx);
+
+                        let (duplex_stream, _) = tokio::io::duplex(1);
+                        let stream = std::mem::replace(
+                            &mut sess_impl.stream,
+                            HttpStream::from_duplex_stream(duplex_stream),
+                        );
+                        tokio::spawn(async move {
+                            _ = stream_chunked_body_to_channel(stream, body_buf, tx).await;
+                        });
+                        sse_response = Some(res);
+                        break;
+                    }
+                    break;
+                }
+                let mut tmp_buf = [0u8; 4096];
+                let n = sess_impl.stream.read(&mut tmp_buf).await?;
+                if n == 0 {
+                    return Err(anyhow!("connection closed"));
+                }
+                buf.extend_from_slice(&tmp_buf[..n]);
+            }
+        }
+        if let Some(res) = sse_response {
+            self.sess_impl = None;
+            return Ok(res);
+        }
+        let sess_impl = self.session_impl()?;
         let (res, _) = HttpResponse::from_stream_with_request_method(
             &mut buf,
             &mut sess_impl.stream,
@@ -205,28 +334,106 @@ define_client_method!(connect);
 define_client_method!(patch);
 define_client_method!(trace);
 
-//
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __potato_headers_vec {
+    () => {
+        Vec::<$crate::Headers>::new()
+    };
+    ($($header:ident = $value:expr),+ $(,)?) => {{
+        vec![$($crate::Headers::$header(($value).into())),+]
+    }};
+}
 
-// #[macro_export]
-// macro_rules! get {
-//     ($url:expr) => {{
-//         let mut sess = Session::new();
-//         match sess.new_request(HttpMethod::GET, url).await {
-//             Ok(req) => sess.do_request(req).await
-//             Err(err) => Err(err),
-//         }
-//     }};
-//     ($url:expr $(, $args:expr)*) => {{
-//         let mut sess = Session::new();
-//         match sess.new_request(HttpMethod::GET, url).await {
-//             Ok(req) => {
-//                 $( req.apply_header(args); )*
-//                 sess.do_request(req).await
-//             }
-//             Err(err) => Err(err),
-//         }
-//     }};
-// }
+#[macro_export]
+macro_rules! get {
+    ($url:expr $(,)?) => {
+        $crate::get($url, $crate::__potato_headers_vec!())
+    };
+    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
+        $crate::get($url, $crate::__potato_headers_vec!($($header = $value),+))
+    };
+}
+
+#[macro_export]
+macro_rules! delete {
+    ($url:expr $(,)?) => {
+        $crate::delete($url, $crate::__potato_headers_vec!())
+    };
+    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
+        $crate::delete($url, $crate::__potato_headers_vec!($($header = $value),+))
+    };
+}
+
+#[macro_export]
+macro_rules! head {
+    ($url:expr $(,)?) => {
+        $crate::head($url, $crate::__potato_headers_vec!())
+    };
+    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
+        $crate::head($url, $crate::__potato_headers_vec!($($header = $value),+))
+    };
+}
+
+#[macro_export]
+macro_rules! options {
+    ($url:expr $(,)?) => {
+        $crate::options($url, $crate::__potato_headers_vec!())
+    };
+    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
+        $crate::options($url, $crate::__potato_headers_vec!($($header = $value),+))
+    };
+}
+
+#[macro_export]
+macro_rules! connect {
+    ($url:expr $(,)?) => {
+        $crate::connect($url, $crate::__potato_headers_vec!())
+    };
+    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
+        $crate::connect($url, $crate::__potato_headers_vec!($($header = $value),+))
+    };
+}
+
+#[macro_export]
+macro_rules! trace {
+    ($url:expr $(,)?) => {
+        $crate::trace($url, $crate::__potato_headers_vec!())
+    };
+    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
+        $crate::trace($url, $crate::__potato_headers_vec!($($header = $value),+))
+    };
+}
+
+#[macro_export]
+macro_rules! post {
+    ($url:expr, $body:expr $(,)?) => {
+        $crate::post($url, $body, $crate::__potato_headers_vec!())
+    };
+    ($url:expr, $body:expr, $($header:ident = $value:expr),+ $(,)?) => {
+        $crate::post($url, $body, $crate::__potato_headers_vec!($($header = $value),+))
+    };
+}
+
+#[macro_export]
+macro_rules! put {
+    ($url:expr, $body:expr $(,)?) => {
+        $crate::put($url, $body, $crate::__potato_headers_vec!())
+    };
+    ($url:expr, $body:expr, $($header:ident = $value:expr),+ $(,)?) => {
+        $crate::put($url, $body, $crate::__potato_headers_vec!($($header = $value),+))
+    };
+}
+
+#[macro_export]
+macro_rules! patch {
+    ($url:expr $(,)?) => {
+        $crate::patch($url, $crate::__potato_headers_vec!())
+    };
+    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
+        $crate::patch($url, $crate::__potato_headers_vec!($($header = $value),+))
+    };
+}
 
 pub struct TransferSession {
     pub req_path_prefix: String,

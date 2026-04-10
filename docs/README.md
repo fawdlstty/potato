@@ -11,24 +11,18 @@ actions:
     type: secondary
 
 features:
-  - title: 高性能、极简
-    details: 纯Rust语言实现，速度快，几行代码即可实现HTTP服务器/客户端
-  - title: 多协议服务端
-    details: 同一套处理函数可运行在 HTTP/1.1、HTTP/2、HTTP/3
-  - title: OpenAPI支持
-    details: 支持OpenAPI规范，支持生成API文档
-  - title: 静态资源打包
-    details: 支持静态HTTP资源文件打包，方便部署
-  - title: 条件请求与分段下载
-    details: 静态文件路由支持 ETag/Last-Modified 与 Range/If-Range
-  - title: JwtAuth校验支持
-    details: 内置JwtAuth校验功能，方便API鉴权
-  - title: 内存泄露排查
-    details: 内置jemalloc内存泄露检测功能，方便排查内存泄露
-  - title: WebDAV 支持
-    details: 支持服务器端 WebDAV 协议
-  - title: AI 协议支持
-    details: 支持 OpenAI 和 Claude 两种主流 AI 流式传输协议
+  - title: 高性能、用法极简
+    details: 基于 Rust 异步运行时实现，路由定义与服务启动可在少量代码内完成
+  - title: 标准 HTTP 支持
+    details: 完整支持 HTTP/1.1、HTTP/2、HTTP/3，并可在同一处理函数下运行
+  - title: 静态打包与动态路由
+    details: 支持将静态资源打包为单体发布，同时支持动态 HTTP 路由、静态文件路由与缓存协商机制
+  - title: OpenAPI 与 WebDAV 支持
+    details: 支持 OpenAPI 描述生成与 WebDAV 服务端协议能力
+  - title: 内置认证与处理链路
+    details: 内置 JWT 鉴权能力，并支持请求预处理与响应后处理链路
+  - title: AI 流式协议支持
+    details: 支持 OpenAI 与 Claude 的流式传输协议与分块响应处理
 
 footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---

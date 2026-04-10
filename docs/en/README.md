@@ -11,24 +11,18 @@ actions:
     type: secondary
 
 features:
-  - title: High Performance, Concise
-    details: Pure Rust implementation, fast, a few lines of code can implement HTTP server/client
-  - title: Multi-Protocol Server
-    details: Run the same handlers on HTTP/1.1, HTTP/2, and HTTP/3
-  - title: OpenAPI Support
-    details: Supports OpenAPI specification, supports generating API documentation
-  - title: Static Resource Packaging
-    details: Supports static HTTP resource file packaging, convenient for deployment
-  - title: Conditional and Range Requests
-    details: Static routes support ETag/Last-Modified and Range/If-Range
-  - title: JwtAuth Verification Support
-    details: Built-in JwtAuth verification function, convenient for API authentication
-  - title: Memory Leak Detection
-    details: Built-in jemalloc memory leak detection function, convenient for troubleshooting memory leaks
-  - title: WebDAV Support
-    details: Supports server-side WebDAV protocol
-  - title: AI Protocol Support
-    details: Supports OpenAI and Claude two mainstream AI streaming protocols
+  - title: High Performance, Minimal API
+    details: Built on Rust async runtime, with concise route definitions and service bootstrap code
+  - title: Standard HTTP Coverage
+    details: Full support for HTTP/1.1, HTTP/2, and HTTP/3 with the same handler model
+  - title: Static Bundling and Dynamic Routing
+    details: Supports packaging static assets into a single distributable unit, alongside dynamic HTTP routes, static file routes, and cache negotiation semantics
+  - title: OpenAPI + WebDAV Support
+    details: Supports OpenAPI description generation and server-side WebDAV protocol capabilities
+  - title: Built-in Auth and Processing Pipeline
+    details: Includes built-in JWT auth with request pre-processing and response post-processing stages
+  - title: AI Streaming Protocol Support
+    details: Supports OpenAI and Claude streaming protocols with chunked response handling
 
 footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---

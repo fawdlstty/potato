@@ -13,7 +13,7 @@ fn get_test_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use potato::HttpServer;
+    use potato::{HttpResponseBody, HttpServer};
 
     /// 测试基础的客户端 Session 创建
     #[tokio::test]
@@ -132,24 +132,29 @@ mod tests {
 
         let url = format!("http://{}/", server_addr);
 
-        // 使用全局 API
-        let _res = potato::get(&url, vec![]).await;
-        println!("✅ Global GET API works");
+        let _res = potato::get!(&url).await;
+        println!("✅ Global GET macro works");
 
-        let _res = potato::post(&url, vec![], vec![]).await;
-        println!("✅ Global POST API works");
+        let _res = potato::post!(&url, vec![]).await;
+        println!("✅ Global POST macro works");
 
-        let _res = potato::put(&url, vec![], vec![]).await;
-        println!("✅ Global PUT API works");
+        let _res = potato::put!(&url, vec![]).await;
+        println!("✅ Global PUT macro works");
 
-        let _res = potato::delete(&url, vec![]).await;
-        println!("✅ Global DELETE API works");
+        let _res = potato::patch!(&url).await;
+        println!("✅ Global PATCH macro works");
 
-        let _res = potato::head(&url, vec![]).await;
-        println!("✅ Global HEAD API works");
+        let _res = potato::delete!(&url).await;
+        println!("✅ Global DELETE macro works");
 
-        let _res = potato::options(&url, vec![]).await;
-        println!("✅ Global OPTIONS API works");
+        let _res = potato::head!(&url).await;
+        println!("✅ Global HEAD macro works");
+
+        let _res = potato::options!(&url).await;
+        println!("✅ Global OPTIONS macro works");
+
+        let _res = potato::trace!(&url).await;
+        println!("✅ Global TRACE macro works");
 
         server_handle.abort();
         Ok(())
@@ -161,7 +166,7 @@ mod tests {
         // 尝试连接到不存在的服务器
         let url = "http://127.0.0.1:1/";
 
-        let result = potato::get(url, vec![]).await;
+        let result = potato::get!(url).await;
 
         // 应该返回错误
         assert!(result.is_err());
@@ -190,7 +195,7 @@ mod tests {
         let url = format!("http://{}/", server_addr);
 
         // 使用 tokio 的超时包装
-        let result = tokio::time::timeout(Duration::from_secs(5), potato::get(&url, vec![])).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), potato::get!(&url)).await;
 
         match result {
             Ok(Ok(_res)) => {
@@ -287,6 +292,63 @@ mod tests {
         println!("✅ Client post_json_str API works");
 
         server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_client_macro_headers() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{}", port);
+
+        let mut server = HttpServer::new(&server_addr);
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http().await;
+        });
+
+        sleep(Duration::from_millis(200)).await;
+
+        let url = format!("http://{}/", server_addr);
+        let _res = potato::get!(&url, User_Agent = "test-client/1.0").await;
+        let _res = potato::post!(&url, vec![], User_Agent = "test-client/1.0").await;
+
+        println!("✅ Macro headers work");
+
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_http_response_body_data_waits_stream() -> anyhow::Result<()> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            _ = tx.send(b"hello".to_vec()).await;
+            _ = tx.send(b" world".to_vec()).await;
+        });
+
+        let mut body = HttpResponseBody::Stream(rx);
+        let data = body.data().await;
+        assert_eq!(data, b"hello world");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_http_response_body_stream_next() -> anyhow::Result<()> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            _ = tx.send(b"data: one\n\n".to_vec()).await;
+            _ = tx.send(b"data: two\n\n".to_vec()).await;
+        });
+
+        let mut body = HttpResponseBody::Stream(rx);
+        let mut stream = body.stream_data();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], b"data: one\n\n");
+        assert_eq!(chunks[1], b"data: two\n\n");
         Ok(())
     }
 }

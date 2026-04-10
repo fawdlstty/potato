@@ -1,25 +1,47 @@
 # Using the Client
 
-Specify two parameters: the request address and additional parameters. Example code:
+Client macros support passing the URL directly, with optional headers. Example:
 
 ```rust
-let res = potato::get("https://www.fawdlstty.com", vec![]).await?;
-println!("{}", String::from_utf8(res.body)?);
+let mut res = potato::get!("https://www.fawdlstty.com").await?;
+println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
 ```
 
-Additional parameters are used to specify HTTP headers. Example of modifying `User-Agent`:
+Additional parameters are used to specify HTTP headers. Example for `User-Agent`:
 
 ```rust
-let res = potato::get("https://www.fawdlstty.com", vec![Headers::User_Agent("aaa".into())]).await?;
-println!("{}", String::from_utf8(res.body)?);
+let mut res = potato::get!("https://www.fawdlstty.com", User_Agent = "aaa").await?;
+println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
 ```
+
+For methods with a request body (`post!`/`put!`), the second argument is the body:
+
+```rust
+let body = vec![];
+let mut res = potato::post!("https://www.fawdlstty.com", body, User_Agent = "aaa").await?;
+println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
+```
+
+Other methods follow the same style: `delete!`, `head!`, `options!`, `connect!`, `trace!`, `patch!`.
 
 Requests can be made in session form. If the request paths are the same, the connection will be reused:
 
 ```rust
 let mut sess = Session::new();
-let res1 = sess.get("https://www.fawdlstty.com/1", vec![]).await?;
-let res2 = sess.get("https://www.fawdlstty.com/2", vec![]).await?;
+let mut res1 = sess.get("https://www.fawdlstty.com/1", vec![]).await?;
+let mut res2 = sess.get("https://www.fawdlstty.com/2", vec![]).await?;
+println!("{}", String::from_utf8(res1.body.data().await.to_vec())?);
+println!("{}", String::from_utf8(res2.body.data().await.to_vec())?);
+```
+
+For SSE responses, keep reading with `stream_data()`:
+
+```rust
+let mut res = potato::get!("http://127.0.0.1:3000/api/v1/chat").await?;
+let mut stream = res.body.stream_data();
+while let Some(chunk) = stream.next().await {
+    print!("{}", String::from_utf8_lossy(&chunk));
+}
 ```
 
 To initiate a WebSocket connection request, use the following form:

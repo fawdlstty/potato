@@ -1,25 +1,47 @@
 # 使用客户端
 
-指定两个参数，请求地址与附加参数。示例代码：
+客户端宏支持直接传 URL，并可选追加请求头。示例代码：
 
 ```rust
-let res = potato::get("https://www.fawdlstty.com", vec![]).await?;
-println!("{}", String::from_utf8(res.body)?);
+let mut res = potato::get!("https://www.fawdlstty.com").await?;
+println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
 ```
 
-附加参数用于指定HTTP头。示例修改 `User-Agent`：
+附加参数用于指定 HTTP 头。示例修改 `User-Agent`：
 
 ```rust
-let res = potato::get("https://www.fawdlstty.com", vec![Headers::User_Agent("aaa".into())]).await?;
-println!("{}", String::from_utf8(res.body)?);
+let mut res = potato::get!("https://www.fawdlstty.com", User_Agent = "aaa").await?;
+println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
 ```
+
+带请求体的方法（`post!`/`put!`）第二个参数是 body：
+
+```rust
+let body = vec![];
+let mut res = potato::post!("https://www.fawdlstty.com", body, User_Agent = "aaa").await?;
+println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
+```
+
+其余方法同样支持该写法：`delete!`、`head!`、`options!`、`connect!`、`trace!`、`patch!`。
 
 可通过会话形式发起请求，如果请求路径相同，则复用链接：
 
 ```rust
 let mut sess = Session::new();
-let res1 = sess.get("https://www.fawdlstty.com/1", vec![]).await?;
-let res2 = sess.get("https://www.fawdlstty.com/2", vec![]).await?;
+let mut res1 = sess.get("https://www.fawdlstty.com/1", vec![]).await?;
+let mut res2 = sess.get("https://www.fawdlstty.com/2", vec![]).await?;
+println!("{}", String::from_utf8(res1.body.data().await.to_vec())?);
+println!("{}", String::from_utf8(res2.body.data().await.to_vec())?);
+```
+
+SSE流式响应可通过 `stream_data()` 持续接收：
+
+```rust
+let mut res = potato::get!("http://127.0.0.1:3000/api/v1/chat").await?;
+let mut stream = res.body.stream_data();
+while let Some(chunk) = stream.next().await {
+    print!("{}", String::from_utf8_lossy(&chunk));
+}
 ```
 
 发起Websocket连接请求通过如下形式：
