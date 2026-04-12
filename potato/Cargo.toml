@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -79,7 +79,7 @@ rcgen = "0.14.5"
 time = "0.3"
 
 [features]
-default = ["openapi", "tls", "http3"]
+default = ["openapi", "tls"]
 http2 = ["tls", "dep:h2", "dep:bytes"]
 http3 = ["tls", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:bytes"]
 jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:tikv-jemallocator"]

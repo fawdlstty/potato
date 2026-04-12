@@ -1,4 +1,7 @@
 #![allow(non_camel_case_types)]
+pub mod http2;
+pub mod http3;
+
 use crate::utils::bytes::CompressExt;
 use crate::utils::refstr::{HeaderItem, Headers};
 use crate::utils::tcp_stream::HttpStream;
@@ -284,7 +287,7 @@ impl Session {
     fn session_impl(&mut self) -> anyhow::Result<&mut SessionImpl> {
         self.sess_impl
             .as_mut()
-            .ok_or_else(|| anyhow!("session impl is null"))
+            .ok_or_else(|| anyhow!("session implementation not initialized"))
     }
 
     define_session_method!(get, GET);
@@ -340,6 +343,219 @@ define_client_method!(connect);
 define_client_method!(patch);
 define_client_method!(trace);
 
+/// HTTP 协议版本选择器
+#[derive(Clone, Debug)]
+pub enum HttpVersion {
+    /// HTTP/1.1 (默认)
+    Http11,
+    /// HTTP/2
+    #[cfg(feature = "http2")]
+    Http2,
+    /// HTTP/3
+    #[cfg(feature = "http3")]
+    Http3,
+}
+
+/// URL 包装器，用于指定 HTTP 协议版本
+pub struct VersionedUrl {
+    pub url: String,
+    pub version: HttpVersion,
+}
+
+/// 创建 HTTP/1.1 URL（默认，可省略）
+pub fn http11(url: impl Into<String>) -> VersionedUrl {
+    VersionedUrl {
+        url: url.into(),
+        version: HttpVersion::Http11,
+    }
+}
+
+/// 创建 HTTP/2 URL
+#[cfg(feature = "http2")]
+pub fn http2(url: impl Into<String>) -> VersionedUrl {
+    VersionedUrl {
+        url: url.into(),
+        version: HttpVersion::Http2,
+    }
+}
+
+/// 创建 HTTP/3 URL
+#[cfg(feature = "http3")]
+pub fn http3(url: impl Into<String>) -> VersionedUrl {
+    VersionedUrl {
+        url: url.into(),
+        version: HttpVersion::Http3,
+    }
+}
+
+/// 统一的 GET 请求函数，根据 URL 版本选择器自动选择协议
+pub async fn get_versioned(
+    versioned_url: VersionedUrl,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => get(&versioned_url.url, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => crate::client::http2::get(&versioned_url.url, args).await,
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => crate::client::http3::get(&versioned_url.url, args).await,
+    }
+}
+
+/// 统一的 POST 请求函数
+pub async fn post_versioned(
+    versioned_url: VersionedUrl,
+    body: Vec<u8>,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => post(&versioned_url.url, body, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => crate::client::http2::post(&versioned_url.url, body, args).await,
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => crate::client::http3::post(&versioned_url.url, body, args).await,
+    }
+}
+
+/// 统一的 POST JSON 请求函数
+pub async fn post_json_versioned(
+    versioned_url: VersionedUrl,
+    body: serde_json::Value,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => post_json(&versioned_url.url, body, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => crate::client::http2::post_json(&versioned_url.url, body, args).await,
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => crate::client::http3::post_json(&versioned_url.url, body, args).await,
+    }
+}
+
+/// 统一的 POST JSON String 请求函数
+pub async fn post_json_str_versioned(
+    versioned_url: VersionedUrl,
+    body: String,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => post_json_str(&versioned_url.url, body, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => {
+            crate::client::http2::post_json_str(&versioned_url.url, body, args).await
+        }
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => {
+            crate::client::http3::post_json_str(&versioned_url.url, body, args).await
+        }
+    }
+}
+
+/// 统一的 PUT 请求函数
+pub async fn put_versioned(
+    versioned_url: VersionedUrl,
+    body: Vec<u8>,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => put(&versioned_url.url, body, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => crate::client::http2::put(&versioned_url.url, body, args).await,
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => crate::client::http3::put(&versioned_url.url, body, args).await,
+    }
+}
+
+/// 统一的 PUT JSON 请求函数
+pub async fn put_json_versioned(
+    versioned_url: VersionedUrl,
+    body: serde_json::Value,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => put_json(&versioned_url.url, body, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => crate::client::http2::put_json(&versioned_url.url, body, args).await,
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => crate::client::http3::put_json(&versioned_url.url, body, args).await,
+    }
+}
+
+/// 统一的 PUT JSON String 请求函数
+pub async fn put_json_str_versioned(
+    versioned_url: VersionedUrl,
+    body: String,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => put_json_str(&versioned_url.url, body, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => {
+            crate::client::http2::put_json_str(&versioned_url.url, body, args).await
+        }
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => {
+            crate::client::http3::put_json_str(&versioned_url.url, body, args).await
+        }
+    }
+}
+
+/// 统一的 DELETE 请求函数
+pub async fn delete_versioned(
+    versioned_url: VersionedUrl,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => delete(&versioned_url.url, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => crate::client::http2::delete(&versioned_url.url, args).await,
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => crate::client::http3::delete(&versioned_url.url, args).await,
+    }
+}
+
+/// 统一的 HEAD 请求函数
+pub async fn head_versioned(
+    versioned_url: VersionedUrl,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => head(&versioned_url.url, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => crate::client::http2::head(&versioned_url.url, args).await,
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => crate::client::http3::head(&versioned_url.url, args).await,
+    }
+}
+
+/// 统一的 OPTIONS 请求函数
+pub async fn options_versioned(
+    versioned_url: VersionedUrl,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => options(&versioned_url.url, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => crate::client::http2::options(&versioned_url.url, args).await,
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => crate::client::http3::options(&versioned_url.url, args).await,
+    }
+}
+
+/// 统一的 PATCH 请求函数
+pub async fn patch_versioned(
+    versioned_url: VersionedUrl,
+    args: Vec<Headers>,
+) -> anyhow::Result<HttpResponse> {
+    match versioned_url.version {
+        HttpVersion::Http11 => patch(&versioned_url.url, args).await,
+        #[cfg(feature = "http2")]
+        HttpVersion::Http2 => crate::client::http2::patch(&versioned_url.url, args).await,
+        #[cfg(feature = "http3")]
+        HttpVersion::Http3 => crate::client::http3::patch(&versioned_url.url, args).await,
+    }
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __potato_headers_vec {
@@ -351,44 +567,122 @@ macro_rules! __potato_headers_vec {
     }};
 }
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __potato_push_header {
+    ($headers:expr, $key:literal = $value:expr) => {{
+        $headers.push($crate::Headers::Custom(($key.into(), ($value).into())));
+    }};
+    ($headers:expr, $header:ident = $value:expr) => {{
+        $headers.push($crate::Headers::$header(($value).into()));
+    }};
+    ($headers:expr, Custom($key:expr) = $value:expr) => {{
+        $headers.push($crate::Headers::Custom((($key).into(), ($value).into())));
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __potato_parse_headers {
+    ($headers:expr,) => {};
+    ($headers:expr, $key:literal = $value:expr, $($rest:tt)+) => {{
+        $headers.push($crate::Headers::Custom(($key.into(), ($value).into())));
+        $crate::__potato_parse_headers!($headers, $($rest)+);
+    }};
+    ($headers:expr, $header:ident = $value:expr, $($rest:tt)+) => {{
+        $headers.push($crate::Headers::$header(($value).into()));
+        $crate::__potato_parse_headers!($headers, $($rest)+);
+    }};
+    ($headers:expr, Custom($key:expr) = $value:expr, $($rest:tt)+) => {{
+        $headers.push($crate::Headers::Custom((($key).into(), ($value).into())));
+        $crate::__potato_parse_headers!($headers, $($rest)+);
+    }};
+    ($headers:expr, $key:literal = $value:expr) => {{
+        $headers.push($crate::Headers::Custom(($key.into(), ($value).into())));
+    }};
+    ($headers:expr, $header:ident = $value:expr) => {{
+        $headers.push($crate::Headers::$header(($value).into()));
+    }};
+    ($headers:expr, Custom($key:expr) = $value:expr) => {{
+        $headers.push($crate::Headers::Custom((($key).into(), ($value).into())));
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __potato_detect_url_version {
+    // 检测 http11() 包装器
+    (http11($url:expr)) => {
+        $crate::client::http11($url)
+    };
+    // 检测 http2() 包装器
+    (http2($url:expr)) => {
+        $crate::client::http2($url)
+    };
+    // 检测 http3() 包装器
+    (http3($url:expr)) => {
+        $crate::client::http3($url)
+    };
+    // 默认情况：直接使用 URL（HTTP/1.1）
+    ($url:expr) => {
+        $crate::client::http11($url)
+    };
+}
+
 #[macro_export]
 macro_rules! get {
-    ($url:expr $(,)?) => {
-        $crate::get($url, $crate::__potato_headers_vec!())
-    };
-    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
-        $crate::get($url, $crate::__potato_headers_vec!($($header = $value),+))
-    };
+    ($url:expr $(,)?) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        $crate::get_versioned(versioned_url, $crate::__potato_headers_vec!())
+    }};
+    ($url:expr, $($tt:tt)+) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        let mut headers = Vec::<$crate::Headers>::new();
+        $crate::__potato_parse_headers!(headers, $($tt)+);
+        $crate::get_versioned(versioned_url, headers)
+    }};
 }
 
 #[macro_export]
 macro_rules! delete {
-    ($url:expr $(,)?) => {
-        $crate::delete($url, $crate::__potato_headers_vec!())
-    };
-    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
-        $crate::delete($url, $crate::__potato_headers_vec!($($header = $value),+))
-    };
+    ($url:expr $(,)?) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        $crate::delete_versioned(versioned_url, $crate::__potato_headers_vec!())
+    }};
+    ($url:expr, $($tt:tt)+) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        let mut headers = Vec::<$crate::Headers>::new();
+        $crate::__potato_parse_headers!(headers, $($tt)+);
+        $crate::delete_versioned(versioned_url, headers)
+    }};
 }
 
 #[macro_export]
 macro_rules! head {
-    ($url:expr $(,)?) => {
-        $crate::head($url, $crate::__potato_headers_vec!())
-    };
-    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
-        $crate::head($url, $crate::__potato_headers_vec!($($header = $value),+))
-    };
+    ($url:expr $(,)?) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        $crate::head_versioned(versioned_url, $crate::__potato_headers_vec!())
+    }};
+    ($url:expr, $($tt:tt)+) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        let mut headers = Vec::<$crate::Headers>::new();
+        $crate::__potato_parse_headers!(headers, $($tt)+);
+        $crate::head_versioned(versioned_url, headers)
+    }};
 }
 
 #[macro_export]
 macro_rules! options {
-    ($url:expr $(,)?) => {
-        $crate::options($url, $crate::__potato_headers_vec!())
-    };
-    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
-        $crate::options($url, $crate::__potato_headers_vec!($($header = $value),+))
-    };
+    ($url:expr $(,)?) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        $crate::options_versioned(versioned_url, $crate::__potato_headers_vec!())
+    }};
+    ($url:expr, $($tt:tt)+) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        let mut headers = Vec::<$crate::Headers>::new();
+        $crate::__potato_parse_headers!(headers, $($tt)+);
+        $crate::options_versioned(versioned_url, headers)
+    }};
 }
 
 #[macro_export]
@@ -396,9 +690,11 @@ macro_rules! connect {
     ($url:expr $(,)?) => {
         $crate::connect($url, $crate::__potato_headers_vec!())
     };
-    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
-        $crate::connect($url, $crate::__potato_headers_vec!($($header = $value),+))
-    };
+    ($url:expr, $($tt:tt)+) => {{
+        let mut headers = Vec::<$crate::Headers>::new();
+        $crate::__potato_parse_headers!(headers, $($tt)+);
+        $crate::connect($url, headers)
+    }};
 }
 
 #[macro_export]
@@ -406,39 +702,53 @@ macro_rules! trace {
     ($url:expr $(,)?) => {
         $crate::trace($url, $crate::__potato_headers_vec!())
     };
-    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
-        $crate::trace($url, $crate::__potato_headers_vec!($($header = $value),+))
-    };
+    ($url:expr, $($tt:tt)+) => {{
+        let mut headers = Vec::<$crate::Headers>::new();
+        $crate::__potato_parse_headers!(headers, $($tt)+);
+        $crate::trace($url, headers)
+    }};
 }
 
 #[macro_export]
 macro_rules! post {
-    ($url:expr, $body:expr $(,)?) => {
-        $crate::post($url, $body, $crate::__potato_headers_vec!())
-    };
-    ($url:expr, $body:expr, $($header:ident = $value:expr),+ $(,)?) => {
-        $crate::post($url, $body, $crate::__potato_headers_vec!($($header = $value),+))
-    };
+    ($url:expr, $body:expr $(,)?) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        $crate::post_versioned(versioned_url, $body, $crate::__potato_headers_vec!())
+    }};
+    ($url:expr, $body:expr, $($tt:tt)+) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        let mut headers = Vec::<$crate::Headers>::new();
+        $crate::__potato_parse_headers!(headers, $($tt)+);
+        $crate::post_versioned(versioned_url, $body, headers)
+    }};
 }
 
 #[macro_export]
 macro_rules! put {
-    ($url:expr, $body:expr $(,)?) => {
-        $crate::put($url, $body, $crate::__potato_headers_vec!())
-    };
-    ($url:expr, $body:expr, $($header:ident = $value:expr),+ $(,)?) => {
-        $crate::put($url, $body, $crate::__potato_headers_vec!($($header = $value),+))
-    };
+    ($url:expr, $body:expr $(,)?) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        $crate::put_versioned(versioned_url, $body, $crate::__potato_headers_vec!())
+    }};
+    ($url:expr, $body:expr, $($tt:tt)+) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        let mut headers = Vec::<$crate::Headers>::new();
+        $crate::__potato_parse_headers!(headers, $($tt)+);
+        $crate::put_versioned(versioned_url, $body, headers)
+    }};
 }
 
 #[macro_export]
 macro_rules! patch {
-    ($url:expr $(,)?) => {
-        $crate::patch($url, $crate::__potato_headers_vec!())
-    };
-    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
-        $crate::patch($url, $crate::__potato_headers_vec!($($header = $value),+))
-    };
+    ($url:expr $(,)?) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        $crate::patch_versioned(versioned_url, $crate::__potato_headers_vec!())
+    }};
+    ($url:expr, $($tt:tt)+) => {{
+        let versioned_url = $crate::__potato_detect_url_version!($url);
+        let mut headers = Vec::<$crate::Headers>::new();
+        $crate::__potato_parse_headers!(headers, $($tt)+);
+        $crate::patch_versioned(versioned_url, headers)
+    }};
 }
 
 #[macro_export]
@@ -446,9 +756,11 @@ macro_rules! websocket {
     ($url:expr $(,)?) => {
         $crate::Websocket::connect($url, $crate::__potato_headers_vec!())
     };
-    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
-        $crate::Websocket::connect($url, $crate::__potato_headers_vec!($($header = $value),+))
-    };
+    ($url:expr, $($tt:tt)+) => {{
+        let mut headers = Vec::<$crate::Headers>::new();
+        $crate::__potato_parse_headers!(headers, $($tt)+);
+        $crate::Websocket::connect($url, headers)
+    }};
 }
 
 pub struct TransferSession {

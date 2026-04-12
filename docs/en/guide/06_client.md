@@ -1,40 +1,50 @@
 # Using the Client
 
-Client macros support passing the URL directly, with optional headers. Example:
+Client macros support passing URL directly with optional headers:
 
 ```rust
 let mut res = potato::get!("https://www.fawdlstty.com").await?;
 println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
-```
 
-Additional parameters are used to specify HTTP headers. Example for `User-Agent`:
+// With headers
+let mut res = potato::get!("https://www.fawdlstty.com", User_Agent = "my-client").await?;
 
-```rust
-let mut res = potato::get!("https://www.fawdlstty.com", User_Agent = "aaa").await?;
-println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
-```
-
-For methods with a request body (`post!`/`put!`), the second argument is the body:
-
-```rust
+// POST/PUT second argument is body
 let body = vec![];
-let mut res = potato::post!("https://www.fawdlstty.com", body, User_Agent = "aaa").await?;
-println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
+let mut res = potato::post!("https://www.fawdlstty.com", body, Content_Type = "application/json").await?;
 ```
 
-Other methods follow the same style: `delete!`, `head!`, `options!`, `connect!`, `trace!`, `patch!`.
+All HTTP method macros (`get!`, `post!`, `put!`, `delete!`, `patch!`, `head!`, `options!`, `trace!`, `connect!`) support this syntax.
 
-Requests can be made in session form. If the request paths are the same, the connection will be reused:
+## HTTP/2 and HTTP/3 Requests
+
+Use `http2()` or `http3()` wrapper to specify protocol version (default HTTP/1.1):
+
+```rust
+#[cfg(feature = "http2")]
+let mut res = potato::get!(http2("https://www.fawdlstty.com")).await?;
+
+#[cfg(feature = "http3")]
+let mut res = potato::post!(http3("https://api.example.com"), body, Custom("X-Key") = "value").await?;
+```
+
+- **HTTP/1.1**: Default, use URL directly
+- **HTTP/2**: Requires TLS, use `http2("https://...")`
+- **HTTP/3**: Requires TLS (QUIC-based), use `http3("https://...")`
+
+Full example: `examples/05_http2_http3_client.rs`
+
+## Sessions and Streaming
+
+**Session reuse** (reuses connection for same host):
 
 ```rust
 let mut sess = Session::new();
-let mut res1 = sess.get("https://www.fawdlstty.com/1", vec![]).await?;
-let mut res2 = sess.get("https://www.fawdlstty.com/2", vec![]).await?;
-println!("{}", String::from_utf8(res1.body.data().await.to_vec())?);
-println!("{}", String::from_utf8(res2.body.data().await.to_vec())?);
+let res1 = sess.get("https://www.fawdlstty.com/1", vec![]).await?;
+let res2 = sess.get("https://www.fawdlstty.com/2", vec![]).await?;
 ```
 
-For SSE responses, keep reading with `stream_data()`:
+**SSE streaming**:
 
 ```rust
 let mut res = potato::get!("http://127.0.0.1:3000/api/v1/chat").await?;
@@ -44,50 +54,54 @@ while let Some(chunk) = stream.next().await {
 }
 ```
 
-To initiate a WebSocket connection request, use the following form (macro with the same parameter format as `get!()`):
+**WebSocket connection**:
 
 ```rust
-let mut ws = potato::websocket!("ws://127.0.0.1:8080/ws").await?;
-ws.send_ping().await?;
-ws.send_text("aaa").await?;
+let mut ws = potato::websocket!("ws://127.0.0.1:8080/ws", Custom("X-Key") = "value").await?;
+ws.send_text("hello").await?;
 let frame = ws.recv().await?;
 ```
 
-Additionally, even in pure client mode, you can use jemalloc to get detailed memory allocation reports. You need to add the following code at the program entry point (at the beginning of the main function):
+## Custom HTTP Headers
+
+All client macros support mixing standard and custom headers:
 
 ```rust
-potato::init_jemalloc()?;
+let res = potato::get!(
+    "https://api.example.com/data",
+    Custom("X-Custom-Header") = "value",  // Custom header (string key)
+    User_Agent = "my-client/1.0",          // Standard header (identifier)
+    Custom(k) = v                          // Variables supported
+).await?;
 ```
 
-Then when needed, call the following code:
+**Syntax rules**:
+- **Standard Headers**: Identifiers (e.g., `User_Agent`, `Content_Type`)
+- **Custom Headers**: `Custom(key) = value`, key/value can be strings or variables
+- Mix freely, comma-separated, trailing comma supported
+
+Full example: `examples/01_client_with_arg.rs`
+
+## Other Features
+
+**Jemalloc memory profiling** (requires `jemalloc` feature):
 
 ```rust
-let pdf_data = crate::dump_jemalloc_profile()?;
+potato::init_jemalloc()?;  // At start of main
+// ... run program ...
+let pdf_data = potato::dump_jemalloc_profile()?;  // Get PDF report
 ```
 
-At this point, the `pdf_data` variable contains the raw content of the PDF memory analysis report. Store it as a file to view it.
-
-## Reverse Proxy and Transfer Sessions
-
-You can use [TransferSession](file:///e:/GitHub_fa/potato/potato/src/client.rs#L224-L251) to handle reverse proxy and forward proxy scenarios. It supports forwarding of both HTTP and WebSocket requests, and can modify the forwarded content.
-
-Create a reverse proxy session that forwards requests to a specified target URL:
+**Reverse and forward proxy**:
 
 ```rust
-let mut transfer_session = potato::client::TransferSession::from_reverse_proxy(
-    "/api".to_string(),      // Request path prefix
-    "http://backend-server:8080".to_string()  // Backend target server
+// Reverse proxy
+let mut session = potato::client::TransferSession::from_reverse_proxy(
+    "/api", "http://backend-server:8080"
 );
 
-// Use the transfer method when processing requests
-// let response = transfer_session.transfer(&mut request, true /* whether to modify content */).await?;
-```
+// Forward proxy
+let mut session = potato::client::TransferSession::from_forward_proxy();
 
-Create a forward proxy session for general proxy forwarding:
-
-```rust
-let mut transfer_session = potato::client::TransferSession::from_forward_proxy();
-
-// Use the transfer method when processing requests
-// let response = transfer_session.transfer(&mut request, false /* whether to modify content */).await?;
+// Usage: session.transfer(&mut request, modify_content).await?
 ```

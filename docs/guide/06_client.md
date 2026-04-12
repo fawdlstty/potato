@@ -1,40 +1,50 @@
 # 使用客户端
 
-客户端宏支持直接传 URL，并可选追加请求头。示例代码：
+客户端宏支持直接传 URL，并可选追加请求头：
 
 ```rust
 let mut res = potato::get!("https://www.fawdlstty.com").await?;
 println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
-```
 
-附加参数用于指定 HTTP 头。示例修改 `User-Agent`：
+// 带请求头
+let mut res = potato::get!("https://www.fawdlstty.com", User_Agent = "my-client").await?;
 
-```rust
-let mut res = potato::get!("https://www.fawdlstty.com", User_Agent = "aaa").await?;
-println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
-```
-
-带请求体的方法（`post!`/`put!`）第二个参数是 body：
-
-```rust
+// POST/PUT 第二个参数是 body
 let body = vec![];
-let mut res = potato::post!("https://www.fawdlstty.com", body, User_Agent = "aaa").await?;
-println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
+let mut res = potato::post!("https://www.fawdlstty.com", body, Content_Type = "application/json").await?;
 ```
 
-其余方法同样支持该写法：`delete!`、`head!`、`options!`、`connect!`、`trace!`、`patch!`。
+所有 HTTP 方法宏（`get!`、`post!`、`put!`、`delete!`、`patch!`、`head!`、`options!`、`trace!`、`connect!`）均支持此语法。
 
-可通过会话形式发起请求，如果请求路径相同，则复用链接：
+## HTTP/2 和 HTTP/3 请求
+
+使用 `http2()` 或 `http3()` 包装器指定协议版本（默认 HTTP/1.1）：
+
+```rust
+#[cfg(feature = "http2")]
+let mut res = potato::get!(http2("https://www.fawdlstty.com")).await?;
+
+#[cfg(feature = "http3")]
+let mut res = potato::post!(http3("https://api.example.com"), body, Custom("X-Key") = "value").await?;
+```
+
+- **HTTP/1.1**: 默认，直接使用 URL
+- **HTTP/2**: 需 TLS，使用 `http2("https://...")`
+- **HTTP/3**: 需 TLS（基于 QUIC），使用 `http3("https://...")`
+
+完整示例：`examples/05_http2_http3_client.rs`
+
+## 会话与流式
+
+**会话复用**（相同路径复用连接）：
 
 ```rust
 let mut sess = Session::new();
-let mut res1 = sess.get("https://www.fawdlstty.com/1", vec![]).await?;
-let mut res2 = sess.get("https://www.fawdlstty.com/2", vec![]).await?;
-println!("{}", String::from_utf8(res1.body.data().await.to_vec())?);
-println!("{}", String::from_utf8(res2.body.data().await.to_vec())?);
+let res1 = sess.get("https://www.fawdlstty.com/1", vec![]).await?;
+let res2 = sess.get("https://www.fawdlstty.com/2", vec![]).await?;
 ```
 
-SSE流式响应可通过 `stream_data()` 持续接收：
+**SSE 流式响应**：
 
 ```rust
 let mut res = potato::get!("http://127.0.0.1:3000/api/v1/chat").await?;
@@ -44,50 +54,54 @@ while let Some(chunk) = stream.next().await {
 }
 ```
 
-发起Websocket连接请求通过如下形式，参数格式与 `get!()` 相同：
+**WebSocket 连接**：
 
 ```rust
-let mut ws = potato::websocket!("ws://127.0.0.1:8080/ws").await?;
-ws.send_ping().await?;
-ws.send_text("aaa").await?;
+let mut ws = potato::websocket!("ws://127.0.0.1:8080/ws", Custom("X-Key") = "value").await?;
+ws.send_text("hello").await?;
 let frame = ws.recv().await?;
 ```
 
-另外。即使是纯客户端模式，也可以使用jemalloc获取详细内存分配报告。需要在程序入口点（main函数开始位置）加入如下代码：
+## 自定义 HTTP Header
+
+所有客户端宏支持混合使用标准 Header 和 Custom Header：
 
 ```rust
-potato::init_jemalloc()?;
+let res = potato::get!(
+    "https://api.example.com/data",
+    Custom("X-Custom-Header") = "value",  // Custom header（字符串 key）
+    User_Agent = "my-client/1.0",          // Standard header（标识符）
+    Custom(k) = v                          // 支持变量
+).await?;
 ```
 
-然后在需要时，调用如下代码：
+**语法规则**：
+- **标准 Header**: 标识符（如 `User_Agent`、`Content_Type`）
+- **Custom Header**: `Custom(key) = value`，key/value 可为字符串或变量
+- 混合使用，逗号分隔，支持尾随逗号
+
+完整示例：`examples/01_client_with_arg.rs`
+
+## 其他功能
+
+**Jemalloc 内存分析**（需启用 `jemalloc` feature）：
 
 ```rust
-let pdf_data = crate::dump_jemalloc_profile()?;
+potato::init_jemalloc()?;  // main 函数开始处
+// ... 运行程序 ...
+let pdf_data = potato::dump_jemalloc_profile()?;  // 获取 PDF 报告
 ```
 
-此时`pdf_data`变量里就存了pdf内存分析报告原始内容，将其存储为文件即可查看。
-
-## 反向代理与转发会话
-
-可以使用 [TransferSession](file:///e:/GitHub_fa/potato/potato/src/client.rs#L224-L251) 来处理反向代理和正向代理场景。它支持HTTP和WebSocket请求的转发，并且可以修改转发的内容。
-
-创建一个反向代理会话，将请求转发到指定的目标URL：
+**反向代理与转发会话**：
 
 ```rust
-let mut transfer_session = potato::client::TransferSession::from_reverse_proxy(
-    "/api".to_string(),      // 请求路径前缀
-    "http://backend-server:8080".to_string()  // 后端目标服务器
+// 反向代理
+let mut session = potato::client::TransferSession::from_reverse_proxy(
+    "/api", "http://backend-server:8080"
 );
 
-// 在处理请求时使用transfer方法
-// let response = transfer_session.transfer(&mut request, true /* 是否修改内容 */).await?;
-```
+// 正向代理
+let mut session = potato::client::TransferSession::from_forward_proxy();
 
-创建一个正向代理会话，用于通用代理转发：
-
-```rust
-let mut transfer_session = potato::client::TransferSession::from_forward_proxy();
-
-// 在处理请求时使用transfer方法
-// let response = transfer_session.transfer(&mut request, false /* 是否修改内容 */).await?;
+// 使用: session.transfer(&mut request, modify_content).await?
 ```
