@@ -44,10 +44,10 @@ while let Some(chunk) = stream.next().await {
 }
 ```
 
-To initiate a WebSocket connection request, use the following form:
+To initiate a WebSocket connection request, use the following form (macro with the same parameter format as `get!()`):
 
 ```rust
-let mut ws = Websocket::connect("ws://127.0.0.1:8080/ws", vec![]).await?;
+let mut ws = potato::websocket!("ws://127.0.0.1:8080/ws").await?;
 ws.send_ping().await?;
 ws.send_text("aaa").await?;
 let frame = ws.recv().await?;

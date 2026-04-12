@@ -44,10 +44,10 @@ while let Some(chunk) = stream.next().await {
 }
 ```
 
-发起Websocket连接请求通过如下形式：
+发起Websocket连接请求通过如下形式，参数格式与 `get!()` 相同：
 
 ```rust
-let mut ws = Websocket::connect("ws://127.0.0.1:8080/ws", vec![]).await?;
+let mut ws = potato::websocket!("ws://127.0.0.1:8080/ws").await?;
 ws.send_ping().await?;
 ws.send_text("aaa").await?;
 let frame = ws.recv().await?;

@@ -441,6 +441,16 @@ macro_rules! patch {
     };
 }
 
+#[macro_export]
+macro_rules! websocket {
+    ($url:expr $(,)?) => {
+        $crate::Websocket::connect($url, $crate::__potato_headers_vec!())
+    };
+    ($url:expr, $($header:ident = $value:expr),+ $(,)?) => {
+        $crate::Websocket::connect($url, $crate::__potato_headers_vec!($($header = $value),+))
+    };
+}
+
 pub struct TransferSession {
     pub req_path_prefix: String,
     pub dest_url: Option<String>,
