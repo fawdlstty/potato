@@ -371,12 +371,11 @@ impl PipeContext {
         allow_symlink_escape: bool,
     ) {
         let (url_path, loc_path) = (url_path.into(), loc_path.into());
-        self.items
-            .push(PipeContextItem::LocationRoute((
-                url_path,
-                loc_path,
-                allow_symlink_escape,
-            )));
+        self.items.push(PipeContextItem::LocationRoute((
+            url_path,
+            loc_path,
+            allow_symlink_escape,
+        )));
     }
 
     pub fn use_embedded_route(
@@ -1108,6 +1107,10 @@ pub struct HttpServer {
     addr: String,
     pipe_ctx: Arc<PipeContext>,
     shutdown_signal: Option<oneshot::Receiver<()>>,
+    #[cfg(feature = "acme")]
+    acme_manager: Option<crate::acme::AcmeManager>,
+    #[cfg(feature = "acme")]
+    acme_acceptor: Option<crate::acme::DynamicTlsAcceptor>,
 }
 
 impl HttpServer {
@@ -1116,6 +1119,10 @@ impl HttpServer {
             addr: addr.into(),
             pipe_ctx: Arc::new(PipeContext::new()),
             shutdown_signal: None,
+            #[cfg(feature = "acme")]
+            acme_manager: None,
+            #[cfg(feature = "acme")]
+            acme_acceptor: None,
         }
     }
 
@@ -1186,6 +1193,47 @@ impl HttpServer {
                 }
             }
             None => self.serve_http3_impl(cert_file, key_file).await,
+        }
+    }
+
+    #[cfg(feature = "acme")]
+    pub async fn serve_acme(
+        &mut self,
+        domain: impl Into<String>,
+        email: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        let opts = crate::acme::AcmeOptions::new(domain, email);
+        self.serve_acme_with_opts(opts).await
+    }
+
+    #[cfg(feature = "acme")]
+    pub async fn serve_acme_with_opts(
+        &mut self,
+        opts: crate::acme::AcmeOptions,
+    ) -> anyhow::Result<()> {
+        let (acme_manager, acme_acceptor) = crate::acme::AcmeManager::new(opts).await?;
+
+        // 启动后台续期循环
+        let manager_clone = acme_manager.clone();
+        let acceptor_clone = acme_acceptor.clone();
+        tokio::spawn(async move {
+            if let Err(e) = manager_clone.start_renewal_loop(acceptor_clone).await {
+                eprintln!("[ACME] Renewal loop error: {}", e);
+            }
+        });
+
+        self.acme_manager = Some(acme_manager);
+        self.acme_acceptor = Some(acme_acceptor);
+
+        let shutdown_signal = self.shutdown_signal.take();
+        match shutdown_signal {
+            Some(shutdown_signal) => {
+                select! {
+                    result = self.serve_acme_impl() => result,
+                    _ = shutdown_signal => Ok(()),
+                }
+            }
+            None => self.serve_acme_impl().await,
         }
     }
 
@@ -1260,6 +1308,13 @@ impl HttpServer {
         key_file: &str,
         alpn: Option<Vec<Vec<u8>>>,
     ) -> anyhow::Result<TlsAcceptor> {
+        // 初始化 rustls CryptoProvider（如果尚未初始化）
+        {
+            use rustls::crypto::ring::default_provider;
+            use rustls::crypto::CryptoProvider;
+            let _ = CryptoProvider::install_default(default_provider());
+        }
+
         let certs = CertificateDer::pem_file_iter(cert_file)?.collect::<Result<Vec<_>, _>>()?;
         let key = PrivateKeyDer::from_pem_file(key_file)?;
         let mut config = rustls::ServerConfig::builder()
@@ -1273,6 +1328,13 @@ impl HttpServer {
 
     #[cfg(feature = "http3")]
     fn quinn_server_config(cert_file: &str, key_file: &str) -> anyhow::Result<quinn::ServerConfig> {
+        // 初始化 rustls CryptoProvider（如果尚未初始化）
+        {
+            use rustls::crypto::ring::default_provider;
+            use rustls::crypto::CryptoProvider;
+            let _ = CryptoProvider::install_default(default_provider());
+        }
+
         let certs = CertificateDer::pem_file_iter(cert_file)?.collect::<Result<Vec<_>, _>>()?;
         let key = PrivateKeyDer::from_pem_file(key_file)?;
 
@@ -1508,6 +1570,114 @@ impl HttpServer {
                 );
             });
         }
+    }
+
+    #[cfg(feature = "acme")]
+    async fn serve_acme_impl(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "jemalloc")]
+        crate::init_jemalloc()?;
+
+        let addr: SocketAddr = self.addr.parse()?;
+        let listener = TcpListener::bind(&addr).await?;
+        let acme_acceptor = self
+            .acme_acceptor
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ACME acceptor not initialized"))?;
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
+        let acme_manager = self
+            .acme_manager
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ACME manager not initialized"))?;
+        let acme_manager_clone = acme_manager.clone();
+
+        loop {
+            let (stream, client_addr) = listener.accept().await?;
+            _ = stream.set_nodelay(true);
+            let acceptor = acme_acceptor.get_acceptor().await;
+            let pipe_ctx2 = Arc::clone(&pipe_ctx);
+            let acme_manager2 = acme_manager_clone.clone();
+            let acceptor_clone = acceptor.clone();
+
+            _ = tokio::task::spawn(async move {
+                let stream = match acceptor_clone.accept(stream).await {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                };
+
+                // 直接处理ACME挑战请求
+                Self::handle_acme_or_normal(
+                    pipe_ctx2,
+                    client_addr,
+                    HttpStream::from_server_tls(stream),
+                    &acme_manager2,
+                )
+                .await;
+            });
+        }
+    }
+
+    #[cfg(feature = "acme")]
+    async fn handle_acme_or_normal(
+        pipe_ctx: Arc<PipeContext>,
+        client_addr: SocketAddr,
+        mut stream: HttpStream,
+        acme_manager: &crate::acme::AcmeManager,
+    ) {
+        // 先读取部分数据检查是否是ACME挑战
+        let mut buf = vec![0u8; 4096];
+        let n = match stream.read(&mut buf).await {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+
+        if n == 0 {
+            return;
+        }
+
+        // 检查是否是ACME挑战请求
+        let initial_data = String::from_utf8_lossy(&buf[..n]);
+        if initial_data.contains("/.well-known/acme-challenge/") {
+            // 解析请求路径
+            if let Some(path_start) = initial_data.find("/.well-known/acme-challenge/") {
+                let path_end = initial_data[path_start..]
+                    .find(|c: char| c.is_whitespace() || c == ' ')
+                    .map(|e| path_start + e)
+                    .unwrap_or(initial_data.len());
+                let full_path = &initial_data[path_start..path_end];
+                let token = &full_path["/.well-known/acme-challenge/".len()..];
+
+                let challenges = acme_manager.get_challenges().await;
+                for challenge in challenges {
+                    if challenge.token == token {
+                        // 返回ACME挑战响应
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            challenge.key_authorization.len(),
+                            challenge.key_authorization
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 正常HTTP请求处理 - 需要重新实现完整请求处理
+        // 这里简化处理，实际应该将initial_data和后续数据一起处理
+        // 由于复杂度较高，暂时只支持已缓存证书的常规请求
+        Self::spawn_http1_connection_with_initial(pipe_ctx, client_addr, stream, &buf[..n]);
+    }
+
+    #[cfg(feature = "acme")]
+    fn spawn_http1_connection_with_initial(
+        pipe_ctx: Arc<PipeContext>,
+        client_addr: SocketAddr,
+        stream: HttpStream,
+        initial_data: &[u8],
+    ) {
+        // 使用WithPreRead包装流，将initial_data作为预读取数据
+        let stream_with_pre_read = HttpStream::with_pre_read(stream, initial_data.to_vec());
+        Self::spawn_http1_connection(pipe_ctx, client_addr, stream_with_pre_read);
     }
 
     #[cfg(feature = "http2")]

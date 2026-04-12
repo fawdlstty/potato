@@ -8,8 +8,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut stream = resp.body.stream_data();
     while let Some(chunk) = stream.next().await {
-        let text = String::from_utf8_lossy(&chunk);
-        print!("{text}");
+        print!("{}", str::from_utf8(&chunk)?);
     }
 
     Ok(())

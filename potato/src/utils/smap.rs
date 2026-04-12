@@ -11,6 +11,15 @@ where
     pub ext_data: Option<HashMap<K, V>>,
 }
 
+impl<K, V> Default for SMap<K, V>
+where
+    K: Eq + Hash + Ord,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<K, V> SMap<K, V>
 where
     K: Eq + Hash + Ord,
@@ -69,6 +78,10 @@ where
 
     pub fn len(&self) -> usize {
         self.data.len() + self.ext_data.as_ref().map_or(0, HashMap::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn iter(&self) -> SMapIter<'_, K, V> {

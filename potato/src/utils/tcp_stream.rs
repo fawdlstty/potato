@@ -16,6 +16,11 @@ pub enum HttpStream {
     #[cfg(feature = "tls")]
     ClientTls(ClientTlsStream<TcpStream>),
     DuplexStream(tokio::io::DuplexStream),
+    /// 带预读取缓冲区的流，用于ACME挑战检测后继续处理HTTP请求
+    WithPreRead {
+        stream: Box<HttpStream>,
+        pre_read_data: Vec<u8>,
+    },
 }
 unsafe impl Send for HttpStream {}
 
@@ -38,6 +43,14 @@ impl HttpStream {
         HttpStream::DuplexStream(stream)
     }
 
+    /// 创建一个带预读取缓冲区的HttpStream
+    pub fn with_pre_read(stream: HttpStream, pre_read_data: Vec<u8>) -> Self {
+        HttpStream::WithPreRead {
+            stream: Box::new(stream),
+            pre_read_data,
+        }
+    }
+
     pub async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
         Ok(match self {
             HttpStream::Tcp(s) => s.read(buf).await?,
@@ -46,6 +59,31 @@ impl HttpStream {
             #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => s.read(buf).await?,
             HttpStream::DuplexStream(s) => s.read(buf).await?,
+            HttpStream::WithPreRead {
+                stream,
+                pre_read_data,
+            } => {
+                if !pre_read_data.is_empty() {
+                    let len = std::cmp::min(pre_read_data.len(), buf.len());
+                    buf[..len].copy_from_slice(&pre_read_data[..len]);
+                    pre_read_data.drain(..len);
+                    len
+                } else {
+                    // 使用内部match避免递归调用
+                    match stream.as_mut() {
+                        HttpStream::Tcp(s) => s.read(buf).await?,
+                        #[cfg(feature = "tls")]
+                        HttpStream::ServerTls(s) => s.read(buf).await?,
+                        #[cfg(feature = "tls")]
+                        HttpStream::ClientTls(s) => s.read(buf).await?,
+                        HttpStream::DuplexStream(s) => s.read(buf).await?,
+                        HttpStream::WithPreRead { .. } => {
+                            // 不应该发生，WithPreRead不应该嵌套
+                            0
+                        }
+                    }
+                }
+            }
         })
     }
 
@@ -57,6 +95,27 @@ impl HttpStream {
             #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => s.read_exact(buf).await?,
             HttpStream::DuplexStream(s) => s.read_exact(buf).await?,
+            HttpStream::WithPreRead {
+                stream,
+                pre_read_data,
+            } => {
+                if !pre_read_data.is_empty() {
+                    let len = std::cmp::min(pre_read_data.len(), buf.len());
+                    buf[..len].copy_from_slice(&pre_read_data[..len]);
+                    pre_read_data.drain(..len);
+                    len
+                } else {
+                    match stream.as_mut() {
+                        HttpStream::Tcp(s) => s.read_exact(buf).await?,
+                        #[cfg(feature = "tls")]
+                        HttpStream::ServerTls(s) => s.read_exact(buf).await?,
+                        #[cfg(feature = "tls")]
+                        HttpStream::ClientTls(s) => s.read_exact(buf).await?,
+                        HttpStream::DuplexStream(s) => s.read_exact(buf).await?,
+                        HttpStream::WithPreRead { .. } => 0,
+                    }
+                }
+            }
         })
     }
 
@@ -68,6 +127,15 @@ impl HttpStream {
             #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => s.write_all(buf).await?,
             HttpStream::DuplexStream(s) => s.write_all(buf).await?,
+            HttpStream::WithPreRead { stream, .. } => match stream.as_mut() {
+                HttpStream::Tcp(s) => s.write_all(buf).await?,
+                #[cfg(feature = "tls")]
+                HttpStream::ServerTls(s) => s.write_all(buf).await?,
+                #[cfg(feature = "tls")]
+                HttpStream::ClientTls(s) => s.write_all(buf).await?,
+                HttpStream::DuplexStream(s) => s.write_all(buf).await?,
+                HttpStream::WithPreRead { .. } => {}
+            },
         }
         Ok(())
     }
@@ -83,6 +151,15 @@ impl HttpStream {
             #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => write_all_vectored_inner(s, bufs).await?,
             HttpStream::DuplexStream(s) => write_all_vectored_inner(s, bufs).await?,
+            HttpStream::WithPreRead { stream, .. } => match stream.as_mut() {
+                HttpStream::Tcp(s) => write_all_vectored_inner(s, bufs).await?,
+                #[cfg(feature = "tls")]
+                HttpStream::ServerTls(s) => write_all_vectored_inner(s, bufs).await?,
+                #[cfg(feature = "tls")]
+                HttpStream::ClientTls(s) => write_all_vectored_inner(s, bufs).await?,
+                HttpStream::DuplexStream(s) => write_all_vectored_inner(s, bufs).await?,
+                HttpStream::WithPreRead { .. } => {}
+            },
         }
         Ok(())
     }
@@ -95,6 +172,15 @@ impl HttpStream {
             #[cfg(feature = "tls")]
             HttpStream::ClientTls(s) => write_all_vectored2_inner(s, a, b).await?,
             HttpStream::DuplexStream(s) => write_all_vectored2_inner(s, a, b).await?,
+            HttpStream::WithPreRead { stream, .. } => match stream.as_mut() {
+                HttpStream::Tcp(s) => write_all_vectored2_inner(s, a, b).await?,
+                #[cfg(feature = "tls")]
+                HttpStream::ServerTls(s) => write_all_vectored2_inner(s, a, b).await?,
+                #[cfg(feature = "tls")]
+                HttpStream::ClientTls(s) => write_all_vectored2_inner(s, a, b).await?,
+                HttpStream::DuplexStream(s) => write_all_vectored2_inner(s, a, b).await?,
+                HttpStream::WithPreRead { .. } => {}
+            },
         }
         Ok(())
     }

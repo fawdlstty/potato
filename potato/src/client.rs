@@ -192,6 +192,12 @@ pub struct Session {
     pub sess_impl: Option<SessionImpl>,
 }
 
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Session {
     pub fn new() -> Self {
         Self { sess_impl: None }
@@ -603,11 +609,9 @@ impl TransferSession {
 
                 let use_ssl = req
                     .get_header("X-Forwarded-Proto")
-                    .map_or(false, |proto| proto == "https")
-                    || req
-                        .get_header("X-Forwarded-Proto-Https")
-                        .map_or(false, |_| true)
-                    || port_from_header.map_or(false, |p| p == 443);
+                    .is_some_and(|proto| proto == "https")
+                    || req.get_header("X-Forwarded-Proto-Https").is_some()
+                    || port_from_header.is_some_and(|p| p == 443);
                 let port = port_from_header.unwrap_or(if use_ssl { 443 } else { 80 });
 
                 (use_ssl, port)

@@ -423,7 +423,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             });
             arg_names.push(random_ident());
         } else {
-            panic!("unsupported: {}", arg.to_token_stream().to_string());
+            panic!("unsupported: {}", arg.to_token_stream());
         }
     }
     if !arg_auth_mark && doc_auth {

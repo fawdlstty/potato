@@ -3,6 +3,9 @@ pub mod global_config;
 pub mod server;
 pub mod utils;
 
+#[cfg(feature = "acme")]
+pub mod acme;
+
 pub use client::*;
 pub use global_config::*;
 pub use hipstr;
@@ -499,6 +502,12 @@ pub struct HttpRequest {
 
 unsafe impl Send for HttpRequest {}
 unsafe impl Sync for HttpRequest {}
+
+impl Default for HttpRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl HttpRequest {
     fn bad_request(msg: impl Into<String>) -> anyhow::Error {
@@ -1069,7 +1078,7 @@ impl HttpRequest {
         }
         if self
             .get_header("Sec-WebSocket-Key")
-            .map_or(false, |val| val.len() == 0)
+            .is_some_and(|val| val.is_empty())
         {
             return false;
         }
@@ -1102,7 +1111,7 @@ impl HttpRequest {
             return Ok(addr);
         }
         match self.get_ext::<SocketAddr>() {
-            Some(addr) => Ok((*addr).clone()),
+            Some(addr) => Ok(*addr),
             None => Err(anyhow!("no addr info")),
         }
     }
@@ -1181,14 +1190,12 @@ impl HttpRequest {
             match content_type_parsed {
                 Some(HttpContentType::ApplicationJson) => {
                     if let Ok(body_str) = std::str::from_utf8(&req.body) {
-                        if let Ok(root) = serde_json::from_str::<serde_json::Value>(&body_str) {
-                            if let serde_json::Value::Object(obj) = root {
-                                for (k, v) in obj {
-                                    req.body_pairs.insert(
-                                        LocalHipStr::from(k),
-                                        LocalHipStr::from(v.to_string()),
-                                    );
-                                }
+                        if let Ok(serde_json::Value::Object(obj)) =
+                            serde_json::from_str::<serde_json::Value>(body_str)
+                        {
+                            for (k, v) in obj {
+                                req.body_pairs
+                                    .insert(LocalHipStr::from(k), LocalHipStr::from(v.to_string()));
                             }
                         }
                     }
@@ -1316,7 +1323,7 @@ impl HttpRequest {
         req.parse_request_target(target)?;
         req.version = rreq.version.unwrap_or(1) + 10;
         for h in rreq.headers.iter() {
-            if h.name == "" {
+            if h.name.is_empty() {
                 break;
             }
             let header_value = str::from_utf8(h.value)?;
@@ -1583,7 +1590,9 @@ pub struct HttpResponseBodyStream<'a> {
 
 impl HttpResponseBody {
     pub async fn data(&mut self) -> &[u8] {
-        if let HttpResponseBody::Stream(mut rx) = std::mem::replace(self, HttpResponseBody::Data(vec![])) {
+        if let HttpResponseBody::Stream(mut rx) =
+            std::mem::replace(self, HttpResponseBody::Data(vec![]))
+        {
             let mut data = Vec::with_capacity(1024);
             while let Some(chunk) = rx.recv().await {
                 data.extend_from_slice(&chunk);
@@ -1672,6 +1681,12 @@ macro_rules! make_resp_by_binary {
             }
         }
     };
+}
+
+impl Default for HttpResponse {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HttpResponse {
@@ -1807,7 +1822,7 @@ impl HttpResponse {
             ret
         } else {
             let mut ret = Self::empty();
-            let mime_type = match path.split('.').last() {
+            let mime_type = match path.split('.').next_back() {
                 Some("css") => "text/css",
                 Some("csv") => "text/csv",
                 Some("htm") => "text/html",
@@ -1825,7 +1840,7 @@ impl HttpResponse {
                     Some(p) => &path[p + 1..],
                     None => path,
                 };
-                if file.len() > 0 {
+                if !file.is_empty() {
                     ret.add_header(
                         "Content-Disposition".into(),
                         format!("attachment; filename={file}").into(),
@@ -1843,7 +1858,7 @@ impl HttpResponse {
             let mut sha1 = Sha1::default();
             sha1.update(ws_key);
             sha1.update(&b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"[..]);
-            base64::encode(&sha1.finalize())
+            base64::encode(sha1.finalize())
         };
         Self {
             version: "HTTP/1.1".into(),
@@ -2286,7 +2301,7 @@ impl HttpResponse {
         req.version = format!("HTTP/1.{}", rres.version.unwrap_or(0));
         req.http_code = rres.code.unwrap_or(0);
         for h in rres.headers.iter() {
-            if h.name == "" {
+            if h.name.is_empty() {
                 break;
             }
             let header_value = str::from_utf8(h.value)?.trim();
@@ -2339,7 +2354,7 @@ impl HttpResponse {
 
 pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
     let mut ret = HashMap::with_capacity(16);
-    for name in T::iter().into_iter() {
+    for name in T::iter() {
         if let Some(file) = T::get(&name) {
             if name.ends_with("index.htm") || name.ends_with("index.html") {
                 if let Some(path) = Path::new(&name[..]).parent() {
