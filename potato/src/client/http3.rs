@@ -372,3 +372,113 @@ define_h3_client_method!(options);
 define_h3_client_method!(patch);
 define_h3_client_method!(connect);
 define_h3_client_method!(trace);
+
+/// WebTransport 客户端
+pub struct WebTransport {
+    connection: quinn::Connection,
+}
+
+impl WebTransport {
+    /// 连接到 WebTransport 服务器
+    pub async fn connect(url: &str, _headers: Vec<Headers>) -> anyhow::Result<Self> {
+        // 解析 URL
+        let uri: http::Uri = url.parse()?;
+        let host = uri
+            .host()
+            .ok_or_else(|| anyhow!("Invalid URL: missing host"))?;
+        let port = uri.port_u16().unwrap_or(443);
+        let path = uri.path().to_string();
+
+        // 创建 TLS 配置
+        use tokio_rustls::rustls;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let mut tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+        // 创建 QUIC 端点
+        let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+        ));
+        endpoint.set_default_client_config(client_config);
+
+        // 连接到服务器
+        let connection = endpoint
+            .connect(format!("{}:{}", host, port).parse()?, host)?
+            .await
+            .map_err(|e| anyhow!("QUIC connection failed: {}", e))?;
+
+        // 发送 HTTP/3 CONNECT 请求以建立 WebTransport 会话
+        let (mut driver, mut send_request) =
+            h3::client::new(h3_quinn::Connection::new(connection.clone()))
+                .await
+                .map_err(|e| anyhow!("HTTP/3 client initialization failed: {}", e))?;
+
+        // 启动驱动任务
+        let driver_handle = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        // 构建 CONNECT 请求
+        let req = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(&path)
+            .header(":protocol", "webtransport")
+            .header(":scheme", "https")
+            .header(":authority", format!("{}:{}", host, port))
+            .body(())
+            .map_err(|e| anyhow!("Failed to build CONNECT request: {}", e))?;
+
+        // 发送 CONNECT 请求
+        let mut stream = send_request
+            .send_request(req)
+            .await
+            .map_err(|e| anyhow!("Failed to send CONNECT request: {}", e))?;
+
+        // 等待响应
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(|e| anyhow!("Failed to get response: {}", e))?;
+
+        if response.status() != 200 {
+            return Err(anyhow!(
+                "WebTransport connection failed with status: {}",
+                response.status()
+            ));
+        }
+
+        // 完成请求
+        let _ = stream
+            .finish()
+            .await
+            .map_err(|e| anyhow!("Failed to finish request: {}", e))?;
+
+        // 阻止 driver_handle 被 drop
+        drop(driver_handle);
+
+        Ok(Self { connection })
+    }
+
+    /// 打开一个新的双向流
+    pub async fn open_bi(&self) -> anyhow::Result<crate::WebTransportStream> {
+        let (send, recv) = self.connection.open_bi().await?;
+        Ok(crate::WebTransportStream::new(send, recv))
+    }
+
+    /// 发送数据报
+    pub async fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()> {
+        self.connection.send_datagram(data.to_vec().into())?;
+        Ok(())
+    }
+
+    /// 接收数据报
+    pub async fn recv_datagram(&self) -> anyhow::Result<Vec<u8>> {
+        let data = self.connection.read_datagram().await?;
+        Ok(data.to_vec())
+    }
+}

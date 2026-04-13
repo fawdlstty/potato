@@ -3,6 +3,8 @@ use crate::utils::refstr::HeaderItem;
 #[cfg(any(feature = "http2", feature = "http3"))]
 use crate::utils::refstr::HeaderOrHipStr;
 use crate::utils::tcp_stream::HttpStream;
+#[cfg(feature = "http3")]
+use crate::webtransport_impl::WebTransportSession;
 use crate::CompressMode;
 use crate::{
     HttpHandler, HttpMethod, HttpRequest, HttpRequestTargetForm, HttpResponse, PreflightResult,
@@ -45,6 +47,32 @@ type AsyncCustomHandler = dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output 
 
 type SyncCustomHandler = dyn Fn(&mut HttpRequest) -> Option<HttpResponse> + Send + Sync;
 
+#[cfg(feature = "http3")]
+#[derive(Clone)]
+pub struct WebTransportConfig {
+    pub max_sessions: usize,
+    pub max_streams_per_session: u32,
+    pub datagram_enabled: bool,
+    pub max_datagram_size: usize,
+}
+
+#[cfg(feature = "http3")]
+impl Default for WebTransportConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: 1000,
+            max_streams_per_session: 100,
+            datagram_enabled: true,
+            max_datagram_size: 1200,
+        }
+    }
+}
+
+#[cfg(feature = "http3")]
+pub type WebTransportHandler = Box<
+    dyn Fn(WebTransportSession) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync,
+>;
+
 #[derive(Clone)]
 pub enum CustomHandler {
     Sync(Arc<SyncCustomHandler>),
@@ -72,7 +100,6 @@ static HANDLERS_FLAT: LazyLock<HashMap<(&'static str, HttpMethod), &'static Requ
         handlers
     });
 
-#[derive(Clone)]
 pub enum PipeContextItem {
     Handlers(bool),
     LocationRoute((String, String, bool)),
@@ -84,6 +111,36 @@ pub enum PipeContextItem {
     Jemalloc(String),
     #[cfg(feature = "webdav")]
     Webdav((String, dav_server::DavHandler)),
+    #[cfg(feature = "http3")]
+    WebTransport((String, WebTransportConfig, WebTransportHandler)),
+    #[cfg(feature = "webrtc")]
+    WebRTC((crate::webrtc::WebRTCConfig, crate::webrtc::WebRTCEvents)),
+}
+
+// 手动实现 Clone，因为 WebTransportHandler 不能 Clone
+impl Clone for PipeContextItem {
+    fn clone(&self) -> Self {
+        match self {
+            PipeContextItem::Handlers(v) => PipeContextItem::Handlers(*v),
+            PipeContextItem::LocationRoute(v) => PipeContextItem::LocationRoute(v.clone()),
+            PipeContextItem::EmbeddedRoute(v) => PipeContextItem::EmbeddedRoute(v.clone()),
+            PipeContextItem::FinalRoute(v) => PipeContextItem::FinalRoute(v.clone()),
+            PipeContextItem::Custom(v) => PipeContextItem::Custom(v.clone()),
+            PipeContextItem::ReverseProxy(v1, v2, v3) => {
+                PipeContextItem::ReverseProxy(v1.clone(), v2.clone(), *v3)
+            }
+            #[cfg(feature = "jemalloc")]
+            PipeContextItem::Jemalloc(v) => PipeContextItem::Jemalloc(v.clone()),
+            #[cfg(feature = "webdav")]
+            PipeContextItem::Webdav(v) => PipeContextItem::Webdav(v.clone()),
+            #[cfg(feature = "http3")]
+            PipeContextItem::WebTransport(_) => {
+                panic!("WebTransport handler cannot be cloned")
+            }
+            #[cfg(feature = "webrtc")]
+            PipeContextItem::WebRTC(v) => PipeContextItem::WebRTC(v.clone()),
+        }
+    }
 }
 
 pub struct PipeContext {
@@ -684,6 +741,33 @@ impl PipeContext {
             .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
 
+    #[cfg(feature = "http3")]
+    pub fn use_webtransport<F, Fut>(&mut self, url_path: impl Into<String>, handler: F)
+    where
+        F: Fn(WebTransportSession) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.items.push(PipeContextItem::WebTransport((
+            url_path.into(),
+            WebTransportConfig::default(),
+            Box::new(move |session| Box::pin(handler(session))),
+        )));
+    }
+
+    #[cfg(feature = "webrtc")]
+    pub fn use_webrtc(&mut self) -> crate::webrtc::WebRTCBuilder<'_> {
+        crate::webrtc::WebRTCBuilder::new(self)
+    }
+
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn add_webrtc(
+        &mut self,
+        config: crate::webrtc::WebRTCConfig,
+        events: crate::webrtc::WebRTCEvents,
+    ) {
+        self.items.push(PipeContextItem::WebRTC((config, events)));
+    }
+
     pub async fn handle_request(
         self2: &PipeContext,
         req: &mut HttpRequest,
@@ -1095,6 +1179,31 @@ impl PipeContext {
                         res
                     };
                     return res;
+                }
+                #[cfg(feature = "webrtc")]
+                PipeContextItem::WebRTC((config, _events)) => {
+                    // WebRTC信令处理
+                    // WebSocket信令在WebSocket upgrade时处理
+                    // REST信令在这里处理
+                    if req.url_path.starts_with(&config.rest_prefix) {
+                        // 处理REST信令请求
+                        // TODO: 实现完整的REST信令处理逻辑
+                        // 目前返回提示信息
+                        let host = req.get_header("Host").unwrap_or("127.0.0.1:8080");
+                        let json_response = serde_json::json!({
+                            "status": "WebRTC REST signaling endpoint",
+                            "ws_url": format!("ws://{}{}", host, config.ws_path),
+                            "rest_prefix": config.rest_prefix,
+                        });
+                        let mut res = HttpResponse::json(json_response.to_string());
+                        res.add_header("Content-Type".into(), "application/json".into());
+                        return res;
+                    }
+                }
+                #[cfg(feature = "http3")]
+                PipeContextItem::WebTransport(_) => {
+                    // WebTransport 在 HTTP/3 层处理，这里不会到达
+                    // CONNECT 请求已经在 serve_http3_impl 中处理
                 }
             }
         }
@@ -1759,6 +1868,9 @@ impl HttpServer {
                     Err(_) => return,
                 };
                 let client_addr = conn.remote_address();
+                // 为 WebTransport 克隆连接
+                #[cfg(feature = "http3")]
+                let wt_conn = conn.clone();
                 let mut h3_conn: h3_server::Connection<_, bytes::Bytes> =
                     match h3_server::Connection::new(h3_quinn::Connection::new(conn)).await {
                         Ok(conn) => conn,
@@ -1772,11 +1884,59 @@ impl HttpServer {
                         Err(_) => break,
                     };
                     let pipe_ctx3 = Arc::clone(&pipe_ctx2);
+                    #[cfg(feature = "http3")]
+                    let wt_conn = wt_conn.clone();
                     _ = tokio::task::spawn(async move {
                         let (req_head, mut stream) = match resolver.resolve_request().await {
                             Ok(req_stream) => req_stream,
                             Err(_) => return,
                         };
+
+                        // 检查是否是 WebTransport CONNECT 请求
+                        #[cfg(feature = "http3")]
+                        if req_head.method() == http::Method::CONNECT {
+                            if let Some(protocol) = req_head.headers().get(":protocol") {
+                                if protocol == "webtransport" {
+                                    // 检查路径是否匹配 WebTransport 路由
+                                    let path = req_head.uri().path();
+                                    let mut wt_handler: Option<&WebTransportHandler> = None;
+
+                                    for item in pipe_ctx3.items.iter() {
+                                        if let PipeContextItem::WebTransport((
+                                            wt_path,
+                                            _config,
+                                            handler,
+                                        )) = item
+                                        {
+                                            if path == wt_path
+                                                || path.starts_with(&format!("{}/", wt_path))
+                                            {
+                                                wt_handler = Some(handler);
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(handler) = wt_handler {
+                                        // 发送 200 响应接受 WebTransport 会话
+                                        let response =
+                                            match http::Response::builder().status(200).body(()) {
+                                                Ok(resp) => resp,
+                                                Err(_) => return,
+                                            };
+                                        if stream.send_response(response).await.is_err() {
+                                            return;
+                                        }
+                                        let _ = stream.finish().await;
+
+                                        // 创建 WebTransport 会话并调用处理器
+                                        let wt_session = WebTransportSession::new(wt_conn);
+                                        handler(wt_session).await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
 
                         let mut req = HttpRequest::new();
                         req.method = match Self::h2_method_to_http_method(req_head.method()) {

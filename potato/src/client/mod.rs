@@ -1247,6 +1247,12 @@ pub struct SshJumpboxInfo {
     pub password: String,
 }
 
+// WebTransport 客户端实现 - 完整的实现在 crate::webtransport 模块中
+// webtransport 类型已通过 lib.rs 中的 `pub use webtransport::*;` 导出
+
+#[cfg(feature = "http3")]
+pub use http3::WebTransport;
+
 #[cfg(test)]
 mod tests {
     use super::format_host_header_value;

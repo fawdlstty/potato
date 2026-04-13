@@ -6,6 +6,13 @@ pub mod utils;
 #[cfg(feature = "acme")]
 pub mod acme;
 
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
+
+// WebTransport 实现
+#[cfg(feature = "http3")]
+mod webtransport_impl;
+
 pub use client::*;
 pub use global_config::*;
 pub use hipstr;
@@ -15,12 +22,18 @@ pub use regex;
 pub use rust_embed;
 pub use serde_json;
 pub use server::*;
+
 use thread_local::ThreadLocal;
 pub use utils::ai::*;
 pub use utils::refstr::Headers;
+#[cfg(feature = "http3")]
+pub use webtransport_impl::{WebTransportSession, WebTransportStream};
 
 #[cfg(feature = "jemalloc")]
 pub use utils::jemalloc_helper::*;
+
+#[cfg(feature = "webrtc")]
+pub use webrtc::*;
 
 use anyhow::anyhow;
 use chrono::Utc;
@@ -2367,6 +2380,37 @@ pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
         }
     }
     ret
+}
+
+/// WebTransport 客户端连接宏
+///
+/// 用于快速连接到 WebTransport 服务器。
+///
+/// # 示例
+///
+/// ```rust
+/// // 基本连接
+/// let mut wt = potato::webtransport!("https://server.com/wt").await?;
+///
+/// // 带自定义头连接
+/// let mut wt = potato::webtransport!(
+///     "https://server.com/wt",
+///     "Authorization" = "Bearer token"
+/// ).await?;
+/// ```
+#[cfg(feature = "http3")]
+#[macro_export]
+macro_rules! webtransport {
+    ($url:expr) => {
+        $crate::WebTransport::connect($url, vec![])
+    };
+    ($url:expr, $($key:ident = $value:expr),+ $(,)?) => {
+        $crate::WebTransport::connect($url, vec![
+            $(
+                $crate::Headers::Custom((stringify!($key).to_string(), $value.to_string())),
+            )+
+        ])
+    };
 }
 
 #[cfg(test)]

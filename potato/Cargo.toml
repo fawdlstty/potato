@@ -57,6 +57,10 @@ quinn = { version = "0.11.9", default-features = false, features = ["runtime-tok
 # acme
 instant-acme = { version = "0.8", default-features = true, features = ["ring"], optional = true }
 x509-parser = { version = "0.16", optional = true }
+# webrtc
+webrtc = { version = "0.17", optional = true }
+webrtc-util = { version = "0.17", optional = true }
+uuid = { version = "1.0", features = ["v4"], optional = true }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 # jemalloc
@@ -78,6 +82,16 @@ tikv-jemallocator = { version = "0.6.0", features = [
 rcgen = "0.14.5"
 time = "0.3"
 
+[[example]]
+name = "32_webtransport_server"
+path = "../examples/32_webtransport_server.rs"
+required-features = ["http3"]
+
+[[example]]
+name = "33_webtransport_client"
+path = "../examples/33_webtransport_client.rs"
+required-features = ["http3"]
+
 [features]
 default = ["openapi", "tls"]
 http2 = ["tls", "dep:h2", "dep:bytes"]
@@ -88,7 +102,8 @@ ssh = ["dep:russh"]
 tls = ["dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
 webdav = ["dep:bytes", "dep:dav-server", "dep:futures-util", "dep:webpki-roots"]
 acme = ["tls", "dep:instant-acme", "dep:x509-parser"]
-full = ["openapi", "ssh", "tls", "http2", "http3", "webdav", "acme"]
+webrtc = ["dep:webrtc", "dep:webrtc-util", "dep:uuid", "dep:bytes", "tls"]
+full = ["openapi", "ssh", "tls", "http2", "http3", "webdav", "acme", "webrtc"]
 
 # cargo publish -p potato-macro --allow-dirty --registry crates-io
 # cargo publish -p potato --allow-dirty --registry crates-io
