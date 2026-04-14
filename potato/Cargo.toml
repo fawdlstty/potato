@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -82,16 +82,6 @@ tikv-jemallocator = { version = "0.6.0", features = [
 rcgen = "0.14.5"
 time = "0.3"
 
-[[example]]
-name = "32_webtransport_server"
-path = "../examples/32_webtransport_server.rs"
-required-features = ["http3"]
-
-[[example]]
-name = "33_webtransport_client"
-path = "../examples/33_webtransport_client.rs"
-required-features = ["http3"]
-
 [features]
 default = ["openapi", "tls"]
 http2 = ["tls", "dep:h2", "dep:bytes"]
@@ -107,3 +97,4 @@ full = ["openapi", "ssh", "tls", "http2", "http3", "webdav", "acme", "webrtc"]
 
 # cargo publish -p potato-macro --allow-dirty --registry crates-io
 # cargo publish -p potato --allow-dirty --registry crates-io
+# cd docs && npm run docs:build && cd ..

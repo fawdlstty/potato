@@ -48,6 +48,26 @@ async fn claude_chat() -> anyhow::Result<potato::HttpResponse> {
     Ok(rx)
 }
 
+#[potato::http_get("/api3/v1/chat")]
+async fn ollama_chat() -> anyhow::Result<potato::HttpResponse> {
+    let (sender, rx) = potato::OllamaSender::new("llama3", 100).await?;
+    tokio::spawn(async move {
+        async fn ollama_chat_inner(sender: potato::OllamaSender) -> anyhow::Result<()> {
+            sender.send("Hello,").await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            sender.send("World!").await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            sender.send("hohohoho!").await?;
+            sender.send_finish().await?;
+            Ok(())
+        }
+        if let Err(e) = ollama_chat_inner(sender).await {
+            eprintln!("Ollama chat error: {e}");
+        }
+    });
+    Ok(rx)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut server = potato::HttpServer::new("127.0.0.1:3000");
@@ -57,5 +77,6 @@ async fn main() -> anyhow::Result<()> {
     println!("OpenAI SSE on http://127.0.0.1:3000/sse");
     println!("OpenAI custom SSE on http://127.0.0.1:3000/sse-custom");
     println!("Claude SSE on http://127.0.0.1:3000/claude-sse");
+    println!("Ollama SSE on http://127.0.0.1:3000/api3/v1/chat");
     server.serve_http().await
 }

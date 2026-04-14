@@ -26,8 +26,3 @@ features:
 
 footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---
-
-<!--
-npm run docs:build
-npm run docs:dev
--->

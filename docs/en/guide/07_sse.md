@@ -2,7 +2,7 @@
 
 ## Overview
 
-Potato framework supports SSE (Server-Sent Events) for streaming, particularly suitable for scenarios like AI chat that require progressive content delivery. The framework provides standard support for two mainstream AI protocols: OpenAI and Claude.
+Potato framework supports SSE (Server-Sent Events) for streaming, particularly suitable for scenarios like AI chat that require progressive content delivery. The framework provides standard support for three mainstream AI protocols: OpenAI, Claude, and Ollama.
 
 ## OpenAI Style Streaming
 
@@ -109,6 +109,56 @@ async fn main() -> anyhow::Result<()> {
    - `message_stop`: Indicates message completion
 
 4. **Response Type**: Handler returns `anyhow::Result<HttpResponse>`, automatically configured with appropriate SSE headers for Claude protocol.
+
+## Ollama Style Streaming
+
+### Basic Usage
+
+```rust
+#[potato::http_get("/api/v1/chat")]
+async fn ollama_chat() -> anyhow::Result<potato::HttpResponse> {
+    let (sender, rx) = potato::OllamaSender::new("llama3", 100).await?;
+    
+    tokio::spawn(async move {
+        async fn ollama_chat_inner(sender: potato::OllamaSender) -> anyhow::Result<()> {
+            // Send content chunks
+            sender.send("Hello!").await?;
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            sender.send("I am Ollama AI assistant.").await?;
+            // Send finish event
+            sender.send_finish().await?;
+            Ok(())
+        }
+        if let Err(e) = ollama_chat_inner(sender).await {
+            eprintln!("Ollama chat error: {e}");
+        }
+    });
+    
+    Ok(rx)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut server = potato::HttpServer::new("127.0.0.1:3000");
+    server.serve_http().await
+}
+```
+
+### Explanation
+
+1. **Create OllamaSender**: Use `OllamaSender::new()` to create a sender and response object. Parameters include:
+   - `model`: Model name (e.g., "llama3", "gemma", "mistral", etc.)
+   - `buffer_size`: Channel buffer size (e.g., 100)
+
+2. **Send Messages**: Use `sender.send()` to send text content blocks.
+
+3. **Finish Streaming**: Use `sender.send_finish()` to end the stream. This automatically sends:
+   - `done: true`: Indicates generation is complete
+   - `done_reason`: Completion reason (e.g., "stop")
+
+4. **Response Type**: Handler returns `anyhow::Result<HttpResponse>`, automatically configured with appropriate SSE headers for Ollama protocol.
+
+5. **Data Format**: Ollama uses NDJSON (newline-delimited JSON) format, which differs from OpenAI/Claude's SSE format, but Potato internally uses a unified SSE channel for transmission.
 
 ## Generic SSE Transmission
 

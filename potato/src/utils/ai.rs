@@ -168,3 +168,49 @@ impl ClaudeSender {
         Ok(())
     }
 }
+
+pub struct OllamaSender {
+    model: String,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl OllamaSender {
+    pub async fn new(
+        model: impl Into<String>,
+        buffer_size: usize,
+    ) -> anyhow::Result<(Self, crate::HttpResponse)> {
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
+        let model = model.into();
+
+        let mut resp = crate::HttpResponse::sse(rx);
+        resp.add_header("Content-Type".into(), "application/x-ndjson".into());
+
+        Ok((Self { model, tx }, resp))
+    }
+
+    pub async fn send(&self, message: impl Into<String>) -> anyhow::Result<()> {
+        let root = serde_json::to_string(&serde_json::json!({
+            "model": self.model,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "response": message.into(),
+            "done": false
+        }))?;
+        // Ollama 使用 NDJSON 格式（newline-delimited JSON）
+        let payload = format!("{}\n", root);
+        self.tx.send(payload.into_bytes()).await?;
+        Ok(())
+    }
+
+    pub async fn send_finish(&self) -> anyhow::Result<()> {
+        let root = serde_json::to_string(&serde_json::json!({
+            "model": self.model,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "response": "",
+            "done": true,
+            "done_reason": "stop"
+        }))?;
+        let payload = format!("{}\n", root);
+        self.tx.send(payload.into_bytes()).await?;
+        Ok(())
+    }
+}

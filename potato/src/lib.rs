@@ -2392,7 +2392,7 @@ pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
 ///
 /// # 示例
 ///
-/// ```rust,ignore
+/// ```rust
 /// // 基本连接
 /// let mut wt = potato::webtransport!("https://server.com/wt").await?;
 ///
