@@ -376,6 +376,13 @@ define_h3_client_method!(trace);
 /// WebTransport 客户端
 pub struct WebTransport {
     connection: quinn::Connection,
+    driver_handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WebTransport {
+    fn drop(&mut self) {
+        self.driver_handle.abort();
+    }
 }
 
 impl WebTransport {
@@ -452,22 +459,38 @@ impl WebTransport {
             ));
         }
 
-        // 完成请求
-        let _ = stream
-            .finish()
-            .await
-            .map_err(|e| anyhow!("Failed to finish request: {}", e))?;
+        // 注意：不要调用 stream.finish()，因为 WebTransport 会话需要保持开放
+        // HTTP/3 的 CONNECT 流在 WebTransport 会话期间应该保持开放
 
-        // 阻止 driver_handle 被 drop
-        drop(driver_handle);
-
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            driver_handle,
+        })
     }
 
     /// 打开一个新的双向流
     pub async fn open_bi(&self) -> anyhow::Result<crate::WebTransportStream> {
         let (send, recv) = self.connection.open_bi().await?;
         Ok(crate::WebTransportStream::new(send, recv))
+    }
+
+    /// 打开一个新的单向流（客户端主动发送）
+    pub async fn open_uni(&self) -> anyhow::Result<quinn::SendStream> {
+        let send = self.connection.open_uni().await?;
+        Ok(send)
+    }
+
+    /// 接受一个新的单向接收流
+    pub async fn accept_uni(&self) -> anyhow::Result<Option<quinn::RecvStream>> {
+        match self.connection.accept_uni().await {
+            Ok(recv) => Ok(Some(recv)),
+            Err(quinn::ConnectionError::ApplicationClosed(_)) => Ok(None),
+            Err(quinn::ConnectionError::ConnectionClosed(_)) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to accept unidirectional stream: {}",
+                e
+            )),
+        }
     }
 
     /// 发送数据报

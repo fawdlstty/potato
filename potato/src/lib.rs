@@ -1,17 +1,11 @@
+#[cfg(feature = "acme")]
+pub mod acme;
 pub mod client;
 pub mod global_config;
 pub mod server;
 pub mod utils;
-
-#[cfg(feature = "acme")]
-pub mod acme;
-
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
-
-// WebTransport 实现
-#[cfg(feature = "http3")]
-mod webtransport_impl;
 
 pub use client::*;
 pub use global_config::*;
@@ -26,8 +20,6 @@ pub use server::*;
 use thread_local::ThreadLocal;
 pub use utils::ai::*;
 pub use utils::refstr::Headers;
-#[cfg(feature = "http3")]
-pub use webtransport_impl::{WebTransportSession, WebTransportStream};
 
 #[cfg(feature = "jemalloc")]
 pub use utils::jemalloc_helper::*;
@@ -149,12 +141,24 @@ fn parse_transfer_encoding_tokens(raw: &str) -> anyhow::Result<Vec<String>> {
     Ok(codings)
 }
 
+/// HTTP date parsing error
+#[derive(Debug)]
+pub struct HttpDateParseError;
+
+impl std::fmt::Display for HttpDateParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to parse HTTP date")
+    }
+}
+
+impl std::error::Error for HttpDateParseError {}
+
 /// Parse HTTP date format to Unix timestamp
 /// Supports RFC 7231 standard HTTP date formats:
 /// - RFC 1123: "Mon, 06 Nov 1994 08:49:37 GMT"
 /// - RFC 850: "Monday, 06-Nov-94 08:49:37 GMT"
 /// - ANSI C asctime(): "Mon Nov  6 08:49:37 1994"
-pub fn parse_http_date(date_str: &str) -> Result<u64, ()> {
+pub fn parse_http_date(date_str: &str) -> Result<u64, HttpDateParseError> {
     // Use simple manual parsing method to handle RFC 1123 format
     // Format: "Fri, 12 Sep 2025 00:00:00 GMT"
     if let Some(caps) =
@@ -162,12 +166,12 @@ pub fn parse_http_date(date_str: &str) -> Result<u64, ()> {
             .unwrap()
             .captures(date_str)
     {
-        let day: u32 = caps[1].parse().map_err(|_| ())?;
+        let day: u32 = caps[1].parse().map_err(|_| HttpDateParseError)?;
         let month_str = &caps[2];
-        let year: i32 = caps[3].parse().map_err(|_| ())?;
-        let hour: u32 = caps[4].parse().map_err(|_| ())?;
-        let minute: u32 = caps[5].parse().map_err(|_| ())?;
-        let second: u32 = caps[6].parse().map_err(|_| ())?;
+        let year: i32 = caps[3].parse().map_err(|_| HttpDateParseError)?;
+        let hour: u32 = caps[4].parse().map_err(|_| HttpDateParseError)?;
+        let minute: u32 = caps[5].parse().map_err(|_| HttpDateParseError)?;
+        let second: u32 = caps[6].parse().map_err(|_| HttpDateParseError)?;
 
         let month = match month_str {
             "Jan" => 1,
@@ -182,7 +186,7 @@ pub fn parse_http_date(date_str: &str) -> Result<u64, ()> {
             "Oct" => 10,
             "Nov" => 11,
             "Dec" => 12,
-            _ => return Err(()),
+            _ => return Err(HttpDateParseError),
         };
 
         if let Some(dt) = chrono::NaiveDate::from_ymd_opt(year, month, day)
@@ -211,7 +215,7 @@ pub fn parse_http_date(date_str: &str) -> Result<u64, ()> {
         return Ok(timestamp);
     }
 
-    Err(())
+    Err(HttpDateParseError)
 }
 
 static SERVER_STR: LazyLock<String> =
@@ -1079,13 +1083,13 @@ impl HttpRequest {
         }
         if self
             .get_header_key(HeaderItem::Upgrade)
-            .map_or(false, |val| val.to_lowercase() != "websocket")
+            .is_some_and(|val| val.to_lowercase() != "websocket")
         {
             return false;
         }
         if self
             .get_header("Sec-WebSocket-Version")
-            .map_or(false, |val| val != "13")
+            .is_some_and(|val| val != "13")
         {
             return false;
         }
@@ -2388,14 +2392,14 @@ pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
 ///
 /// # 示例
 ///
-/// ```rust
+/// ```rust,ignore
 /// // 基本连接
 /// let mut wt = potato::webtransport!("https://server.com/wt").await?;
 ///
 /// // 带自定义头连接
 /// let mut wt = potato::webtransport!(
 ///     "https://server.com/wt",
-///     "Authorization" = "Bearer token"
+///     Authorization = "Bearer token"
 /// ).await?;
 /// ```
 #[cfg(feature = "http3")]

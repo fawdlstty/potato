@@ -1,25 +1,16 @@
+#[cfg(feature = "http2")]
+mod http2;
+#[cfg(feature = "http3")]
+mod http3;
+
 use crate::utils::enums::HttpConnection;
 use crate::utils::refstr::HeaderItem;
-#[cfg(any(feature = "http2", feature = "http3"))]
-use crate::utils::refstr::HeaderOrHipStr;
 use crate::utils::tcp_stream::HttpStream;
-#[cfg(feature = "http3")]
-use crate::webtransport_impl::WebTransportSession;
 use crate::CompressMode;
 use crate::{
     HttpHandler, HttpMethod, HttpRequest, HttpRequestTargetForm, HttpResponse, PreflightResult,
 };
 use crate::{RequestHandlerFlag, TransferSession};
-#[cfg(feature = "http3")]
-use bytes::Buf;
-#[cfg(feature = "http2")]
-use h2::server as h2_server;
-#[cfg(feature = "http3")]
-use h3::server as h3_server;
-#[cfg(feature = "http3")]
-use quinn::crypto::rustls::QuicServerConfig;
-#[cfg(feature = "http3")]
-use quinn::{self};
 use std::any::TypeId;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -47,31 +38,9 @@ type AsyncCustomHandler = dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output 
 
 type SyncCustomHandler = dyn Fn(&mut HttpRequest) -> Option<HttpResponse> + Send + Sync;
 
+// Re-export WebTransport types from http3 module
 #[cfg(feature = "http3")]
-#[derive(Clone)]
-pub struct WebTransportConfig {
-    pub max_sessions: usize,
-    pub max_streams_per_session: u32,
-    pub datagram_enabled: bool,
-    pub max_datagram_size: usize,
-}
-
-#[cfg(feature = "http3")]
-impl Default for WebTransportConfig {
-    fn default() -> Self {
-        Self {
-            max_sessions: 1000,
-            max_streams_per_session: 100,
-            datagram_enabled: true,
-            max_datagram_size: 1200,
-        }
-    }
-}
-
-#[cfg(feature = "http3")]
-pub type WebTransportHandler = Box<
-    dyn Fn(WebTransportSession) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync,
->;
+pub use http3::{WebTransportConfig, WebTransportHandler, WebTransportSession, WebTransportStream};
 
 #[derive(Clone)]
 pub enum CustomHandler {
@@ -1280,28 +1249,38 @@ impl HttpServer {
     #[cfg(feature = "http2")]
     pub async fn serve_http2(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
         let shutdown_signal = self.shutdown_signal.take();
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
+        let addr = self.addr.clone();
         match shutdown_signal {
             Some(shutdown_signal) => {
                 select! {
-                    result = self.serve_http2_impl(cert_file, key_file) => result,
+                    result = http2::serve_http2_impl(&addr, cert_file, key_file, pipe_ctx) => result,
                     _ = shutdown_signal => Ok(()),
                 }
             }
-            None => self.serve_http2_impl(cert_file, key_file).await,
+            None => {
+                http2::serve_http2_impl(&self.addr, cert_file, key_file, Arc::clone(&self.pipe_ctx))
+                    .await
+            }
         }
     }
 
     #[cfg(feature = "http3")]
     pub async fn serve_http3(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
         let shutdown_signal = self.shutdown_signal.take();
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
+        let addr = self.addr.clone();
         match shutdown_signal {
             Some(shutdown_signal) => {
                 select! {
-                    result = self.serve_http3_impl(cert_file, key_file) => result,
+                    result = http3::serve_http3_impl(&addr, cert_file, key_file, pipe_ctx) => result,
                     _ = shutdown_signal => Ok(()),
                 }
             }
-            None => self.serve_http3_impl(cert_file, key_file).await,
+            None => {
+                http3::serve_http3_impl(&self.addr, cert_file, key_file, Arc::clone(&self.pipe_ctx))
+                    .await
+            }
         }
     }
 
@@ -1346,7 +1325,7 @@ impl HttpServer {
         }
     }
 
-    fn spawn_http1_connection(
+    pub(crate) fn spawn_http1_connection(
         pipe_ctx: Arc<PipeContext>,
         client_addr: SocketAddr,
         stream: HttpStream,
@@ -1433,204 +1412,6 @@ impl HttpServer {
             config.alpn_protocols = alpn;
         }
         Ok(TlsAcceptor::from(Arc::new(config)))
-    }
-
-    #[cfg(feature = "http3")]
-    fn quinn_server_config(cert_file: &str, key_file: &str) -> anyhow::Result<quinn::ServerConfig> {
-        // 初始化 rustls CryptoProvider（如果尚未初始化）
-        {
-            use rustls::crypto::ring::default_provider;
-            use rustls::crypto::CryptoProvider;
-            let _ = CryptoProvider::install_default(default_provider());
-        }
-
-        let certs = CertificateDer::pem_file_iter(cert_file)?.collect::<Result<Vec<_>, _>>()?;
-        let key = PrivateKeyDer::from_pem_file(key_file)?;
-
-        let mut tls_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?;
-        tls_config.max_early_data_size = u32::MAX;
-        tls_config.alpn_protocols = vec![b"h3".to_vec()];
-
-        Ok(quinn::ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(tls_config)?,
-        )))
-    }
-
-    #[cfg(any(feature = "http2", feature = "http3"))]
-    fn h2_method_to_http_method(method: &http::Method) -> anyhow::Result<HttpMethod> {
-        Ok(match method.as_str() {
-            "GET" => HttpMethod::GET,
-            "PUT" => HttpMethod::PUT,
-            "COPY" => HttpMethod::COPY,
-            "HEAD" => HttpMethod::HEAD,
-            "LOCK" => HttpMethod::LOCK,
-            "MOVE" => HttpMethod::MOVE,
-            "POST" => HttpMethod::POST,
-            "MKCOL" => HttpMethod::MKCOL,
-            "PATCH" => HttpMethod::PATCH,
-            "TRACE" => HttpMethod::TRACE,
-            "DELETE" => HttpMethod::DELETE,
-            "UNLOCK" => HttpMethod::UNLOCK,
-            "CONNECT" => HttpMethod::CONNECT,
-            "OPTIONS" => HttpMethod::OPTIONS,
-            "PROPFIND" => HttpMethod::PROPFIND,
-            "PROPPATCH" => HttpMethod::PROPPATCH,
-            _ => anyhow::bail!("unsupported method: {method}"),
-        })
-    }
-
-    #[cfg(any(feature = "http2", feature = "http3"))]
-    fn is_h2_h3_forbidden_response_header(name: &str) -> bool {
-        name.eq_ignore_ascii_case("connection")
-            || name.eq_ignore_ascii_case("keep-alive")
-            || name.eq_ignore_ascii_case("proxy-connection")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-            || name.eq_ignore_ascii_case("upgrade")
-            || name.eq_ignore_ascii_case("te")
-            || name.eq_ignore_ascii_case("trailer")
-    }
-
-    #[cfg(any(feature = "http2", feature = "http3"))]
-    fn is_forbidden_trailer_for_h2_h3(name: &str) -> bool {
-        name.eq_ignore_ascii_case("transfer-encoding")
-            || name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("trailer")
-            || name.eq_ignore_ascii_case("host")
-            || name.eq_ignore_ascii_case("connection")
-            || name.eq_ignore_ascii_case("keep-alive")
-            || name.eq_ignore_ascii_case("te")
-            || name.eq_ignore_ascii_case("upgrade")
-            || name.eq_ignore_ascii_case("proxy-authenticate")
-            || name.eq_ignore_ascii_case("proxy-authorization")
-    }
-
-    #[cfg(any(feature = "http2", feature = "http3"))]
-    fn should_suppress_response_body(status: u16, request_method: HttpMethod) -> bool {
-        (100..200).contains(&status)
-            || status == 204
-            || status == 304
-            || request_method == HttpMethod::HEAD
-    }
-
-    #[cfg(feature = "http2")]
-    async fn handle_h2_request(
-        mut req_head: http::Request<h2::RecvStream>,
-        mut respond: h2_server::SendResponse<bytes::Bytes>,
-        pipe_ctx: Arc<PipeContext>,
-        client_addr: SocketAddr,
-    ) -> anyhow::Result<()> {
-        let mut req = HttpRequest::new();
-        req.method = Self::h2_method_to_http_method(req_head.method())?;
-        req.target_form = HttpRequestTargetForm::Origin;
-        req.version = 20;
-        req.client_addr = Some(client_addr);
-
-        let path_and_query = req_head
-            .uri()
-            .path_and_query()
-            .map(|v| v.as_str())
-            .unwrap_or("/");
-        match path_and_query.split_once('?') {
-            Some((path, query)) => {
-                req.url_path = path.into();
-                req.url_query = query
-                    .split('&')
-                    .map(|s| s.split_once('=').unwrap_or((s, "")))
-                    .map(|(a, b)| (a.into(), b.into()))
-                    .collect();
-            }
-            None => {
-                req.url_path = path_and_query.into();
-            }
-        }
-
-        let authority = req_head.uri().authority().map(|v| v.as_str().to_string());
-        for (key, value) in req_head.headers().iter() {
-            if let Ok(value) = value.to_str() {
-                req.headers
-                    .insert(HeaderOrHipStr::from_str(key.as_str()), value.into());
-            }
-        }
-        if let Some(authority) = authority {
-            if let Some(host) = req.get_header("Host") {
-                if !host.eq_ignore_ascii_case(&authority) {
-                    let head = http::Response::builder().status(400).body(())?;
-                    let _ = respond.send_response(head, true)?;
-                    return Ok(());
-                }
-            }
-            req.headers
-                .insert(HeaderOrHipStr::from_str("Host"), authority.into());
-        }
-
-        let body_stream = req_head.body_mut();
-        let mut request_body = Vec::new();
-        while let Some(next) = body_stream.data().await {
-            let chunk = next?;
-            request_body.extend_from_slice(&chunk);
-        }
-        req.body = request_body.into();
-
-        let res = PipeContext::handle_request(pipe_ctx.as_ref(), &mut req, 0).await;
-
-        let suppress_body = Self::should_suppress_response_body(res.http_code, req.method);
-        let mut response_builder = http::Response::builder().status(res.http_code);
-        for (key, value) in res.headers.iter() {
-            if Self::is_h2_h3_forbidden_response_header(key) {
-                continue;
-            }
-            response_builder = response_builder.header(key.as_ref(), value.as_ref());
-        }
-
-        let mut trailers = http::HeaderMap::new();
-        for (key, value) in res.trailers.iter() {
-            if Self::is_forbidden_trailer_for_h2_h3(key) {
-                continue;
-            }
-            if let Ok(name) = http::header::HeaderName::from_bytes(key.as_bytes()) {
-                if let Ok(value) = http::HeaderValue::from_str(value) {
-                    trailers.insert(name, value);
-                }
-            }
-        }
-        let has_trailers = !trailers.is_empty();
-
-        if suppress_body {
-            let head = response_builder.body(())?;
-            let _ = respond.send_response(head, true)?;
-            return Ok(());
-        }
-
-        match res.body {
-            crate::HttpResponseBody::Data(data) => {
-                let head = response_builder.body(())?;
-                let mut send = respond.send_response(head, data.is_empty() && !has_trailers)?;
-                if !data.is_empty() {
-                    send.send_data(data.into(), !has_trailers)?;
-                }
-                if has_trailers {
-                    send.send_trailers(trailers)?;
-                }
-            }
-            crate::HttpResponseBody::Stream(mut rx) => {
-                let head = response_builder.body(())?;
-                let mut send = respond.send_response(head, false)?;
-                while let Some(chunk) = rx.recv().await {
-                    if chunk.is_empty() {
-                        continue;
-                    }
-                    send.send_data(chunk.into(), false)?;
-                }
-                if has_trailers {
-                    send.send_trailers(trailers)?;
-                } else {
-                    send.send_data(Vec::<u8>::new().into(), true)?;
-                }
-            }
-        }
-        Ok(())
     }
 
     async fn serve_http_impl(&mut self) -> anyhow::Result<()> {
@@ -1787,290 +1568,5 @@ impl HttpServer {
         // 使用WithPreRead包装流，将initial_data作为预读取数据
         let stream_with_pre_read = HttpStream::with_pre_read(stream, initial_data.to_vec());
         Self::spawn_http1_connection(pipe_ctx, client_addr, stream_with_pre_read);
-    }
-
-    #[cfg(feature = "http2")]
-    async fn serve_http2_impl(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
-        #[cfg(feature = "jemalloc")]
-        crate::init_jemalloc()?;
-
-        let addr: SocketAddr = self.addr.parse()?;
-        let listener = TcpListener::bind(&addr).await?;
-        let acceptor = Self::tls_acceptor_with_alpn(
-            cert_file,
-            key_file,
-            Some(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-        )?;
-        let pipe_ctx = Arc::clone(&self.pipe_ctx);
-
-        loop {
-            let (stream, client_addr) = listener.accept().await?;
-            _ = stream.set_nodelay(true);
-            let acceptor = acceptor.clone();
-            let pipe_ctx2 = Arc::clone(&pipe_ctx);
-            _ = tokio::task::spawn(async move {
-                let stream = match acceptor.accept(stream).await {
-                    Ok(stream) => stream,
-                    Err(_) => return,
-                };
-
-                let negotiated_h2 = stream
-                    .get_ref()
-                    .1
-                    .alpn_protocol()
-                    .map(|p| p == b"h2")
-                    .unwrap_or(false);
-
-                if !negotiated_h2 {
-                    Self::spawn_http1_connection(
-                        pipe_ctx2,
-                        client_addr,
-                        HttpStream::from_server_tls(stream),
-                    );
-                    return;
-                }
-
-                let mut h2_conn = match h2_server::handshake(stream).await {
-                    Ok(conn) => conn,
-                    Err(_) => return,
-                };
-
-                while let Some(next) = h2_conn.accept().await {
-                    let (req_head, respond) = match next {
-                        Ok(parts) => parts,
-                        Err(_) => break,
-                    };
-                    let pipe_ctx3 = Arc::clone(&pipe_ctx2);
-                    _ = tokio::task::spawn(async move {
-                        let _ = Self::handle_h2_request(req_head, respond, pipe_ctx3, client_addr)
-                            .await;
-                    });
-                }
-            });
-        }
-    }
-
-    #[cfg(feature = "http3")]
-    async fn serve_http3_impl(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
-        #[cfg(feature = "jemalloc")]
-        crate::init_jemalloc()?;
-
-        let addr: SocketAddr = self.addr.parse()?;
-        let server_config = Self::quinn_server_config(cert_file, key_file)?;
-        let endpoint = quinn::Endpoint::server(server_config, addr)?;
-        let pipe_ctx = Arc::clone(&self.pipe_ctx);
-
-        while let Some(new_conn) = endpoint.accept().await {
-            let pipe_ctx2 = Arc::clone(&pipe_ctx);
-            _ = tokio::task::spawn(async move {
-                let conn = match new_conn.await {
-                    Ok(conn) => conn,
-                    Err(_) => return,
-                };
-                let client_addr = conn.remote_address();
-                // 为 WebTransport 克隆连接
-                #[cfg(feature = "http3")]
-                let wt_conn = conn.clone();
-                let mut h3_conn: h3_server::Connection<_, bytes::Bytes> =
-                    match h3_server::Connection::new(h3_quinn::Connection::new(conn)).await {
-                        Ok(conn) => conn,
-                        Err(_) => return,
-                    };
-
-                loop {
-                    let resolver = match h3_conn.accept().await {
-                        Ok(Some(resolver)) => resolver,
-                        Ok(None) => break,
-                        Err(_) => break,
-                    };
-                    let pipe_ctx3 = Arc::clone(&pipe_ctx2);
-                    #[cfg(feature = "http3")]
-                    let wt_conn = wt_conn.clone();
-                    _ = tokio::task::spawn(async move {
-                        let (req_head, mut stream) = match resolver.resolve_request().await {
-                            Ok(req_stream) => req_stream,
-                            Err(_) => return,
-                        };
-
-                        // 检查是否是 WebTransport CONNECT 请求
-                        #[cfg(feature = "http3")]
-                        if req_head.method() == http::Method::CONNECT {
-                            if let Some(protocol) = req_head.headers().get(":protocol") {
-                                if protocol == "webtransport" {
-                                    // 检查路径是否匹配 WebTransport 路由
-                                    let path = req_head.uri().path();
-                                    let mut wt_handler: Option<&WebTransportHandler> = None;
-
-                                    for item in pipe_ctx3.items.iter() {
-                                        if let PipeContextItem::WebTransport((
-                                            wt_path,
-                                            _config,
-                                            handler,
-                                        )) = item
-                                        {
-                                            if path == wt_path
-                                                || path.starts_with(&format!("{}/", wt_path))
-                                            {
-                                                wt_handler = Some(handler);
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    if let Some(handler) = wt_handler {
-                                        // 发送 200 响应接受 WebTransport 会话
-                                        let response =
-                                            match http::Response::builder().status(200).body(()) {
-                                                Ok(resp) => resp,
-                                                Err(_) => return,
-                                            };
-                                        if stream.send_response(response).await.is_err() {
-                                            return;
-                                        }
-                                        let _ = stream.finish().await;
-
-                                        // 创建 WebTransport 会话并调用处理器
-                                        let wt_session = WebTransportSession::new(wt_conn);
-                                        handler(wt_session).await;
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-
-                        let mut req = HttpRequest::new();
-                        req.method = match Self::h2_method_to_http_method(req_head.method()) {
-                            Ok(method) => method,
-                            Err(_) => return,
-                        };
-                        req.target_form = HttpRequestTargetForm::Origin;
-                        req.version = 30;
-                        req.client_addr = Some(client_addr);
-
-                        let path_and_query = req_head
-                            .uri()
-                            .path_and_query()
-                            .map(|v| v.as_str())
-                            .unwrap_or("/");
-                        match path_and_query.split_once('?') {
-                            Some((path, query)) => {
-                                req.url_path = path.into();
-                                req.url_query = query
-                                    .split('&')
-                                    .map(|s| s.split_once('=').unwrap_or((s, "")))
-                                    .map(|(a, b)| (a.into(), b.into()))
-                                    .collect();
-                            }
-                            None => {
-                                req.url_path = path_and_query.into();
-                            }
-                        }
-
-                        let authority = req_head.uri().authority().map(|v| v.as_str().to_string());
-                        for (key, value) in req_head.headers().iter() {
-                            if let Ok(value) = value.to_str() {
-                                req.headers
-                                    .insert(HeaderOrHipStr::from_str(key.as_str()), value.into());
-                            }
-                        }
-                        if let Some(authority) = authority {
-                            if let Some(host) = req.get_header("Host") {
-                                if !host.eq_ignore_ascii_case(&authority) {
-                                    let response =
-                                        match http::Response::builder().status(400).body(()) {
-                                            Ok(resp) => resp,
-                                            Err(_) => return,
-                                        };
-                                    let _ = stream.send_response(response).await;
-                                    let _ = stream.finish().await;
-                                    return;
-                                }
-                            }
-                            req.headers
-                                .insert(HeaderOrHipStr::from_str("Host"), authority.into());
-                        }
-
-                        let mut request_body = Vec::new();
-                        loop {
-                            match stream.recv_data().await {
-                                Ok(Some(mut chunk)) => {
-                                    request_body
-                                        .extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
-                                }
-                                Ok(None) => break,
-                                Err(_) => return,
-                            }
-                        }
-                        req.body = request_body.into();
-
-                        let res =
-                            PipeContext::handle_request(pipe_ctx3.as_ref(), &mut req, 0).await;
-
-                        let mut response_builder = http::Response::builder().status(res.http_code);
-                        for (key, value) in res.headers.iter() {
-                            if Self::is_h2_h3_forbidden_response_header(key) {
-                                continue;
-                            }
-                            response_builder =
-                                response_builder.header(key.as_ref(), value.as_ref());
-                        }
-                        let response = match response_builder.body(()) {
-                            Ok(resp) => resp,
-                            Err(_) => return,
-                        };
-                        if stream.send_response(response).await.is_err() {
-                            return;
-                        }
-
-                        let suppress_body =
-                            Self::should_suppress_response_body(res.http_code, req.method);
-                        if !suppress_body {
-                            match res.body {
-                                crate::HttpResponseBody::Data(data) => {
-                                    if !data.is_empty()
-                                        && stream.send_data(bytes::Bytes::from(data)).await.is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                                crate::HttpResponseBody::Stream(mut rx) => {
-                                    while let Some(chunk) = rx.recv().await {
-                                        if stream
-                                            .send_data(bytes::Bytes::from(chunk))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if !res.trailers.is_empty() {
-                            let mut trailers = http::HeaderMap::new();
-                            for (key, value) in res.trailers.iter() {
-                                if Self::is_forbidden_trailer_for_h2_h3(key) {
-                                    continue;
-                                }
-                                if let Ok(name) =
-                                    http::header::HeaderName::from_bytes(key.as_bytes())
-                                {
-                                    if let Ok(value) = http::HeaderValue::from_str(value) {
-                                        trailers.insert(name, value);
-                                    }
-                                }
-                            }
-                            let _ = stream.send_trailers(trailers).await;
-                        }
-
-                        let _ = stream.finish().await;
-                    });
-                }
-            });
-        }
-
-        endpoint.wait_idle().await;
-        Ok(())
     }
 }

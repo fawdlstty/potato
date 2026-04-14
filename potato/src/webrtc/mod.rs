@@ -7,46 +7,36 @@
 //! - DataChannel支持
 //! - 自动化媒体流处理
 
-#[cfg(feature = "webrtc")]
+#![cfg(feature = "webrtc")]
+
 pub mod client;
-#[cfg(feature = "webrtc")]
 pub mod datachannel;
-#[cfg(feature = "webrtc")]
 pub mod media;
-#[cfg(feature = "webrtc")]
 pub mod peer;
-#[cfg(feature = "webrtc")]
 pub mod room;
-#[cfg(feature = "webrtc")]
 pub mod server;
-#[cfg(feature = "webrtc")]
 pub mod signaling;
-#[cfg(feature = "webrtc")]
 pub mod signaling_handler;
 
-#[cfg(feature = "webrtc")]
 pub use client::*;
-#[cfg(feature = "webrtc")]
 pub use datachannel::*;
-#[cfg(feature = "webrtc")]
 pub use media::*;
-#[cfg(feature = "webrtc")]
 pub use peer::*;
-#[cfg(feature = "webrtc")]
 pub use room::*;
-#[cfg(feature = "webrtc")]
 pub use server::*;
-#[cfg(feature = "webrtc")]
 pub use signaling::*;
-#[cfg(feature = "webrtc")]
 pub use signaling_handler::*;
 
-#[cfg(feature = "webrtc")]
 use crate::PipeContext;
 use std::sync::Arc;
 
+// 类型别名，简化复杂类型定义
+type WebRTCCallback1 = dyn Fn(&str) + Send + Sync;
+type WebRTCCallback2 = dyn Fn(&str, &str) + Send + Sync;
+type WebRTCCallback3 = dyn Fn(&str, &str, &str) + Send + Sync;
+type WebRTCCallback4 = dyn Fn(&str, &str, &str, &[u8]) + Send + Sync;
+
 /// WebRTC配置
-#[cfg(feature = "webrtc")]
 #[derive(Clone)]
 pub struct WebRTCConfig {
     pub max_peers: u32,
@@ -80,27 +70,14 @@ impl Default for WebRTCConfig {
 }
 
 /// WebRTC事件回调
-#[cfg(feature = "webrtc")]
+#[derive(Default)]
 pub struct WebRTCEvents {
-    pub on_room_created: Option<Arc<dyn Fn(&str) + Send + Sync>>,
-    pub on_peer_joined: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
-    pub on_peer_left: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
-    pub on_publish_started: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
-    pub on_subscribe_started: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
-    pub on_datachannel_message: Option<Arc<dyn Fn(&str, &str, &str, &[u8]) + Send + Sync>>,
-}
-
-impl Default for WebRTCEvents {
-    fn default() -> Self {
-        Self {
-            on_room_created: None,
-            on_peer_joined: None,
-            on_peer_left: None,
-            on_publish_started: None,
-            on_subscribe_started: None,
-            on_datachannel_message: None,
-        }
-    }
+    pub on_room_created: Option<Arc<WebRTCCallback1>>,
+    pub on_peer_joined: Option<Arc<WebRTCCallback2>>,
+    pub on_peer_left: Option<Arc<WebRTCCallback2>>,
+    pub on_publish_started: Option<Arc<WebRTCCallback2>>,
+    pub on_subscribe_started: Option<Arc<WebRTCCallback3>>,
+    pub on_datachannel_message: Option<Arc<WebRTCCallback4>>,
 }
 
 impl Clone for WebRTCEvents {
@@ -117,14 +94,12 @@ impl Clone for WebRTCEvents {
 }
 
 /// WebRTC Builder(链式配置)
-#[cfg(feature = "webrtc")]
 pub struct WebRTCBuilder<'a> {
     ctx: &'a mut PipeContext,
     config: WebRTCConfig,
     events: WebRTCEvents,
 }
 
-#[cfg(feature = "webrtc")]
 impl<'a> WebRTCBuilder<'a> {
     /// 创建WebRTC Builder
     pub fn new(ctx: &'a mut PipeContext) -> Self {

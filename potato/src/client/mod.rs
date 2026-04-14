@@ -1,5 +1,7 @@
 #![allow(non_camel_case_types)]
+#[cfg(feature = "http2")]
 pub mod http2;
+#[cfg(feature = "http3")]
 pub mod http3;
 
 use crate::utils::bytes::CompressExt;

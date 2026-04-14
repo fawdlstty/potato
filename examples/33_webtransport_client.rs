@@ -10,7 +10,7 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 使用宏连接 WebTransport 服务器（最简洁）
-    let mut wt = potato::webtransport!("https://127.0.0.1:4433/wt").await?;
+    let wt = potato::webtransport!("https://127.0.0.1:4433/wt").await?;
 
     println!("WebTransport 连接已建立");
 
@@ -28,8 +28,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 接收响应
     match stream.recv().await {
-        Ok(data) => {
+        Ok(Some(data)) => {
             println!("收到响应: {:?}", String::from_utf8_lossy(&data));
+        }
+        Ok(None) => {
+            println!("流已关闭，无响应");
         }
         Err(e) => {
             eprintln!("接收响应失败: {}", e);

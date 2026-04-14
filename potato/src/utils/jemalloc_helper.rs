@@ -1,21 +1,17 @@
-#[cfg(not(target_os = "windows"))]
+#![cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+
 use crate::utils::process::ProgramRunner;
 use anyhow::anyhow;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(target_os = "windows"))]
 use tikv_jemalloc_ctl::*;
-#[cfg(not(target_os = "windows"))]
 use tokio::fs::{self, File};
-#[cfg(not(target_os = "windows"))]
 use tokio::io::AsyncReadExt;
 
-#[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 static INIT_JEMALLOC: AtomicBool = AtomicBool::new(true);
 
-#[cfg(not(target_os = "windows"))]
 pub fn init_jemalloc() -> anyhow::Result<()> {
     if !INIT_JEMALLOC.load(Ordering::SeqCst) {
         return Ok(());
@@ -40,19 +36,6 @@ pub fn init_jemalloc() -> anyhow::Result<()> {
     ))
 }
 
-#[cfg(target_os = "windows")]
-pub fn init_jemalloc() -> anyhow::Result<()> {
-    if !INIT_JEMALLOC.load(Ordering::SeqCst) {
-        return Err(anyhow!(
-            "jemalloc feature is not available on Windows; disable jemalloc or build on a non-Windows target"
-        ));
-    }
-    Err(anyhow!(
-        "jemalloc feature is not available on Windows; disable jemalloc or build on a non-Windows target"
-    ))
-}
-
-#[cfg(not(target_os = "windows"))]
 pub async fn dump_jemalloc_profile() -> anyhow::Result<Vec<u8>> {
     const PROF_DUMP: &'static [u8] = b"prof.dump\0";
     let prof_file = format!("/tmp/prof_{}.dump", env!("CARGO_PKG_NAME"));
@@ -87,9 +70,4 @@ pub async fn dump_jemalloc_profile() -> anyhow::Result<Vec<u8>> {
     _ = fs::remove_file(&prof_file).await;
     _ = fs::remove_file(&pdf_file).await;
     Ok(buf)
-}
-
-#[cfg(target_os = "windows")]
-pub async fn dump_jemalloc_profile() -> anyhow::Result<Vec<u8>> {
-    Err(anyhow!("jemalloc profile dump is not available on Windows"))
 }

@@ -2,6 +2,8 @@
 //!
 //! 提供Let's Encrypt等ACME协议的自动证书申请、续期和热重载功能
 
+#![cfg(feature = "acme")]
+
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
     NewAccount, NewOrder, OrderStatus, RetryPolicy,

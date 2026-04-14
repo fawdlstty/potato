@@ -56,11 +56,7 @@ async fn handle_bi_stream(mut stream: potato::WebTransportStream) {
     // 简单回显: 接收数据并发送回去
     loop {
         match stream.recv().await {
-            Ok(data) => {
-                if data.is_empty() {
-                    println!("流关闭");
-                    break;
-                }
+            Ok(Some(data)) => {
                 println!("收到数据: {:?}", String::from_utf8_lossy(&data));
 
                 // 回显数据
@@ -68,6 +64,10 @@ async fn handle_bi_stream(mut stream: potato::WebTransportStream) {
                     eprintln!("发送数据失败: {}", e);
                     break;
                 }
+            }
+            Ok(None) => {
+                println!("流关闭");
+                break;
             }
             Err(e) => {
                 eprintln!("接收数据失败: {}", e);
