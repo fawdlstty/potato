@@ -97,4 +97,5 @@ full = ["openapi", "ssh", "tls", "http2", "http3", "webdav", "acme", "webrtc"]
 
 # cargo publish -p potato-macro --allow-dirty --registry crates-io
 # cargo publish -p potato --allow-dirty --registry crates-io
+# cd docs && npm run docs:dev && cd ..
 # cd docs && npm run docs:build && cd ..
