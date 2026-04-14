@@ -461,12 +461,30 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     Err(err) => potato::HttpResponse::error(format!("{err:?}")),
                 }
             },
+            "Result<String>" | "anyhow::Result<String>" => quote! {
+                match #call_expr.await {
+                    Ok(ret) => potato::HttpResponse::html(ret),
+                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
+                }
+            },
+            "Result<& 'static str>" | "anyhow::Result<& 'static str>" => quote! {
+                match #call_expr.await {
+                    Ok(ret) => potato::HttpResponse::html(ret),
+                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
+                }
+            },
             "()" => quote! {
                 #call_expr.await;
                 potato::HttpResponse::text("ok")
             },
             "HttpResponse" => quote! {
                 #call_expr.await
+            },
+            "String" => quote! {
+                potato::HttpResponse::html(#call_expr.await)
+            },
+            "& 'static str" => quote! {
+                potato::HttpResponse::html(#call_expr.await)
             },
             _ => panic!("unsupported ret type: {ret_type}"),
         }
@@ -484,12 +502,30 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     Err(err) => potato::HttpResponse::error(format!("{err:?}")),
                 }
             },
+            "Result<String>" | "anyhow::Result<String>" => quote! {
+                match #call_expr {
+                    Ok(ret) => potato::HttpResponse::html(ret),
+                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
+                }
+            },
+            "Result<& 'static str>" | "anyhow::Result<& 'static str>" => quote! {
+                match #call_expr {
+                    Ok(ret) => potato::HttpResponse::html(ret),
+                    Err(err) => potato::HttpResponse::error(format!("{err:?}")),
+                }
+            },
             "()" => quote! {
                 #call_expr;
                 potato::HttpResponse::text("ok")
             },
             "HttpResponse" => quote! {
                 #call_expr
+            },
+            "String" => quote! {
+                potato::HttpResponse::html(#call_expr)
+            },
+            "& 'static str" => quote! {
+                potato::HttpResponse::html(#call_expr)
             },
             _ => panic!("unsupported ret type: {ret_type}"),
         }

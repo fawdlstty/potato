@@ -37,6 +37,43 @@ ServerConfig::set_jwt_secret("AAABBBCCC").await;
 
 When a function annotation includes an authentication parameter, if authentication fails, a 401 status code will be returned and the handler function will not be called.
 
+## Return Types
+
+Handler functions support multiple return types:
+
+- `HttpResponse` - Direct HTTP response
+- `anyhow::Result<HttpResponse>` - HTTP response that may error
+- `()` - No return value, automatically responds with "ok"
+- `Result<()>` - Operation that may error
+- `String` / `&'static str` - String return, automatically wrapped with `HttpResponse::html()`
+- `anyhow::Result<String>` / `anyhow::Result<&'static str>` - String that may error
+
+Example:
+
+```rust
+// Return String
+#[potato::http_get("/string")]
+async fn string_handler() -> String {
+    "<h1>Hello</h1>".to_string()
+}
+
+// Return &'static str
+#[potato::http_get("/static")]
+async fn static_handler() -> &'static str {
+    "<h1>Static</h1>"
+}
+
+// Return Result<String>
+#[potato::http_get("/result")]
+async fn result_handler(success: bool) -> anyhow::Result<String> {
+    if success {
+        Ok("<h1>Success</h1>".to_string())
+    } else {
+        anyhow::bail!("Error")
+    }
+}
+```
+
 ## Preprocess and Postprocess
 
 You can stack `preprocess` and `postprocess` annotations on a handler to run fixed-signature hooks before and after the handler.

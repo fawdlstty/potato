@@ -37,6 +37,43 @@ ServerConfig::set_jwt_secret("AAABBBCCC").await;
 
 当函数标注鉴权参数后，鉴权不通过，会返回401状态码，且不会实际调用处理函数。
 
+## 返回类型
+
+处理函数支持多种返回类型：
+
+- `HttpResponse` - 直接返回 HTTP 响应
+- `anyhow::Result<HttpResponse>` - 返回可能出错的 HTTP 响应
+- `()` - 无返回值，自动响应 "ok"
+- `Result<()>` - 返回可能出错的操作
+- `String` / `&'static str` - 返回字符串，自动通过 `HttpResponse::html()` 包装
+- `anyhow::Result<String>` / `anyhow::Result<&'static str>` - 返回可能出错的字符串
+
+示例：
+
+```rust
+// 返回 String
+#[potato::http_get("/string")]
+async fn string_handler() -> String {
+    "<h1>Hello</h1>".to_string()
+}
+
+// 返回 &'static str
+#[potato::http_get("/static")]
+async fn static_handler() -> &'static str {
+    "<h1>Static</h1>"
+}
+
+// 返回 Result<String>
+#[potato::http_get("/result")]
+async fn result_handler(success: bool) -> anyhow::Result<String> {
+    if success {
+        Ok("<h1>Success</h1>".to_string())
+    } else {
+        anyhow::bail!("Error")
+    }
+}
+```
+
 ## 预处理与后处理
 
 可以在处理函数上叠加 `preprocess`、`postprocess` 标注，用于在处理函数前后执行固定签名的钩子函数。
