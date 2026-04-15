@@ -269,3 +269,34 @@ async fn update_item() -> &'static str {
 - **自动OPTIONS处理**：CORS预检请求自动返回正确的允许方法列表
 - **方法补充**：指定的methods会自动补充HEAD和OPTIONS
 - **凭证模式约束**：当`credentials=true`时，origin不能使用`*`，必须指定具体域名
+
+## 请求体大小限制标注
+
+通过 `#[potato::limit_size(...)]` 为处理函数设置请求体大小限制，返回 413 Payload Too Large。
+
+### 基本用法
+
+```rust
+// 限制 body 为 10MB
+#[potato::http_post("/upload")]
+#[potato::limit_size(10 * 1024 * 1024)]
+async fn upload(req: &mut HttpRequest) -> HttpResponse {
+    HttpResponse::text("uploaded")
+}
+```
+
+### 分别限制 header 和 body
+
+```rust
+// Header 512KB, Body 50MB
+#[potato::http_post("/large-upload")]
+#[potato::limit_size(header = 512 * 1024, body = 50 * 1024 * 1024)]
+async fn large_upload(req: &mut HttpRequest) -> HttpResponse {
+    HttpResponse::text("large uploaded")
+}
+```
+
+### 优先级
+
+- Handler 注解 > 中间件 `use_limit_size` > 全局配置（默认 100MB）
+- 注解仅对当前 handler 生效，覆盖全局和中间件限制

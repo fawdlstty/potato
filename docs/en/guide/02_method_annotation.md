@@ -269,3 +269,34 @@ async fn update_item() -> &'static str {
 - **Automatic OPTIONS Handling**: CORS preflight requests automatically return correct allowed methods list
 - **Method Supplementation**: Specified methods automatically include HEAD and OPTIONS
 - **Credentials Mode Constraint**: When `credentials=true`, origin cannot be `*`, must specify a concrete domain
+
+## Request Body Size Limit Annotation
+
+Set request body size limit for handler functions using `#[potato::limit_size(...)]`, returns 413 Payload Too Large.
+
+### Basic Usage
+
+```rust
+// Limit body to 10MB
+#[potato::http_post("/upload")]
+#[potato::limit_size(10 * 1024 * 1024)]
+async fn upload(req: &mut HttpRequest) -> HttpResponse {
+    HttpResponse::text("uploaded")
+}
+```
+
+### Separate Header and Body Limits
+
+```rust
+// Header 512KB, Body 50MB
+#[potato::http_post("/large-upload")]
+#[potato::limit_size(header = 512 * 1024, body = 50 * 1024 * 1024)]
+async fn large_upload(req: &mut HttpRequest) -> HttpResponse {
+    HttpResponse::text("large uploaded")
+}
+```
+
+### Priority
+
+- Handler annotation > Middleware `use_limit_size` > Global config (default 100MB)
+- Annotation only applies to current handler, overrides global and middleware limits
