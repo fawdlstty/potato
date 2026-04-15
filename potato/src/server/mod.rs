@@ -100,6 +100,7 @@ pub enum PipeContextItem {
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
     Custom(CustomHandler),
+    LimitSize(usize, usize), // (max_header_bytes, max_body_bytes)
     ReverseProxy(String, String, bool),
     #[cfg(feature = "jemalloc")]
     Jemalloc(String),
@@ -120,6 +121,7 @@ impl Clone for PipeContextItem {
             PipeContextItem::EmbeddedRoute(v) => PipeContextItem::EmbeddedRoute(v.clone()),
             PipeContextItem::FinalRoute(v) => PipeContextItem::FinalRoute(v.clone()),
             PipeContextItem::Custom(v) => PipeContextItem::Custom(v.clone()),
+            PipeContextItem::LimitSize(h, b) => PipeContextItem::LimitSize(*h, *b),
             PipeContextItem::ReverseProxy(v1, v2, v3) => {
                 PipeContextItem::ReverseProxy(v1.clone(), v2.clone(), *v3)
             }
@@ -486,6 +488,26 @@ impl PipeContext {
             .push(PipeContextItem::Custom(CustomHandler::Async(Arc::new(
                 callback,
             ))));
+    }
+
+    /// 添加请求体大小限制中间件
+    ///
+    /// # 参数
+    /// * `max_header_bytes` - Header 总大小限制 (字节)
+    /// * `max_body_bytes` - Body 总大小限制 (字节)
+    ///
+    /// # 示例
+    /// ```rust
+    /// server.configure(|ctx| {
+    ///     ctx.use_limit_size(1024 * 1024, 50 * 1024 * 1024); // 1MB header, 50MB body
+    ///     ctx.use_handlers();
+    /// });
+    /// ```
+    pub fn use_limit_size(&mut self, max_header_bytes: usize, max_body_bytes: usize) {
+        self.items.push(PipeContextItem::LimitSize(
+            max_header_bytes.max(1),
+            max_body_bytes.max(1),
+        ));
     }
 
     pub fn use_reverse_proxy(
@@ -1000,6 +1022,20 @@ impl PipeContext {
                     continue;
                 }
                 PipeContextItem::FinalRoute(res) => return res.clone(),
+                PipeContextItem::LimitSize(_max_header, max_body) => {
+                    // 检查 body 大小
+                    let body_len = req.body.len();
+                    if body_len > *max_body {
+                        let mut res = HttpResponse::text(format!(
+                            "Payload Too Large: body size {} bytes exceeds limit {} bytes",
+                            body_len, max_body
+                        ));
+                        res.http_code = 413;
+                        return res;
+                    }
+                    // Header 大小已在解析阶段检查，此处为双重保险
+                    continue;
+                }
                 PipeContextItem::Custom(handler) => match handler {
                     CustomHandler::Sync(handler) => match handler.as_ref()(req) {
                         Some(res) => return res,

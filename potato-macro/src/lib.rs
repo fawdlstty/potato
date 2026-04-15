@@ -1156,6 +1156,119 @@ pub fn postprocess(attr: TokenStream, input: TokenStream) -> TokenStream {
     postprocess_macro(attr, input)
 }
 
+/// limit_size 属性宏 - 为 handler 设置独立的请求体大小限制
+///
+/// # 参数
+/// * 单个值: `#[potato::limit_size(1024 * 1024 * 1024)]` - 仅限制 body 为 1GB
+/// * 命名参数: `#[potato::limit_size(header = 2 * 1024 * 1024, body = 500 * 1024 * 1024)]`
+///
+/// # 示例
+/// ```rust
+/// // 限制 body 为 1GB
+/// #[potato::http_post("/upload")]
+/// #[potato::limit_size(1024 * 1024 * 1024)]
+/// async fn large_upload(req: &mut HttpRequest) -> HttpResponse {
+///     // ...
+/// }
+///
+/// // 分别限制 header 和 body
+/// #[potato::http_post("/upload")]
+/// #[potato::limit_size(header = 2 * 1024 * 1024, body = 500 * 1024 * 1024)]
+/// async fn medium_upload(req: &mut HttpRequest) -> HttpResponse {
+///     // ...
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn limit_size(attr: TokenStream, input: TokenStream) -> TokenStream {
+    limit_size_macro(attr, input)
+}
+
+fn limit_size_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
+    // 解析参数
+    let (_max_header, max_body) = {
+        let attr_tokens: proc_macro2::TokenStream = attr.clone().into();
+        if attr_tokens.is_empty() {
+            // 默认值: 不限制 header，使用全局 body 限制
+            (None, None)
+        } else {
+            // 尝试解析为命名参数或单值
+            let result = syn::parse::Parser::parse2(
+                |input: syn::parse::ParseStream| -> syn::Result<(Option<syn::Expr>, Option<syn::Expr>)> {
+                    let mut header_expr = None;
+                    let mut body_expr = None;
+
+                    // 尝试解析命名参数
+                    while !input.is_empty() {
+                        let ident: Ident = input.parse()?;
+                        input.parse::<Token![=]>()?;
+                        let value: syn::Expr = input.parse()?;
+
+                        match ident.to_string().as_str() {
+                            "header" => header_expr = Some(value),
+                            "body" => body_expr = Some(value),
+                            _ => return Err(syn::Error::new(ident.span(), "expected 'header' or 'body'")),
+                        }
+
+                        // 可选的逗号
+                        if input.peek(Token![,]) {
+                            input.parse::<Token![,]>()?;
+                        }
+                    }
+
+                    Ok((header_expr, body_expr))
+                },
+                attr_tokens.clone(),
+            );
+
+            match result {
+                Ok((h, b)) => (h, b),
+                Err(_) => {
+                    // 解析失败，尝试作为单值（body 限制）
+                    if let Ok(expr) = syn::parse2::<syn::Expr>(attr_tokens) {
+                        (None, Some(expr))
+                    } else {
+                        (None, None)
+                    }
+                }
+            }
+        }
+    };
+
+    let root_fn = syn::parse_macro_input!(input as syn::ItemFn);
+
+    // 生成检查代码
+    let body_check = if let Some(body_expr) = max_body {
+        quote! {
+            // 检查 body 大小
+            let body_len = req.body.len();
+            if body_len > #body_expr {
+                let mut res = potato::HttpResponse::text(format!(
+                    "Payload Too Large: body size {} bytes exceeds limit {} bytes",
+                    body_len, #body_expr
+                ));
+                res.http_code = 413;
+                return res;
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // 克隆整个函数，然后修改 block
+    let mut wrapped_fn = root_fn.clone();
+    let original_block = root_fn.block.as_ref();
+    let new_block: syn::Block = syn::parse_quote!({
+        #body_check
+        #original_block
+    });
+    wrapped_fn.block = Box::new(new_block);
+
+    quote! {
+        #wrapped_fn
+    }
+    .into()
+}
+
 /// header 属性宏 - 这是一个占位宏，实际解析在 http_handler_macro 中完成
 /// 这个宏的存在使得 #[potato::header(...)] 语法能够被编译器识别
 #[proc_macro_attribute]

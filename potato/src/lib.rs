@@ -77,6 +77,7 @@ pub enum HttpRequestParseError {
     NotImplemented(String),
     ExpectationFailed(String),
     RequestHeaderFieldsTooLarge(String),
+    PayloadTooLarge(String),
 }
 
 impl fmt::Display for HttpRequestParseError {
@@ -86,6 +87,7 @@ impl fmt::Display for HttpRequestParseError {
             HttpRequestParseError::NotImplemented(msg) => write!(f, "{msg}"),
             HttpRequestParseError::ExpectationFailed(msg) => write!(f, "{msg}"),
             HttpRequestParseError::RequestHeaderFieldsTooLarge(msg) => write!(f, "{msg}"),
+            HttpRequestParseError::PayloadTooLarge(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -555,6 +557,7 @@ impl HttpRequest {
                 HttpRequestParseError::NotImplemented(_) => None,
                 HttpRequestParseError::ExpectationFailed(_) => None,
                 HttpRequestParseError::RequestHeaderFieldsTooLarge(_) => None,
+                HttpRequestParseError::PayloadTooLarge(_) => None,
             })
     }
 
@@ -566,6 +569,7 @@ impl HttpRequest {
                     HttpRequestParseError::NotImplemented(msg) => (501, msg.as_str()),
                     HttpRequestParseError::ExpectationFailed(msg) => (417, msg.as_str()),
                     HttpRequestParseError::RequestHeaderFieldsTooLarge(msg) => (431, msg.as_str()),
+                    HttpRequestParseError::PayloadTooLarge(msg) => (413, msg.as_str()),
                 };
                 let mut res = HttpResponse::text(msg.to_string());
                 res.http_code = status;

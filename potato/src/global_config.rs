@@ -11,6 +11,7 @@ static SERVER_WS_PING_DURATION: LazyLock<RwLock<Duration>> =
     LazyLock::new(|| RwLock::new(Duration::from_secs(60)));
 static SERVER_MAX_HEADER_COUNT: AtomicUsize = AtomicUsize::new(48);
 static SERVER_MAX_HEADER_BYTES: AtomicUsize = AtomicUsize::new(16 * 1024);
+static SERVER_MAX_BODY_BYTES: AtomicUsize = AtomicUsize::new(100 * 1024 * 1024); // 100MB default
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -50,6 +51,14 @@ impl ServerConfig {
 
     pub fn get_max_header_bytes() -> usize {
         SERVER_MAX_HEADER_BYTES.load(Ordering::Relaxed)
+    }
+
+    pub fn set_max_body_bytes(limit: usize) {
+        SERVER_MAX_BODY_BYTES.store(limit.max(1), Ordering::Relaxed);
+    }
+
+    pub fn get_max_body_bytes() -> usize {
+        SERVER_MAX_BODY_BYTES.load(Ordering::Relaxed)
     }
 }
 
