@@ -6,7 +6,85 @@ use quote::{format_ident, quote, ToTokens};
 use rand::Rng;
 use serde_json::json;
 use std::{collections::HashSet, sync::LazyLock};
+use syn::Token;
 use utils::StringExt as _;
+
+/// CORS配置结构体(宏内部使用)
+struct CorsAttrConfig {
+    origin: Option<String>,
+    methods: Option<String>,
+    headers: Option<String>,
+    max_age: Option<String>,
+    credentials: bool,
+    expose_headers: Option<String>,
+}
+
+/// 解析CORS属性
+fn parse_cors_attr(tokens: &proc_macro2::TokenStream) -> CorsAttrConfig {
+    let mut config = CorsAttrConfig {
+        origin: None,
+        methods: None,
+        headers: None,
+        max_age: None,
+        credentials: false,
+        expose_headers: None,
+    };
+
+    if tokens.is_empty() {
+        return config; // 返回最小限制配置(origin="*", headers="*", methods自动计算)
+    }
+
+    // 解析 key = value 格式
+    use syn::parse::Parser;
+
+    fn parse_inner(input: syn::parse::ParseStream) -> syn::Result<CorsAttrConfig> {
+        let mut config = CorsAttrConfig {
+            origin: None,
+            methods: None,
+            headers: None,
+            max_age: None,
+            credentials: false,
+            expose_headers: None,
+        };
+
+        let vars =
+            syn::punctuated::Punctuated::<syn::MetaNameValue, Token![,]>::parse_terminated(input)?;
+        for meta in vars {
+            let key = meta
+                .path
+                .get_ident()
+                .map(|i| i.to_string())
+                .unwrap_or_default();
+            if let syn::Expr::Lit(expr_lit) = &meta.value {
+                match &expr_lit.lit {
+                    syn::Lit::Str(s) => {
+                        let val = s.value();
+                        match key.as_str() {
+                            "origin" => config.origin = Some(val),
+                            "methods" => config.methods = Some(val),
+                            "headers" => config.headers = Some(val),
+                            "max_age" => config.max_age = Some(val),
+                            "expose_headers" => config.expose_headers = Some(val),
+                            _ => {}
+                        }
+                    }
+                    syn::Lit::Bool(b) => {
+                        if key == "credentials" {
+                            config.credentials = b.value();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(config)
+    }
+
+    match parse_inner.parse2(tokens.clone()) {
+        Ok(cfg) => cfg,
+        Err(e) => panic!("Failed to parse cors attributes: {}", e),
+    }
+}
 
 static ARG_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
@@ -16,6 +94,37 @@ static ARG_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     .into_iter()
     .collect()
 });
+
+/// 解析 header 标注的 tokens，返回 (key, value)
+fn parse_header_attr(tokens: &proc_macro2::TokenStream) -> Result<(String, String), syn::Error> {
+    use syn::parse::Parser;
+
+    let parser = |input: syn::parse::ParseStream| {
+        // 支持两种格式：
+        // 1. Key = "value" (标准 header)
+        // 2. Custom("key") = "value" (自定义 header)
+        let key_ident: Ident = input.parse()?;
+        let key_name = key_ident.to_string();
+
+        if key_name == "Custom" {
+            // Custom("key") = "value" 格式
+            let content;
+            syn::parenthesized!(content in input);
+            let key_lit: syn::LitStr = content.parse()?;
+            let key = key_lit.value();
+            let _: Token![=] = input.parse()?;
+            let value: syn::LitStr = input.parse()?;
+            Ok((key, value.value()))
+        } else {
+            // Key = "value" 格式
+            let _: Token![=] = input.parse()?;
+            let value: syn::LitStr = input.parse()?;
+            Ok((key_name, value.value()))
+        }
+    };
+
+    parser.parse2(tokens.clone())
+}
 
 fn random_ident() -> Ident {
     let mut rng = rand::thread_rng();
@@ -234,11 +343,12 @@ fn postprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
 
 fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> TokenStream {
     let req_name = Ident::new(req_name, Span::call_site());
-    let (route_path, oauth_arg) = {
+    let (route_path, oauth_arg, default_headers) = {
         let mut oroute_path = syn::parse::<syn::LitStr>(attr.clone())
             .ok()
             .map(|path| path.value());
         let mut oauth_arg = None;
+        let mut default_headers: Vec<(String, String)> = Vec::new();
         //
         if oroute_path.is_none() {
             let http_parser = syn::meta::parser(|meta| {
@@ -257,6 +367,15 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         }
                     }
                     Ok(())
+                } else if meta.path.is_ident("header") {
+                    // 解析 header(key = value) 格式
+                    let content;
+                    syn::parenthesized!(content in meta.input);
+                    let key: Ident = content.parse()?;
+                    let _: syn::Token![=] = content.parse()?;
+                    let value: syn::LitStr = content.parse()?;
+                    default_headers.push((key.to_string(), value.value()));
+                    Ok(())
                 } else {
                     Err(meta.error("unsupported annotation property"))
                 }
@@ -270,9 +389,87 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         if !route_path.starts_with('/') {
             panic!("route path must start with '/'");
         }
-        (route_path, oauth_arg)
+        (route_path, oauth_arg, default_headers)
     };
+
+    // 解析函数上的 #[potato::header(...)] 标注
     let mut root_fn = syn::parse_macro_input!(input as syn::ItemFn);
+    let mut fn_headers: Vec<(String, String)> = Vec::new();
+    let mut cors_config: Option<CorsAttrConfig> = None;
+    let mut remaining_attrs = Vec::new();
+
+    for attr in root_fn.attrs.iter() {
+        // 检查是否是 header 标注（支持 #[header(...)] 和 #[potato::header(...)] 两种形式）
+        let is_header_attr = attr.path().is_ident("header")
+            || (attr.path().segments.len() == 2
+                && attr
+                    .path()
+                    .segments
+                    .iter()
+                    .next()
+                    .map(|s| s.ident.to_string())
+                    == Some("potato".to_string())
+                && attr
+                    .path()
+                    .segments
+                    .iter()
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    == Some("header".to_string()));
+
+        if is_header_attr {
+            if let syn::Meta::List(meta_list) = &attr.meta {
+                // 解析 header(Cache_Control = "no-store, no-cache, max-age=0") 或 header(Custom("key") = "value")
+                if let Ok((key, value)) = parse_header_attr(&meta_list.tokens) {
+                    fn_headers.push((key, value));
+                }
+            }
+            continue;
+        }
+
+        // 检查是否是 cors 标注
+        let is_cors_attr = attr.path().is_ident("cors")
+            || (attr.path().segments.len() == 2
+                && attr
+                    .path()
+                    .segments
+                    .iter()
+                    .next()
+                    .map(|s| s.ident.to_string())
+                    == Some("potato".to_string())
+                && attr
+                    .path()
+                    .segments
+                    .iter()
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    == Some("cors".to_string()));
+
+        if is_cors_attr {
+            if let syn::Meta::List(meta_list) = &attr.meta {
+                cors_config = Some(parse_cors_attr(&meta_list.tokens));
+            } else {
+                // 无参数时使用最小限制配置
+                cors_config = Some(CorsAttrConfig {
+                    origin: None,
+                    methods: None,
+                    headers: None,
+                    max_age: None,
+                    credentials: false,
+                    expose_headers: None,
+                });
+            }
+            continue;
+        }
+
+        remaining_attrs.push(attr.clone());
+    }
+
+    // 合并默认headers和函数headers
+    let mut all_headers = default_headers;
+    all_headers.extend(fn_headers);
+
+    root_fn.attrs = remaining_attrs;
     let (preprocess_fns, postprocess_fns) = collect_handler_hooks(&mut root_fn);
     let preprocess_adapters: Vec<Ident> = preprocess_fns
         .iter()
@@ -530,6 +727,124 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             _ => panic!("unsupported ret type: {ret_type}"),
         }
     };
+    let doc_args = serde_json::to_string(&doc_args).unwrap();
+
+    // 生成添加headers的代码
+    let add_headers_code = if all_headers.is_empty() {
+        quote! {}
+    } else {
+        let header_statements = all_headers.iter().map(|(key, value)| {
+            // 将下划线转换为HTTP标准命名 (例如 Cache_Control -> Cache-Control)
+            let http_key = key.replace("_", "-");
+            quote! {
+                __potato_response.add_header(
+                    std::borrow::Cow::Borrowed(#http_key),
+                    std::borrow::Cow::Borrowed(#value)
+                );
+            }
+        });
+        quote! {
+            #(#header_statements)*
+        }
+    };
+
+    // 如果存在CORS配置,生成CORS headers注入代码
+    let cors_headers_code = if let Some(cors) = &cors_config {
+        let mut statements = vec![];
+
+        // origin: 默认"*"
+        let origin_val = cors.origin.as_deref().unwrap_or("*");
+        statements.push(quote! {
+            __potato_response.add_header(
+                "Access-Control-Allow-Origin".into(),
+                #origin_val.into()
+            );
+        });
+
+        // methods: 仅在用户指定时添加,否则由OPTIONS请求自动计算
+        if let Some(ref methods) = cors.methods {
+            let mut methods_list: Vec<&str> = methods.split(',').map(|s| s.trim()).collect();
+            if !methods_list.contains(&"HEAD") {
+                methods_list.push("HEAD");
+            }
+            if !methods_list.contains(&"OPTIONS") {
+                methods_list.push("OPTIONS");
+            }
+            let methods_str = methods_list.join(",");
+            statements.push(quote! {
+                __potato_response.add_header(
+                    "Access-Control-Allow-Methods".into(),
+                    #methods_str.into()
+                );
+            });
+        }
+
+        // headers: 默认"*"
+        let headers_val = cors.headers.as_deref().unwrap_or("*");
+        statements.push(quote! {
+            __potato_response.add_header(
+                "Access-Control-Allow-Headers".into(),
+                #headers_val.into()
+            );
+        });
+
+        // max_age: 默认"86400"
+        if let Some(ref max_age) = cors.max_age {
+            statements.push(quote! {
+                __potato_response.add_header(
+                    "Access-Control-Max-Age".into(),
+                    #max_age.into()
+                );
+            });
+        } else {
+            statements.push(quote! {
+                __potato_response.add_header(
+                    "Access-Control-Max-Age".into(),
+                    "86400".into()
+                );
+            });
+        }
+
+        if cors.credentials {
+            statements.push(quote! {
+                __potato_response.add_header(
+                    "Access-Control-Allow-Credentials".into(),
+                    "true".into()
+                );
+            });
+        }
+
+        if let Some(ref expose_headers) = cors.expose_headers {
+            statements.push(quote! {
+                __potato_response.add_header(
+                    "Access-Control-Expose-Headers".into(),
+                    #expose_headers.into()
+                );
+            });
+        }
+
+        quote! { #(#statements)* }
+    } else {
+        quote! {}
+    };
+
+    // 如果存在CORS配置且是PUT/POST/DELETE,自动生成HEAD handler
+    let auto_head_handler = if cors_config.is_some()
+        && (req_name == "POST" || req_name == "PUT" || req_name == "DELETE")
+    {
+        let head_wrap_name = format_ident!("__potato_cors_head_{}", fn_name);
+        Some(quote! {
+            #[doc(hidden)]
+            fn #head_wrap_name(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+                // HEAD请求直接返回空响应,不执行原handler
+                // CORS headers会通过postprocess机制自动添加
+                potato::HttpResponse::html("")
+            }
+        })
+    } else {
+        None
+    };
+
     let wrap_func_body = if is_async {
         quote! {
             let mut __potato_pre_response: Option<potato::HttpResponse> = None;
@@ -553,6 +868,9 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     return potato::HttpResponse::error(format!("{err:?}"));
                 }
             )*
+
+            #add_headers_code
+            #cors_headers_code
 
             __potato_response
         }
@@ -584,13 +902,18 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 }
             )*
 
+            #add_headers_code
+            #cors_headers_code
+
             __potato_response
         }
     };
-    let doc_args = serde_json::to_string(&doc_args).unwrap();
+
     if is_async {
         quote! {
             #root_fn
+
+            #auto_head_handler
 
             #[doc(hidden)]
             async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
@@ -613,6 +936,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     } else {
         quote! {
             #root_fn
+
+            #auto_head_handler
 
             #[doc(hidden)]
             fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
@@ -671,6 +996,24 @@ pub fn preprocess(attr: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn postprocess(attr: TokenStream, input: TokenStream) -> TokenStream {
     postprocess_macro(attr, input)
+}
+
+/// header 属性宏 - 这是一个占位宏，实际解析在 http_handler_macro 中完成
+/// 这个宏的存在使得 #[potato::header(...)] 语法能够被编译器识别
+#[proc_macro_attribute]
+pub fn header(_attr: TokenStream, input: TokenStream) -> TokenStream {
+    // 直接返回原始函数，不做任何修改
+    // 实际的 header 解析和处理在 http_get/http_post 等宏中完成
+    input
+}
+
+/// cors 属性宏 - 这是一个占位宏，实际解析在 http_handler_macro 中完成
+/// 这个宏的存在使得 #[potato::cors(...)] 语法能够被编译器识别
+#[proc_macro_attribute]
+pub fn cors(_attr: TokenStream, input: TokenStream) -> TokenStream {
+    // 直接返回原始函数，不做任何修改
+    // 实际的 cors 解析和处理在 http_handler_macro 中完成
+    input
 }
 
 #[proc_macro]

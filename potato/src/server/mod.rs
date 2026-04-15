@@ -32,6 +32,31 @@ use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKey
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
+/// CORS配置
+#[derive(Debug, Clone)]
+pub struct CorsConfig {
+    pub origin: Option<String>,         // Access-Control-Allow-Origin
+    pub methods: Option<String>,        // Access-Control-Allow-Methods
+    pub headers: Option<String>,        // Access-Control-Allow-Headers
+    pub max_age: Option<String>,        // Access-Control-Max-Age
+    pub credentials: bool,              // Access-Control-Allow-Credentials
+    pub expose_headers: Option<String>, // Access-Control-Expose-Headers
+}
+
+impl CorsConfig {
+    /// 创建最小限制默认配置
+    pub fn default_minimal() -> Self {
+        Self {
+            origin: Some("*".to_string()),
+            methods: None, // 自动计算
+            headers: Some("*".to_string()),
+            max_age: Some("86400".to_string()),
+            credentials: false,
+            expose_headers: None,
+        }
+    }
+}
+
 type AsyncCustomHandler = dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = Option<HttpResponse>> + Send + '_>>
     + Send
     + Sync;
@@ -70,7 +95,7 @@ static HANDLERS_FLAT: LazyLock<HashMap<(&'static str, HttpMethod), &'static Requ
     });
 
 pub enum PipeContextItem {
-    Handlers(bool),
+    Handlers,
     LocationRoute((String, String, bool)),
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
@@ -90,7 +115,7 @@ pub enum PipeContextItem {
 impl Clone for PipeContextItem {
     fn clone(&self) -> Self {
         match self {
-            PipeContextItem::Handlers(v) => PipeContextItem::Handlers(*v),
+            PipeContextItem::Handlers => PipeContextItem::Handlers,
             PipeContextItem::LocationRoute(v) => PipeContextItem::LocationRoute(v.clone()),
             PipeContextItem::EmbeddedRoute(v) => PipeContextItem::EmbeddedRoute(v.clone()),
             PipeContextItem::FinalRoute(v) => PipeContextItem::FinalRoute(v.clone()),
@@ -374,7 +399,7 @@ impl PipeContext {
 
     pub fn new() -> Self {
         Self {
-            items: vec![PipeContextItem::Handlers(false)],
+            items: vec![PipeContextItem::Handlers],
         }
     }
 
@@ -386,8 +411,8 @@ impl PipeContext {
         self.items.clone()
     }
 
-    pub fn use_handlers(&mut self, allow_cors: bool) {
-        self.items.push(PipeContextItem::Handlers(allow_cors));
+    pub fn use_handlers(&mut self) {
+        self.items.push(PipeContextItem::Handlers);
     }
 
     pub fn use_location_route(
@@ -750,7 +775,7 @@ impl PipeContext {
 
         for (_idx, item) in self2.items.iter().enumerate().skip(skip) {
             match item {
-                PipeContextItem::Handlers(allow_cors) => {
+                PipeContextItem::Handlers => {
                     let handler_ref = HANDLERS_FLAT
                         .get(&(&req.url_path[..], req.method))
                         .map(|p| p.handler);
@@ -805,12 +830,7 @@ impl PipeContext {
                                     .into()
                             };
 
-                            res2.add_header("Allow".into(), methods_str.clone());
-                            if *allow_cors {
-                                res2.add_header("Access-Control-Allow-Origin".into(), "*".into());
-                                res2.add_header("Access-Control-Allow-Methods".into(), methods_str);
-                                res2.add_header("Access-Control-Allow-Headers".into(), "*".into());
-                            }
+                            res2.add_header("Allow".into(), methods_str);
                             return res2;
                         } else {
                             continue;

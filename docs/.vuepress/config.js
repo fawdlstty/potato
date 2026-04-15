@@ -33,8 +33,8 @@ export default defineUserConfig({
         ],
         sidebar: {
           '/guide/': [
-            "00_introduction", "01_hello_world", "02_method_annotation", "03_method_declare",
-            "04_server_route", "05_graceful_shutdown", "06_client", "07_sse", "08_acme"
+            "00_introduction", "01_hello_world", "02_method_annotation",
+            "03_server_route", "04_graceful_shutdown", "05_client", "06_sse", "07_acme", "08_webtransport"
           ]
         }
       },
@@ -53,8 +53,8 @@ export default defineUserConfig({
         ],
         sidebar: {
           '/en/guide/': [
-            "00_introduction", "01_hello_world", "02_method_annotation", "03_method_declare",
-            "04_server_route", "05_graceful_shutdown", "06_client", "07_sse", "08_acme"
+            "00_introduction", "01_hello_world", "02_method_annotation",
+            "03_server_route", "04_graceful_shutdown", "05_client", "06_sse", "07_acme"
           ]
         }
       }

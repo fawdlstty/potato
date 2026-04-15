@@ -14,8 +14,8 @@ fn get_test_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use potato::utils::enums::HttpConnection;
     use potato::server::PipeContext;
+    use potato::utils::enums::HttpConnection;
     use potato::{HttpMethod, HttpRequest, HttpResponse, HttpServer};
     use std::borrow::Cow;
     use std::collections::HashMap;
@@ -251,7 +251,7 @@ mod tests {
         // 测试 configure 方法
         server.configure(|ctx| {
             // 这个配置可以成功应用
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         println!("✅ Server created and configured for: {}", server_addr);
@@ -322,7 +322,7 @@ mod tests {
 
         // 配置选项1: 禁用处理器
         server.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         println!("✅ Server configuration: handlers disabled");
@@ -330,7 +330,7 @@ mod tests {
         // 配置选项2: OpenAPI (如果启用)
         let mut server2 = HttpServer::new(&format!("127.0.0.1:{}", get_test_port()));
         server2.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
             // ctx.use_openapi("/doc/"); // 仅在 openapi 特性启用时
         });
 
@@ -1665,7 +1665,10 @@ mod tests {
         let res = PipeContext::handle_request(&ctx, &mut req, 0).await;
 
         assert_eq!(res.http_code, 500);
-        assert_eq!(String::from_utf8(response_body_data(res))?, "url path over directory");
+        assert_eq!(
+            String::from_utf8(response_body_data(res))?,
+            "url path over directory"
+        );
 
         _ = fs::remove_dir_all(temp_dir);
         Ok(())

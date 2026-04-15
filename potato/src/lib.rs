@@ -7,6 +7,9 @@ pub mod utils;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
 
+// 导出CORS配置
+pub use server::CorsConfig;
+
 pub use client::*;
 pub use global_config::*;
 pub use hipstr;

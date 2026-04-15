@@ -1,4 +1,4 @@
-# 处理函数标注
+# 处理函数标注与声明
 
 函数标注为服务器端处理函数专用，用于指定处理函数的HTTP方法和路径。当前支持六种，分别为：
 
@@ -37,6 +37,53 @@ ServerConfig::set_jwt_secret("AAABBBCCC").await;
 
 当函数标注鉴权参数后，鉴权不通过，会返回401状态码，且不会实际调用处理函数。
 
+## 参数
+
+参数可以直接接受请求对象，也可以定义自定义请求参数，这请求参数将要求HTTP请求的query string或者body附带此值。示例请求对象：
+
+```rust
+#[potato::http_get("/hello")]
+async fn hello(req: &mut HttpRequest) -> HttpResponse {
+    HttpResponse::html("hello world")
+}
+
+#[potato::http_get("/hello")]
+async fn hello2(req: &mut HttpRequest) -> anyhow::Result<HttpResponse> {
+    let addr = req.get_client_addr().await?;
+    Ok(HttpResponse::html(format!("hello client: {addr:?}")))
+}
+```
+
+下面是一个websocket服务器端示例代码：
+
+```rust
+#[potato::http_get("/ws")]
+async fn websocket(req: &mut HttpRequest) -> anyhow::Result<()> {
+    let mut ws = req.upgrade_websocket().await?;
+    ws.send_ping().await?;
+    loop {
+        match ws.recv().await? {
+            WsFrame::Text(text) => ws.send_text(&text).await?,
+            WsFrame::Binary(bin) => ws.send_binary(bin).await?,
+        }
+    }
+}
+```
+
+另外就是处理函数的参数了。除了前文提到的鉴权用的参数外，剩余的均要求通过请求的query里或body里附带。示例：
+
+```rust
+#[potato::http_get("/hello_user")]
+async fn hello_user(name: String) -> HttpResponse {
+    HttpResponse::html(format!("hello {name}"))
+}
+
+#[potato::http_post("/upload")]
+async fn upload(file1: PostFile) -> HttpResponse {
+    HttpResponse::html(format!("file[{}] len: {}", file1.filename, file1.data.len()))
+}
+```
+
 ## 返回类型
 
 处理函数支持多种返回类型：
@@ -74,9 +121,59 @@ async fn result_handler(success: bool) -> anyhow::Result<String> {
 }
 ```
 
+## 响应头标注
+
+可通过 `#[header(...)]` 为处理函数添加响应头，支持标准头和自定义头：
+
+```rust
+// 标准头（使用下划线命名）
+#[potato::http_get("/api")]
+#[header(Cache_Control = "no-cache")]
+async fn api_handler() -> HttpResponse {
+    HttpResponse::text("response")
+}
+
+// 自定义头（使用 Custom 语法）
+#[potato::http_get("/custom")]
+#[header(Custom("X-Custom-Header") = "custom-value")]
+async fn custom_header() -> String {
+    "custom header".to_string()
+}
+
+// 多个header混合使用
+#[potato::http_get("/multi")]
+#[header(Cache_Control = "no-store")]
+#[header(Custom("X-Custom") = "value")]
+async fn multi_headers() -> String {
+    "multiple headers".to_string()
+}
+```
+
 ## 预处理与后处理
 
 可以在处理函数上叠加 `preprocess`、`postprocess` 标注，用于在处理函数前后执行固定签名的钩子函数。
+
+`preprocess` 与 `postprocess` 都支持 `async fn` 或普通 `fn`。
+
+预处理函数签名固定为：
+
+```rust
+#[potato::preprocess]
+fn pre(req: &mut potato::HttpRequest) -> ...
+```
+
+可选返回类型：`anyhow::Result<Option<potato::HttpResponse>>`、`Option<potato::HttpResponse>`、`anyhow::Result<()>`、`()`
+
+后处理函数签名固定为：
+
+```rust
+#[potato::postprocess]
+fn post(req: &mut potato::HttpRequest, res: &mut potato::HttpResponse) -> ...
+```
+
+可选返回类型：`anyhow::Result<()>`、`()`
+
+示例：
 
 ```rust
 #[potato::preprocess]
@@ -98,6 +195,77 @@ async fn hello() -> potato::HttpResponse {
 }
 ```
 
+同一个 handler 上可重复标注多行，例如：
+
+```rust
+#[potato::preprocess(pre1)]
+#[potato::preprocess(pre2, pre3)]
+#[potato::postprocess(post1)]
+#[potato::postprocess(post2)]
+```
+
 - `preprocess` 按声明顺序执行；若某个预处理返回 `HttpResponse`，会跳过实际 handler，但仍会继续执行 `postprocess`。
 - `postprocess` 按声明顺序执行，接收最终 `HttpResponse` 并可原地修改。
-- `preprocess`/`postprocess` 支持拆分多行声明，顺序按“从左到右、从上到下”执行。
+- `preprocess`/`postprocess` 支持拆分多行声明，顺序按"从左到右、从上到下"执行。
+
+## CORS标注
+
+通过 `#[potato::cors(...)]` 为处理函数启用CORS（跨域资源共享）支持。该标注会自动添加CORS响应头，并为PUT/POST/DELETE方法自动生成HEAD方法支持。
+
+### 基本用法
+
+```rust
+// 最简用法：使用最小限制默认值
+// - Access-Control-Allow-Origin: *
+// - Access-Control-Allow-Headers: *
+// - Access-Control-Allow-Methods: 自动计算
+// - Access-Control-Max-Age: 86400
+#[potato::http_get("/api/data")]
+#[potato::cors]
+async fn get_data() -> &'static str {
+    "data"
+}
+```
+
+### 自定义配置
+
+```rust
+// 限制来源和方法
+#[potato::http_post("/api/create")]
+#[potato::cors(
+    origin = "https://example.com",
+    methods = "GET,POST,PUT,DELETE",
+    headers = "Content-Type,Authorization",
+    max_age = "3600"
+)]
+async fn create_item() -> &'static str {
+    "created"
+}
+
+// 允许携带凭证（cookies）
+#[potato::http_put("/api/update")]
+#[potato::cors(
+    origin = "https://secure.example.com",
+    methods = "GET,PUT",
+    credentials = true
+)]
+async fn update_item() -> &'static str {
+    "updated"
+}
+```
+
+### 参数说明
+
+- `origin`: 允许的来源域名，默认 `*`（允许所有）
+- `methods`: 允许的方法列表，默认自动计算（扫描所有已注册方法）
+- `headers`: 允许的请求头，默认 `*`（允许所有）
+- `max_age`: 预检请求缓存时间（秒），默认 `86400`（24小时）
+- `credentials`: 是否允许携带凭证（cookies），默认 `false`
+- `expose_headers`: 允许浏览器访问的响应头
+
+### 智能特性
+
+- **自动HEAD支持**：PUT/POST/DELETE方法标注cors后，自动生成对应的HEAD方法处理
+- **自动OPTIONS处理**：CORS预检请求自动返回正确的允许方法列表
+- **方法补充**：指定的methods会自动补充HEAD和OPTIONS
+- **凭证模式约束**：当`credentials=true`时，origin不能使用`*`，必须指定具体域名

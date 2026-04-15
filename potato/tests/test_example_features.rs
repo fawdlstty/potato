@@ -508,7 +508,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         let server_handle = tokio::spawn(async move {
@@ -542,7 +542,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         let server_handle = tokio::spawn(async move {
@@ -577,7 +577,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         let server_handle = tokio::spawn(async move {
@@ -625,7 +625,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
             ctx.use_openapi("/doc/");
         });
 
@@ -716,7 +716,7 @@ mod tests {
             // 这里使用 embed_dir! 宏生成嵌入资源
             // 由于测试环境限制，我们使用占位符测试 API 可用性
             // ctx.use_embedded_route("/", embed_dir!("../swagger_res"));
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         let server_handle = tokio::spawn(async move {
@@ -753,7 +753,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         // 启动服务器用于测试
@@ -798,7 +798,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         // 定义 WebSocket 处理器 - 使用宏在服务器内部
@@ -894,7 +894,7 @@ mod tests {
                     Some(HttpResponse::text("custom middleware async"))
                 })
             });
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         let server_handle = tokio::spawn(async move {
@@ -958,7 +958,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         let server_handle = tokio::spawn(async move {
@@ -1024,7 +1024,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         let server_handle = tokio::spawn(async move {
@@ -1072,7 +1072,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
-            ctx.use_handlers(false);
+            ctx.use_handlers();
         });
 
         let server_handle = tokio::spawn(async move {
