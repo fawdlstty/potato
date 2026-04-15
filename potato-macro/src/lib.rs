@@ -396,6 +396,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let mut root_fn = syn::parse_macro_input!(input as syn::ItemFn);
     let mut fn_headers: Vec<(String, String)> = Vec::new();
     let mut cors_config: Option<CorsAttrConfig> = None;
+    let mut max_concurrency: Option<usize> = None;
     let mut remaining_attrs = Vec::new();
 
     for attr in root_fn.attrs.iter() {
@@ -458,6 +459,65 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     credentials: false,
                     expose_headers: None,
                 });
+            }
+            continue;
+        }
+
+        // 检查是否是 max_concurrency 标注
+        let is_max_concurrency_attr = attr.path().is_ident("max_concurrency")
+            || (attr.path().segments.len() == 2
+                && attr
+                    .path()
+                    .segments
+                    .iter()
+                    .next()
+                    .map(|s| s.ident.to_string())
+                    == Some("potato".to_string())
+                && attr
+                    .path()
+                    .segments
+                    .iter()
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    == Some("max_concurrency".to_string()));
+
+        if is_max_concurrency_attr {
+            if let syn::Meta::List(meta_list) = &attr.meta {
+                let tokens = &meta_list.tokens;
+                // 直接解析为数字
+                if let Ok(lit_int) = syn::parse2::<syn::LitInt>(tokens.clone()) {
+                    if let Ok(val) = lit_int.base10_parse::<usize>() {
+                        if val == 0 {
+                            panic!("max_concurrency must be greater than 0");
+                        }
+                        max_concurrency = Some(val);
+                    } else {
+                        panic!("invalid max_concurrency value");
+                    }
+                } else {
+                    panic!(
+                        "max_concurrency requires a numeric value, e.g., #[max_concurrency(10)]"
+                    );
+                }
+            } else if let syn::Meta::NameValue(name_value) = &attr.meta {
+                if let syn::Expr::Lit(expr_lit) = &name_value.value {
+                    if let syn::Lit::Int(lit_int) = &expr_lit.lit {
+                        if let Ok(val) = lit_int.base10_parse::<usize>() {
+                            if val == 0 {
+                                panic!("max_concurrency must be greater than 0");
+                            }
+                            max_concurrency = Some(val);
+                        } else {
+                            panic!("invalid max_concurrency value");
+                        }
+                    } else {
+                        panic!("max_concurrency requires a numeric value");
+                    }
+                } else {
+                    panic!("max_concurrency requires a numeric value");
+                }
+            } else {
+                panic!("max_concurrency requires a numeric value, e.g., #[max_concurrency(10)]");
             }
             continue;
         }
@@ -845,67 +905,161 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         None
     };
 
+    // 如果指定了max_concurrency,生成静态信号量
+    let semaphore_static = if let Some(max_conn) = max_concurrency {
+        let semaphore_name =
+            format_ident!("__POTATO_SEMAPHORE_{}", fn_name.to_string().to_uppercase());
+        Some(quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            static #semaphore_name: std::sync::LazyLock<tokio::sync::Semaphore> =
+                std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(#max_conn));
+        })
+    } else {
+        None
+    };
+
     let wrap_func_body = if is_async {
-        quote! {
-            let mut __potato_pre_response: Option<potato::HttpResponse> = None;
-            #(
-                if __potato_pre_response.is_none() {
-                    __potato_pre_response = match #preprocess_adapters(req).await {
-                        Ok(Some(ret)) => Some(ret),
-                        Ok(None) => None,
-                        Err(err) => Some(potato::HttpResponse::error(format!("{err:?}"))),
-                    };
-                }
-            )*
+        if let Some(_) = max_concurrency {
+            let semaphore_name =
+                format_ident!("__POTATO_SEMAPHORE_{}", fn_name.to_string().to_uppercase());
+            quote! {
+                let __potato_permit = #semaphore_name.acquire().await;
 
-            let mut __potato_response = match __potato_pre_response {
-                Some(ret) => ret,
-                None => #handler_wrap_func_body,
-            };
+                let mut __potato_pre_response: Option<potato::HttpResponse> = None;
+                #(
+                    if __potato_pre_response.is_none() {
+                        __potato_pre_response = match #preprocess_adapters(req).await {
+                            Ok(Some(ret)) => Some(ret),
+                            Ok(None) => None,
+                            Err(err) => Some(potato::HttpResponse::error(format!("{err:?}"))),
+                        };
+                    }
+                )*
 
-            #(
-                if let Err(err) = #postprocess_adapters(req, &mut __potato_response).await {
-                    return potato::HttpResponse::error(format!("{err:?}"));
-                }
-            )*
+                let mut __potato_response = match __potato_pre_response {
+                    Some(ret) => ret,
+                    None => #handler_wrap_func_body,
+                };
 
-            #add_headers_code
-            #cors_headers_code
+                #(
+                    if let Err(err) = #postprocess_adapters(req, &mut __potato_response).await {
+                        drop(__potato_permit);
+                        return potato::HttpResponse::error(format!("{err:?}"));
+                    }
+                )*
 
-            __potato_response
+                #add_headers_code
+                #cors_headers_code
+
+                drop(__potato_permit);
+                __potato_response
+            }
+        } else {
+            quote! {
+                let mut __potato_pre_response: Option<potato::HttpResponse> = None;
+                #(
+                    if __potato_pre_response.is_none() {
+                        __potato_pre_response = match #preprocess_adapters(req).await {
+                            Ok(Some(ret)) => Some(ret),
+                            Ok(None) => None,
+                            Err(err) => Some(potato::HttpResponse::error(format!("{err:?}"))),
+                        };
+                    }
+                )*
+
+                let mut __potato_response = match __potato_pre_response {
+                    Some(ret) => ret,
+                    None => #handler_wrap_func_body,
+                };
+
+                #(
+                    if let Err(err) = #postprocess_adapters(req, &mut __potato_response).await {
+                        return potato::HttpResponse::error(format!("{err:?}"));
+                    }
+                )*
+
+                #add_headers_code
+                #cors_headers_code
+
+                __potato_response
+            }
         }
     } else {
-        quote! {
-            let mut __potato_pre_response: Option<potato::HttpResponse> = None;
-            #(
-                if __potato_pre_response.is_none() {
-                    __potato_pre_response = match tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(#preprocess_adapters(req))
+        if let Some(_) = max_concurrency {
+            let semaphore_name =
+                format_ident!("__POTATO_SEMAPHORE_{}", fn_name.to_string().to_uppercase());
+            quote! {
+                let __potato_permit = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(#semaphore_name.acquire())
+                });
+
+                let mut __potato_pre_response: Option<potato::HttpResponse> = None;
+                #(
+                    if __potato_pre_response.is_none() {
+                        __potato_pre_response = match tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(#preprocess_adapters(req))
+                        }) {
+                            Ok(Some(ret)) => Some(ret),
+                            Ok(None) => None,
+                            Err(err) => Some(potato::HttpResponse::error(format!("{err:?}"))),
+                        };
+                    }
+                )*
+
+                let mut __potato_response = match __potato_pre_response {
+                    Some(ret) => ret,
+                    None => #handler_wrap_func_body,
+                };
+
+                #(
+                    if let Err(err) = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(#postprocess_adapters(req, &mut __potato_response))
                     }) {
-                        Ok(Some(ret)) => Some(ret),
-                        Ok(None) => None,
-                        Err(err) => Some(potato::HttpResponse::error(format!("{err:?}"))),
-                    };
-                }
-            )*
+                        drop(__potato_permit);
+                        return potato::HttpResponse::error(format!("{err:?}"));
+                    }
+                )*
 
-            let mut __potato_response = match __potato_pre_response {
-                Some(ret) => ret,
-                None => #handler_wrap_func_body,
-            };
+                #add_headers_code
+                #cors_headers_code
 
-            #(
-                if let Err(err) = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(#postprocess_adapters(req, &mut __potato_response))
-                }) {
-                    return potato::HttpResponse::error(format!("{err:?}"));
-                }
-            )*
+                drop(__potato_permit);
+                __potato_response
+            }
+        } else {
+            quote! {
+                let mut __potato_pre_response: Option<potato::HttpResponse> = None;
+                #(
+                    if __potato_pre_response.is_none() {
+                        __potato_pre_response = match tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(#preprocess_adapters(req))
+                        }) {
+                            Ok(Some(ret)) => Some(ret),
+                            Ok(None) => None,
+                            Err(err) => Some(potato::HttpResponse::error(format!("{err:?}"))),
+                        };
+                    }
+                )*
 
-            #add_headers_code
-            #cors_headers_code
+                let mut __potato_response = match __potato_pre_response {
+                    Some(ret) => ret,
+                    None => #handler_wrap_func_body,
+                };
 
-            __potato_response
+                #(
+                    if let Err(err) = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(#postprocess_adapters(req, &mut __potato_response))
+                    }) {
+                        return potato::HttpResponse::error(format!("{err:?}"));
+                    }
+                )*
+
+                #add_headers_code
+                #cors_headers_code
+
+                __potato_response
+            }
         }
     };
 
@@ -914,6 +1068,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             #root_fn
 
             #auto_head_handler
+
+            #semaphore_static
 
             #[doc(hidden)]
             async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
@@ -938,6 +1094,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             #root_fn
 
             #auto_head_handler
+
+            #semaphore_static
 
             #[doc(hidden)]
             fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
