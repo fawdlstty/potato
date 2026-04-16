@@ -15,7 +15,9 @@ async fn shutdown() -> potato::HttpResponse {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut server = potato::HttpServer::new("0.0.0.0:8080");
-    *SHUTDOWN_SIGNAL.lock().await = Some(server.shutdown_signal());
+    if let Some(tx) = server.shutdown_signal() {
+        *SHUTDOWN_SIGNAL.lock().await = Some(tx);
+    }
     println!("visit: http://127.0.0.1:8080/shutdown");
     server.serve_http().await
 }

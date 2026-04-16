@@ -25,6 +25,7 @@ use std::time::UNIX_EPOCH;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::sync::{oneshot, Mutex};
+use tokio::time::{interval, Duration};
 #[cfg(any(feature = "tls", feature = "http3"))]
 use tokio_rustls::rustls;
 #[cfg(any(feature = "tls", feature = "http3"))]
@@ -133,6 +134,7 @@ impl Clone for PipeContextItem {
             PipeContextItem::Webdav(v) => PipeContextItem::Webdav(v.clone()),
             #[cfg(feature = "http3")]
             PipeContextItem::WebTransport(_) => {
+                // WebTransport cannot be cloned, so we panic to indicate misuse
                 panic!("WebTransport handler cannot be cloned")
             }
             #[cfg(feature = "webrtc")]
@@ -564,9 +566,14 @@ impl PipeContext {
     fn openapi_index_json() -> String {
         use crate::utils::number::HttpCodeExt;
         let mut any_use_auth = false;
+        static AUTHOR_REGEX: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
+            std::sync::LazyLock::new(|| regex::Regex::new(r"([[:word:]]+)\s*<([^>]+)>"));
         let contact = {
-            let re = regex::Regex::new(r"([[:word:]]+)\s*<([^>]+)>").unwrap();
-            match re.captures(env!("CARGO_PKG_AUTHORS")) {
+            match AUTHOR_REGEX
+                .as_ref()
+                .ok()
+                .and_then(|re| re.captures(env!("CARGO_PKG_AUTHORS")))
+            {
                 Some(caps) => {
                     let name = caps.get(1).map_or("", |m| m.as_str());
                     let email = caps.get(2).map_or("", |m| m.as_str());
@@ -1296,19 +1303,40 @@ impl HttpServer {
         }
     }
 
+    /// 启动后台SessionCache清理任务
+    /// 该任务会定期清理过期的session缓存
+    fn start_session_cache_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
+
+        // 确保只启动一次
+        if CLEANUP_STARTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        tokio::spawn(async {
+            let mut interval = interval(Duration::from_secs(60)); // 每60秒清理一次
+            loop {
+                interval.tick().await;
+                // 调用SessionCache的清理方法
+                crate::SessionCache::cleanup_expired_sessions();
+            }
+        });
+    }
+
     pub fn configure(&mut self, callback: impl Fn(&mut PipeContext)) {
         let mut ctx = PipeContext::empty();
         callback(&mut ctx);
         self.pipe_ctx = Arc::new(ctx);
     }
 
-    pub fn shutdown_signal(&mut self) -> oneshot::Sender<()> {
-        let (tx, rx) = oneshot::channel();
+    pub fn shutdown_signal(&mut self) -> Option<oneshot::Sender<()>> {
         if self.shutdown_signal.is_some() {
-            panic!("shutdown signal already set");
+            return None; // Signal already set
         }
+        let (tx, rx) = oneshot::channel();
         self.shutdown_signal = Some(rx);
-        tx
+        Some(tx)
     }
 
     pub async fn serve_http(&mut self) -> anyhow::Result<()> {
@@ -1529,6 +1557,9 @@ impl HttpServer {
     async fn serve_http_impl(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "jemalloc")]
         crate::init_jemalloc()?;
+
+        // 启动后台SessionCache清理任务
+        Self::start_session_cache_cleanup();
 
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;

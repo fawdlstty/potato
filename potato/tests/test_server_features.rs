@@ -290,7 +290,9 @@ mod tests {
         let mut server = HttpServer::new(&server_addr);
 
         // 获取关闭信号
-        let shutdown_tx = server.shutdown_signal();
+        let shutdown_tx = server
+            .shutdown_signal()
+            .expect("Failed to get shutdown signal");
 
         let server_handle = tokio::spawn(async move {
             // 服务器会在收到关闭信号时退出
@@ -392,11 +394,16 @@ mod tests {
         let mut server = HttpServer::new(&server_addr);
 
         // 第一次获取应该成功
-        let _shutdown_tx = server.shutdown_signal();
+        let _shutdown_tx = server
+            .shutdown_signal()
+            .expect("First shutdown signal should succeed");
 
-        // 第二次获取应该 panic（在注释中说明）
-        // 取消注释下行会导致 panic: "shutdown signal already set"
-        // let _shutdown_tx2 = server.shutdown_signal();
+        // 第二次获取应该返回 None
+        let second_signal = server.shutdown_signal();
+        assert!(
+            second_signal.is_none(),
+            "Second shutdown signal should return None"
+        );
 
         println!("✅ Shutdown signal correctly allows only one acquisition");
         Ok(())

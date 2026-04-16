@@ -21,7 +21,7 @@ struct CorsAttrConfig {
 
 /// 解析CORS属性
 fn parse_cors_attr(tokens: &proc_macro2::TokenStream) -> CorsAttrConfig {
-    let mut config = CorsAttrConfig {
+    let config = CorsAttrConfig {
         origin: None,
         methods: None,
         headers: None,
@@ -190,20 +190,44 @@ fn collect_handler_hooks(root_fn: &mut syn::ItemFn) -> (Vec<Ident>, Vec<Ident>) 
     (preprocess_fns, postprocess_fns)
 }
 
-fn validate_preprocess_signature(root_fn: &syn::ItemFn) -> String {
-    if root_fn.sig.inputs.len() != 1 {
-        panic!("`preprocess` function must accept exactly one argument");
+fn validate_preprocess_signature(root_fn: &syn::ItemFn) -> (String, bool, bool) {
+    if root_fn.sig.inputs.len() < 1 || root_fn.sig.inputs.len() > 3 {
+        panic!("`preprocess` function must accept one to three arguments");
     }
-    let arg = root_fn.sig.inputs.first().unwrap();
-    let arg_type_str = match arg {
-        syn::FnArg::Typed(arg) => arg.ty.to_token_stream().to_string().type_simplify(),
-        _ => panic!("`preprocess` function does not support receiver argument"),
-    };
-    if arg_type_str != "& mut HttpRequest" {
+    let mut arg_types = vec![];
+    for arg in root_fn.sig.inputs.iter() {
+        match arg {
+            syn::FnArg::Typed(arg) => {
+                arg_types.push(arg.ty.to_token_stream().to_string().type_simplify())
+            }
+            _ => panic!("`preprocess` function does not support receiver argument"),
+        }
+    }
+    if arg_types[0] != "& mut HttpRequest" {
         panic!(
-            "`preprocess` argument type must be `&mut potato::HttpRequest`, got `{arg_type_str}`"
+            "`preprocess` first argument type must be `&mut potato::HttpRequest`, got `{}`",
+            arg_types[0]
         );
     }
+
+    let has_once_cache = arg_types.iter().any(|t| t == "& mut OnceCache");
+    let has_session_cache = arg_types.iter().any(|t| t == "& mut SessionCache");
+
+    if arg_types.len() == 2 && !has_once_cache && !has_session_cache {
+        panic!(
+            "`preprocess` second argument type must be `&mut potato::OnceCache` or `&mut potato::SessionCache`, got `{}`",
+            arg_types[1]
+        );
+    }
+    if arg_types.len() == 3 {
+        if !has_once_cache {
+            panic!("`preprocess` must have `&mut potato::OnceCache` as one of the arguments");
+        }
+        if !has_session_cache {
+            panic!("`preprocess` must have `&mut potato::SessionCache` as one of the arguments");
+        }
+    }
+
     let ret_type = root_fn
         .sig
         .output
@@ -216,12 +240,12 @@ fn validate_preprocess_signature(root_fn: &syn::ItemFn) -> String {
             "unsupported `preprocess` return type: `{ret_type}`, expected `anyhow::Result<Option<potato::HttpResponse>>`, `Option<potato::HttpResponse>`, `anyhow::Result<()>`, or `()`"
         ),
     }
-    ret_type
+    (ret_type, has_once_cache, has_session_cache)
 }
 
-fn validate_postprocess_signature(root_fn: &syn::ItemFn) -> String {
-    if root_fn.sig.inputs.len() != 2 {
-        panic!("`postprocess` function must accept exactly two arguments");
+fn validate_postprocess_signature(root_fn: &syn::ItemFn) -> (String, bool, bool) {
+    if root_fn.sig.inputs.len() < 2 && root_fn.sig.inputs.len() > 4 {
+        panic!("`postprocess` function must accept two to four arguments");
     }
     let mut arg_types = vec![];
     for arg in root_fn.sig.inputs.iter() {
@@ -244,6 +268,27 @@ fn validate_postprocess_signature(root_fn: &syn::ItemFn) -> String {
             arg_types[1]
         );
     }
+
+    let remaining_args = &arg_types[2..];
+    let has_once_cache = remaining_args.iter().any(|t| t == "& mut OnceCache");
+    let has_session_cache = remaining_args.iter().any(|t| t == "& mut SessionCache");
+
+    if arg_types.len() == 3 {
+        if !has_once_cache && !has_session_cache {
+            panic!(
+                "`postprocess` third argument must be `&mut potato::OnceCache` or `&mut potato::SessionCache`, got `{}`",
+                arg_types[2]
+            );
+        }
+    }
+    if arg_types.len() == 4 {
+        if !has_once_cache || !has_session_cache {
+            panic!(
+                "`postprocess` with 4 arguments must have both `&mut potato::OnceCache` and `&mut potato::SessionCache`"
+            );
+        }
+    }
+
     let ret_type = root_fn
         .sig
         .output
@@ -256,7 +301,7 @@ fn validate_postprocess_signature(root_fn: &syn::ItemFn) -> String {
             "unsupported `postprocess` return type: `{ret_type}`, expected `anyhow::Result<()>` or `()`"
         ),
     }
-    ret_type
+    (ret_type, has_once_cache, has_session_cache)
 }
 
 fn preprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
@@ -266,37 +311,142 @@ fn preprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
     let root_fn = syn::parse_macro_input!(input as syn::ItemFn);
     let fn_name = root_fn.sig.ident.clone();
     let wrap_name = format_ident!("__potato_preprocess_adapter_{}", fn_name);
+    let wrap_name_inner = format_ident!("__potato_preprocess_adapter_inner_{}", fn_name);
     let is_async = root_fn.sig.asyncness.is_some();
-    let ret_type = validate_preprocess_signature(&root_fn);
-    let body = if is_async {
+    let (ret_type, has_once_cache, has_session_cache) = validate_preprocess_signature(&root_fn);
+
+    // 根据是否需要缓存生成不同的函数签名
+    let wrap_signature = match (has_once_cache, has_session_cache) {
+        (true, true) => quote! {
+            async fn #wrap_name_inner(
+                req: &mut potato::HttpRequest,
+                once_cache: &mut potato::OnceCache,
+                session_cache: &mut potato::SessionCache,
+            ) -> anyhow::Result<Option<potato::HttpResponse>>
+        },
+        (true, false) => quote! {
+            async fn #wrap_name_inner(
+                req: &mut potato::HttpRequest,
+                once_cache: &mut potato::OnceCache,
+            ) -> anyhow::Result<Option<potato::HttpResponse>>
+        },
+        (false, true) => quote! {
+            async fn #wrap_name_inner(
+                req: &mut potato::HttpRequest,
+                session_cache: &mut potato::SessionCache,
+            ) -> anyhow::Result<Option<potato::HttpResponse>>
+        },
+        (false, false) => quote! {
+            async fn #wrap_name_inner(
+                req: &mut potato::HttpRequest,
+            ) -> anyhow::Result<Option<potato::HttpResponse>>
+        },
+    };
+
+    // 根据实际使用情况调用函数
+    let call_body = if is_async {
         match &ret_type[..] {
-            "Result<Option<HttpResponse>>" => quote! { #fn_name(req).await },
-            "Option<HttpResponse>" => quote! { Ok(#fn_name(req).await) },
-            "Result<()>" => quote! { #fn_name(req).await.map(|_| None) },
-            "()" => quote! {
-                #fn_name(req).await;
-                Ok(None)
+            "Result<Option<HttpResponse>>" => match (has_once_cache, has_session_cache) {
+                (true, true) => {
+                    quote! { #fn_name(req, once_cache, session_cache).await }
+                }
+                (true, false) => quote! { #fn_name(req, once_cache).await },
+                (false, true) => quote! { #fn_name(req, session_cache).await },
+                (false, false) => quote! { #fn_name(req).await },
+            },
+            "Option<HttpResponse>" => match (has_once_cache, has_session_cache) {
+                (true, true) => quote! { Ok(#fn_name(req, once_cache, session_cache).await) },
+                (true, false) => quote! { Ok(#fn_name(req, once_cache).await) },
+                (false, true) => quote! { Ok(#fn_name(req, session_cache).await) },
+                (false, false) => quote! { Ok(#fn_name(req).await) },
+            },
+            "Result<()>" => match (has_once_cache, has_session_cache) {
+                (true, true) => {
+                    quote! { #fn_name(req, once_cache, session_cache).await.map(|_| None) }
+                }
+                (true, false) => quote! { #fn_name(req, once_cache).await.map(|_| None) },
+                (false, true) => quote! { #fn_name(req, session_cache).await.map(|_| None) },
+                (false, false) => quote! { #fn_name(req).await.map(|_| None) },
+            },
+            "()" => match (has_once_cache, has_session_cache) {
+                (true, true) => quote! { #fn_name(req, once_cache, session_cache).await; Ok(None) },
+                (true, false) => quote! { #fn_name(req, once_cache).await; Ok(None) },
+                (false, true) => quote! { #fn_name(req, session_cache).await; Ok(None) },
+                (false, false) => quote! { #fn_name(req).await; Ok(None) },
             },
             _ => unreachable!(),
         }
     } else {
         match &ret_type[..] {
-            "Result<Option<HttpResponse>>" => quote! { #fn_name(req) },
-            "Option<HttpResponse>" => quote! { Ok(#fn_name(req)) },
-            "Result<()>" => quote! { #fn_name(req).map(|_| None) },
-            "()" => quote! {
-                #fn_name(req);
-                Ok(None)
+            "Result<Option<HttpResponse>>" => match (has_once_cache, has_session_cache) {
+                (true, true) => quote! { #fn_name(req, once_cache, session_cache) },
+                (true, false) => quote! { #fn_name(req, once_cache) },
+                (false, true) => quote! { #fn_name(req, session_cache) },
+                (false, false) => quote! { #fn_name(req) },
+            },
+            "Option<HttpResponse>" => match (has_once_cache, has_session_cache) {
+                (true, true) => quote! { Ok(#fn_name(req, once_cache, session_cache)) },
+                (true, false) => quote! { Ok(#fn_name(req, once_cache)) },
+                (false, true) => quote! { Ok(#fn_name(req, session_cache)) },
+                (false, false) => quote! { Ok(#fn_name(req)) },
+            },
+            "Result<()>" => match (has_once_cache, has_session_cache) {
+                (true, true) => quote! { #fn_name(req, once_cache, session_cache).map(|_| None) },
+                (true, false) => quote! { #fn_name(req, once_cache).map(|_| None) },
+                (false, true) => quote! { #fn_name(req, session_cache).map(|_| None) },
+                (false, false) => quote! { #fn_name(req).map(|_| None) },
+            },
+            "()" => match (has_once_cache, has_session_cache) {
+                (true, true) => quote! { #fn_name(req, once_cache, session_cache); Ok(None) },
+                (true, false) => quote! { #fn_name(req, once_cache); Ok(None) },
+                (false, true) => quote! { #fn_name(req, session_cache); Ok(None) },
+                (false, false) => quote! { #fn_name(req); Ok(None) },
             },
             _ => unreachable!(),
         }
     };
+
+    // 生成wrapper函数，根据cache需求调用inner函数
+    let wrapper_body = match (has_once_cache, has_session_cache) {
+        (true, true) => quote! {
+            #wrap_name_inner(
+                req,
+                once_cache.expect("OnceCache required but not provided"),
+                session_cache.expect("SessionCache required but not provided"),
+            ).await
+        },
+        (true, false) => quote! {
+            #wrap_name_inner(
+                req,
+                once_cache.expect("OnceCache required but not provided"),
+            ).await
+        },
+        (false, true) => quote! {
+            #wrap_name_inner(
+                req,
+                session_cache.expect("SessionCache required but not provided"),
+            ).await
+        },
+        (false, false) => quote! {
+            #wrap_name_inner(req).await
+        },
+    };
+
     quote! {
         #root_fn
 
         #[doc(hidden)]
-        async fn #wrap_name(req: &mut potato::HttpRequest) -> anyhow::Result<Option<potato::HttpResponse>> {
-            #body
+        #wrap_signature {
+            #call_body
+        }
+
+        #[doc(hidden)]
+        pub async fn #wrap_name(
+            req: &mut potato::HttpRequest,
+            once_cache: Option<&mut potato::OnceCache>,
+            session_cache: Option<&mut potato::SessionCache>,
+        ) -> anyhow::Result<Option<potato::HttpResponse>> {
+            #wrapper_body
         }
     }
     .into()
@@ -309,33 +459,182 @@ fn postprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
     let root_fn = syn::parse_macro_input!(input as syn::ItemFn);
     let fn_name = root_fn.sig.ident.clone();
     let wrap_name = format_ident!("__potato_postprocess_adapter_{}", fn_name);
+    let wrap_name_inner = format_ident!("__potato_postprocess_adapter_inner_{}", fn_name);
     let is_async = root_fn.sig.asyncness.is_some();
-    let ret_type = validate_postprocess_signature(&root_fn);
-    let body = if is_async {
+    let (ret_type, has_once_cache, has_session_cache) = validate_postprocess_signature(&root_fn);
+
+    // 根据是否需要缓存生成不同的函数签名
+    let wrap_signature = match (has_once_cache, has_session_cache) {
+        (true, true) => quote! {
+            async fn #wrap_name_inner(
+                req: &mut potato::HttpRequest,
+                res: &mut potato::HttpResponse,
+                once_cache: &mut potato::OnceCache,
+                session_cache: &potato::SessionCache,
+            ) -> anyhow::Result<()>
+        },
+        (true, false) => quote! {
+            async fn #wrap_name_inner(
+                req: &mut potato::HttpRequest,
+                res: &mut potato::HttpResponse,
+                once_cache: &mut potato::OnceCache,
+            ) -> anyhow::Result<()>
+        },
+        (false, true) => quote! {
+            async fn #wrap_name_inner(
+                req: &mut potato::HttpRequest,
+                res: &mut potato::HttpResponse,
+                session_cache: &potato::SessionCache,
+            ) -> anyhow::Result<()>
+        },
+        (false, false) => quote! {
+            async fn #wrap_name_inner(
+                req: &mut potato::HttpRequest,
+                res: &mut potato::HttpResponse,
+            ) -> anyhow::Result<()>
+        },
+    };
+
+    // 根据实际使用情况调用函数
+    let call_body = if is_async {
         match &ret_type[..] {
-            "Result<()>" => quote! { #fn_name(req, res).await },
-            "()" => quote! {
-                #fn_name(req, res).await;
-                Ok(())
-            },
+            "Result<()>" => {
+                if has_once_cache && has_session_cache {
+                    quote! {
+                        #fn_name(req, res, once_cache, session_cache).await
+                    }
+                } else if has_once_cache {
+                    quote! {
+                        #fn_name(req, res, once_cache).await
+                    }
+                } else if has_session_cache {
+                    quote! {
+                        #fn_name(req, res, session_cache).await
+                    }
+                } else {
+                    quote! {
+                        #fn_name(req, res).await
+                    }
+                }
+            }
+            "()" => {
+                if has_once_cache && has_session_cache {
+                    quote! {
+                        #fn_name(req, res, once_cache, session_cache).await;
+                        Ok(())
+                    }
+                } else if has_once_cache {
+                    quote! {
+                        #fn_name(req, res, once_cache).await;
+                        Ok(())
+                    }
+                } else if has_session_cache {
+                    quote! {
+                        #fn_name(req, res, session_cache).await;
+                        Ok(())
+                    }
+                } else {
+                    quote! {
+                        #fn_name(req, res).await;
+                        Ok(())
+                    }
+                }
+            }
             _ => unreachable!(),
         }
     } else {
         match &ret_type[..] {
-            "Result<()>" => quote! { #fn_name(req, res) },
-            "()" => quote! {
-                #fn_name(req, res);
-                Ok(())
-            },
+            "Result<()>" => {
+                if has_once_cache && has_session_cache {
+                    quote! {
+                        #fn_name(req, res, once_cache, session_cache)
+                    }
+                } else if has_once_cache {
+                    quote! {
+                        #fn_name(req, res, once_cache)
+                    }
+                } else if has_session_cache {
+                    quote! {
+                        #fn_name(req, res, session_cache)
+                    }
+                } else {
+                    quote! {
+                        #fn_name(req, res)
+                    }
+                }
+            }
+            "()" => {
+                if has_once_cache && has_session_cache {
+                    quote! {
+                        #fn_name(req, res, once_cache, session_cache);
+                        Ok(())
+                    }
+                } else if has_once_cache {
+                    quote! {
+                        #fn_name(req, res, once_cache);
+                        Ok(())
+                    }
+                } else if has_session_cache {
+                    quote! {
+                        #fn_name(req, res, session_cache);
+                        Ok(())
+                    }
+                } else {
+                    quote! {
+                        #fn_name(req, res);
+                        Ok(())
+                    }
+                }
+            }
             _ => unreachable!(),
         }
     };
+
+    // 生成wrapper函数，根据cache需求调用inner函数
+    let wrapper_body = match (has_once_cache, has_session_cache) {
+        (true, true) => quote! {
+            #wrap_name_inner(
+                req,
+                res,
+                once_cache.expect("OnceCache required but not provided"),
+                session_cache.expect("SessionCache required but not provided"),
+            ).await
+        },
+        (true, false) => quote! {
+            #wrap_name_inner(
+                req,
+                res,
+                once_cache.expect("OnceCache required but not provided"),
+            ).await
+        },
+        (false, true) => quote! {
+            #wrap_name_inner(
+                req,
+                res,
+                session_cache.expect("SessionCache required but not provided"),
+            ).await
+        },
+        (false, false) => quote! {
+            #wrap_name_inner(req, res).await
+        },
+    };
+
     quote! {
         #root_fn
 
         #[doc(hidden)]
-        async fn #wrap_name(req: &mut potato::HttpRequest, res: &mut potato::HttpResponse) -> anyhow::Result<()> {
-            #body
+        #wrap_signature {
+            #call_body
+        }
+
+        #[doc(hidden)]
+        pub async fn #wrap_name(
+            req: &mut potato::HttpRequest,
+            res: &mut potato::HttpResponse,
+            once_cache: Option<&mut potato::OnceCache>,
+            session_cache: Option<&potato::SessionCache>,
+        ) -> anyhow::Result<()> {
+            #wrapper_body
         }
     }
     .into()
@@ -343,11 +642,10 @@ fn postprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
 
 fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> TokenStream {
     let req_name = Ident::new(req_name, Span::call_site());
-    let (route_path, oauth_arg, default_headers) = {
+    let (route_path, default_headers) = {
         let mut oroute_path = syn::parse::<syn::LitStr>(attr.clone())
             .ok()
             .map(|path| path.value());
-        let mut oauth_arg = None;
         let mut default_headers: Vec<(String, String)> = Vec::new();
         //
         if oroute_path.is_none() {
@@ -357,13 +655,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         if let Ok(route_path) = arg.parse::<syn::LitStr>() {
                             let route_path = route_path.value();
                             oroute_path = Some(route_path);
-                        }
-                    }
-                    Ok(())
-                } else if meta.path.is_ident("auth_arg") {
-                    if let Ok(arg) = meta.value() {
-                        if let Ok(tmp_field) = arg.parse::<Ident>() {
-                            oauth_arg = Some(tmp_field.to_string());
                         }
                     }
                     Ok(())
@@ -389,7 +680,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         if !route_path.starts_with('/') {
             panic!("route path must start with '/'");
         }
-        (route_path, oauth_arg, default_headers)
+        (route_path, default_headers)
     };
 
     // 解析函数上的 #[potato::header(...)] 标注
@@ -531,6 +822,30 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
 
     root_fn.attrs = remaining_attrs;
     let (preprocess_fns, postprocess_fns) = collect_handler_hooks(&mut root_fn);
+
+    // 检测handler自身是否需要缓存
+    let handler_has_once_cache = root_fn.sig.inputs.iter().any(|arg| {
+        if let syn::FnArg::Typed(arg) = arg {
+            arg.ty.to_token_stream().to_string().type_simplify() == "& mut OnceCache"
+        } else {
+            false
+        }
+    });
+    let handler_has_session_cache = root_fn.sig.inputs.iter().any(|arg| {
+        if let syn::FnArg::Typed(arg) = arg {
+            arg.ty.to_token_stream().to_string().type_simplify() == "& mut SessionCache"
+        } else {
+            false
+        }
+    });
+
+    // 如果有preprocess或postprocess，也可能需要缓存
+    // 由于无法在编译时确定，保守地创建缓存
+    let need_once_cache =
+        handler_has_once_cache || !preprocess_fns.is_empty() || !postprocess_fns.is_empty();
+    let need_session_cache =
+        handler_has_session_cache || !preprocess_fns.is_empty() || !postprocess_fns.is_empty();
+
     let preprocess_adapters: Vec<Ident> = preprocess_fns
         .iter()
         .map(|name| format_ident!("__potato_preprocess_adapter_{}", name))
@@ -553,7 +868,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
         doc_show
     };
-    let doc_auth = oauth_arg.is_some();
+    let doc_auth = false;
     let doc_summary = {
         let mut docs = vec![];
         for attr in root_fn.attrs.iter() {
@@ -582,7 +897,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let mut args = vec![];
     let mut arg_names = vec![];
     let mut doc_args = vec![];
-    let mut arg_auth_mark = false;
     for arg in root_fn.sig.inputs.iter() {
         if let syn::FnArg::Typed(arg) = arg {
             let arg_type_str = arg
@@ -594,6 +908,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             let arg_name_str = arg.pat.to_token_stream().to_string();
             args.push(match &arg_type_str[..] {
                 "& mut HttpRequest" => quote! { req },
+                "& mut OnceCache" => quote! { __potato_once_cache.as_mut().expect("OnceCache not available") },
+                "& mut SessionCache" => quote! { __potato_session_cache.as_mut().expect("SessionCache not available") },
                 "PostFile" => {
                     doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                     quote! {
@@ -604,77 +920,29 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     }
                 },
                 arg_type_str if ARG_TYPES.contains(arg_type_str) => {
-                    let is_auth_arg = match oauth_arg.as_ref() {
-                        Some(auth_arg) => auth_arg == &arg_name_str,
-                        None => false,
-                    };
-                    if is_auth_arg {
-                        if arg_type_str != "String" {
-                            panic!("auth_arg argument is must String type");
-                        }
-                        arg_auth_mark = true;
-                        if is_async {
-                            quote! {
-                                match req.headers
-                                    .get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization"))
-                                    .map(|v| v.to_str()) {
-                                    Some(mut auth) => {
-                                        if auth.starts_with("Bearer ") {
-                                            auth = &auth[7..];
-                                        }
-                                        match potato::ServerAuth::jwt_check(&auth).await {
-                                            Ok(payload) => payload,
-                                            Err(err) => return potato::HttpResponse::error(format!("auth failed: {err:?}")),
-                                        }
-                                    }
-                                    None => return potato::HttpResponse::error("miss header : Authorization"),
-                                }
-                            }
-                        } else {
-                            quote! {
-                                match req.headers
-                                    .get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization"))
-                                    .map(|v| v.to_str()) {
-                                    Some(mut auth) => {
-                                        if auth.starts_with("Bearer ") {
-                                            auth = &auth[7..];
-                                        }
-                                        match tokio::task::block_in_place(|| {
-                                            tokio::runtime::Handle::current().block_on(potato::ServerAuth::jwt_check(&auth))
-                                        }) {
-                                            Ok(payload) => payload,
-                                            Err(err) => return potato::HttpResponse::error(format!("auth failed: {err:?}")),
-                                        }
-                                    }
-                                    None => return potato::HttpResponse::error("miss header : Authorization"),
-                                }
-                            }
-                        }
-                    } else {
-                        doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
-                        let mut arg_value = quote! {
-                            match req.body_pairs
+                    doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
+                    let mut arg_value = quote! {
+                        match req.body_pairs
+                            .get(&potato::hipstr::LocalHipStr::from(#arg_name_str))
+                            .map(|p| p.to_string()) {
+                            Some(val) => val,
+                            None => match req.url_query
                                 .get(&potato::hipstr::LocalHipStr::from(#arg_name_str))
-                                .map(|p| p.to_string()) {
+                                .map(|p| p.as_str().to_string()) {
                                 Some(val) => val,
-                                None => match req.url_query
-                                    .get(&potato::hipstr::LocalHipStr::from(#arg_name_str))
-                                    .map(|p| p.as_str().to_string()) {
-                                    Some(val) => val,
-                                    None => return potato::HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
-                                },
-                            }
-                        };
-                        if arg_type_str != "String" {
-                            arg_value = quote! {
-                                match #arg_value.parse() {
-                                    Ok(val) => val,
-                                    Err(err) => return potato::HttpResponse::error(format!("arg[{}] is not {} type", #arg_name_str, #arg_type_str)),
-                                }
+                                None => return potato::HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
+                            },
+                        }
+                    };
+                    if arg_type_str != "String" {
+                        arg_value = quote! {
+                            match #arg_value.parse() {
+                                Ok(val) => val,
+                                Err(err) => return potato::HttpResponse::error(format!("arg[{}] is not {} type", #arg_name_str, #arg_type_str)),
                             }
                         }
-                        arg_value
                     }
+                    arg_value
                 },
                 _ => panic!("unsupported arg type: [{arg_type_str}]"),
             });
@@ -682,9 +950,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         } else {
             panic!("unsupported: {}", arg.to_token_stream());
         }
-    }
-    if !arg_auth_mark && doc_auth {
-        panic!("`auth_arg` attribute is must point to an existing argument");
     }
     let wrap_func_name2 = random_ident();
     let ret_type = root_fn
@@ -926,10 +1191,35 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             quote! {
                 let __potato_permit = #semaphore_name.acquire().await;
 
+                // 按需创建缓存对象
+                let mut __potato_once_cache: Option<potato::OnceCache> = if #need_once_cache {
+                    Some(potato::OnceCache::new())
+                } else {
+                    None
+                };
+                let mut __potato_session_cache: Option<potato::SessionCache> = if #need_session_cache {
+                    // 从 Authorization header 中提取 Bearer token 并加载 session
+                    req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization"))
+                        .and_then(|h| {
+                            let header_value = h.as_str();
+                            if header_value.starts_with("Bearer ") {
+                                potato::SessionCache::from_token(&header_value[7..]).ok()
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
+                };
+
                 let mut __potato_pre_response: Option<potato::HttpResponse> = None;
                 #(
                     if __potato_pre_response.is_none() {
-                        __potato_pre_response = match #preprocess_adapters(req).await {
+                        __potato_pre_response = match #preprocess_adapters(
+                            req,
+                            __potato_once_cache.as_mut(),
+                            __potato_session_cache.as_mut(),
+                        ).await {
                             Ok(Some(ret)) => Some(ret),
                             Ok(None) => None,
                             Err(err) => Some(potato::HttpResponse::error(format!("{err:?}"))),
@@ -943,7 +1233,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 };
 
                 #(
-                    if let Err(err) = #postprocess_adapters(req, &mut __potato_response).await {
+                    if let Err(err) = #postprocess_adapters(
+                        req,
+                        &mut __potato_response,
+                        __potato_once_cache.as_mut(),
+                        __potato_session_cache.as_ref(),
+                    ).await {
                         drop(__potato_permit);
                         return potato::HttpResponse::error(format!("{err:?}"));
                     }
@@ -957,10 +1252,35 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             }
         } else {
             quote! {
+                // 按需创建缓存对象
+                let mut __potato_once_cache: Option<potato::OnceCache> = if #need_once_cache {
+                    Some(potato::OnceCache::new())
+                } else {
+                    None
+                };
+                let mut __potato_session_cache: Option<potato::SessionCache> = if #need_session_cache {
+                    // 从 Authorization header 中提取 Bearer token 并加载 session
+                    req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization"))
+                        .and_then(|h| {
+                            let header_value = h.as_str();
+                            if header_value.starts_with("Bearer ") {
+                                potato::SessionCache::from_token(&header_value[7..]).ok()
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
+                };
+
                 let mut __potato_pre_response: Option<potato::HttpResponse> = None;
                 #(
                     if __potato_pre_response.is_none() {
-                        __potato_pre_response = match #preprocess_adapters(req).await {
+                        __potato_pre_response = match #preprocess_adapters(
+                            req,
+                            __potato_once_cache.as_mut(),
+                            __potato_session_cache.as_mut(),
+                        ).await {
                             Ok(Some(ret)) => Some(ret),
                             Ok(None) => None,
                             Err(err) => Some(potato::HttpResponse::error(format!("{err:?}"))),
@@ -974,7 +1294,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 };
 
                 #(
-                    if let Err(err) = #postprocess_adapters(req, &mut __potato_response).await {
+                    if let Err(err) = #postprocess_adapters(
+                        req,
+                        &mut __potato_response,
+                        __potato_once_cache.as_mut(),
+                        __potato_session_cache.as_ref(),
+                    ).await {
                         return potato::HttpResponse::error(format!("{err:?}"));
                     }
                 )*
@@ -994,11 +1319,36 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     tokio::runtime::Handle::current().block_on(#semaphore_name.acquire())
                 });
 
+                // 按需创建缓存对象
+                let mut __potato_once_cache: Option<potato::OnceCache> = if #need_once_cache {
+                    Some(potato::OnceCache::new())
+                } else {
+                    None
+                };
+                let mut __potato_session_cache: Option<potato::SessionCache> = if #need_session_cache {
+                    // 从 Authorization header 中提取 Bearer token 并加载 session
+                    req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization"))
+                        .and_then(|h| {
+                            let header_value = h.as_str();
+                            if header_value.starts_with("Bearer ") {
+                                potato::SessionCache::from_token(&header_value[7..]).ok()
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
+                };
+
                 let mut __potato_pre_response: Option<potato::HttpResponse> = None;
                 #(
                     if __potato_pre_response.is_none() {
                         __potato_pre_response = match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(#preprocess_adapters(req))
+                            tokio::runtime::Handle::current().block_on(#preprocess_adapters(
+                                req,
+                                __potato_once_cache.as_mut(),
+                                __potato_session_cache.as_mut(),
+                            ))
                         }) {
                             Ok(Some(ret)) => Some(ret),
                             Ok(None) => None,
@@ -1014,7 +1364,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
 
                 #(
                     if let Err(err) = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(#postprocess_adapters(req, &mut __potato_response))
+                        tokio::runtime::Handle::current().block_on(#postprocess_adapters(
+                            req,
+                            &mut __potato_response,
+                            __potato_once_cache.as_mut(),
+                            __potato_session_cache.as_ref(),
+                        ))
                     }) {
                         drop(__potato_permit);
                         return potato::HttpResponse::error(format!("{err:?}"));
@@ -1029,11 +1384,36 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             }
         } else {
             quote! {
+                // 按需创建缓存对象
+                let mut __potato_once_cache: Option<potato::OnceCache> = if #need_once_cache {
+                    Some(potato::OnceCache::new())
+                } else {
+                    None
+                };
+                let mut __potato_session_cache: Option<potato::SessionCache> = if #need_session_cache {
+                    // 从 Authorization header 中提取 Bearer token 并加载 session
+                    req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization"))
+                        .and_then(|h| {
+                            let header_value = h.as_str();
+                            if header_value.starts_with("Bearer ") {
+                                potato::SessionCache::from_token(&header_value[7..]).ok()
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
+                };
+
                 let mut __potato_pre_response: Option<potato::HttpResponse> = None;
                 #(
                     if __potato_pre_response.is_none() {
                         __potato_pre_response = match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(#preprocess_adapters(req))
+                            tokio::runtime::Handle::current().block_on(#preprocess_adapters(
+                                req,
+                                __potato_once_cache.as_mut(),
+                                __potato_session_cache.as_mut(),
+                            ))
                         }) {
                             Ok(Some(ret)) => Some(ret),
                             Ok(None) => None,
@@ -1049,7 +1429,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
 
                 #(
                     if let Err(err) = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(#postprocess_adapters(req, &mut __potato_response))
+                        tokio::runtime::Handle::current().block_on(#postprocess_adapters(
+                            req,
+                            &mut __potato_response,
+                            __potato_once_cache.as_mut(),
+                            __potato_session_cache.as_ref(),
+                        ))
                     }) {
                         return potato::HttpResponse::error(format!("{err:?}"));
                     }

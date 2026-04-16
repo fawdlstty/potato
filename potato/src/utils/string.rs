@@ -99,7 +99,7 @@ macro_rules! ssformat {
         {
             use std::fmt::Write;
             let mut buf = smallstr::SmallString::<[u8; $len]>::new();
-            buf.write_fmt(::core::format_args!($($arg)*)).unwrap();
+            let _ = buf.write_fmt(::core::format_args!($($arg)*));
             buf
         }
     };

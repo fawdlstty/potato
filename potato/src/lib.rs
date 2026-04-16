@@ -7,9 +7,6 @@ pub mod utils;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
 
-// 导出CORS配置
-pub use server::CorsConfig;
-
 pub use client::*;
 pub use global_config::*;
 pub use hipstr;
@@ -18,9 +15,8 @@ pub use potato_macro::*;
 pub use regex;
 pub use rust_embed;
 pub use serde_json;
+pub use server::CorsConfig;
 pub use server::*;
-
-use thread_local::ThreadLocal;
 pub use utils::ai::*;
 pub use utils::refstr::Headers;
 
@@ -51,6 +47,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::UNIX_EPOCH;
 use std::{collections::HashMap, collections::HashSet, future::Future, pin::Pin};
 use strum::Display;
+use thread_local::ThreadLocal;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::Mutex;
 use utils::bytes::CompressExt;
@@ -59,6 +56,344 @@ use utils::number::HttpCodeExt;
 use utils::refstr::{HeaderItem, HeaderOrHipStr};
 use utils::string::StringExt;
 use utils::tcp_stream::{HttpStream, VecU8Ext};
+
+/// 一次性缓存,用于单次请求的前处理、后处理及handler方法间传递参数
+#[derive(Debug)]
+pub struct OnceCache {
+    data: HashMap<(String, TypeId), Box<dyn Any + Send + Sync>>,
+}
+
+impl OnceCache {
+    pub fn new() -> Self {
+        Self {
+            data: HashMap::new(),
+        }
+    }
+
+    /// 获取不可变引用
+    pub fn get<T: Any + Send + Sync + 'static>(&self, name: &str) -> Option<&T> {
+        let key = (name.to_string(), TypeId::of::<T>());
+        self.data
+            .get(&key)
+            .and_then(|boxed| boxed.downcast_ref::<T>())
+    }
+
+    /// 获取值或返回默认值（需要类型实现Clone）
+    pub fn get_or_default<T: Any + Send + Sync + Clone + 'static>(
+        &self,
+        name: &str,
+        default: T,
+    ) -> T {
+        self.get::<T>(name).cloned().unwrap_or(default)
+    }
+
+    /// 获取可变引用
+    pub fn get_mut<T: Any + Send + Sync + 'static>(&mut self, name: &str) -> Option<&mut T> {
+        let key = (name.to_string(), TypeId::of::<T>());
+        self.data
+            .get_mut(&key)
+            .and_then(|boxed| boxed.downcast_mut::<T>())
+    }
+
+    /// 插入或更新值
+    pub fn set<T: Any + Send + Sync + 'static>(&mut self, name: &str, value: T) {
+        let key = (name.to_string(), TypeId::of::<T>());
+        self.data.insert(key, Box::new(value));
+    }
+
+    /// 移除并返回值
+    pub fn remove<T: Any + Send + Sync + 'static>(&mut self, name: &str) -> Option<T> {
+        let key = (name.to_string(), TypeId::of::<T>());
+        self.data
+            .remove(&key)
+            .and_then(|boxed| boxed.downcast::<T>().ok())
+            .map(|boxed| *boxed)
+    }
+
+    /// 检查是否包含指定的键
+    pub fn contains_key<T: Any + Send + Sync + 'static>(&self, name: &str) -> bool {
+        let key = (name.to_string(), TypeId::of::<T>());
+        self.data.contains_key(&key)
+    }
+
+    /// 清空所有缓存
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
+
+    /// 获取缓存项数量
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// 判断缓存是否为空
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
+use dashmap::DashMap;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
+
+/// SessionCache 错误类型
+#[derive(Debug)]
+pub enum SessionCacheError {
+    /// Token 解析失败（格式错误、签名验证失败等）
+    InvalidToken(String),
+    /// Token 已过期
+    TokenExpired,
+    /// Session 已过期
+    SessionExpired,
+    /// 缺少 Authorization header
+    MissingAuthHeader,
+    /// 内部错误
+    InternalError(String),
+}
+
+impl std::fmt::Display for SessionCacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionCacheError::InvalidToken(msg) => write!(f, "Invalid token: {}", msg),
+            SessionCacheError::TokenExpired => write!(f, "Token has expired"),
+            SessionCacheError::SessionExpired => write!(f, "Session has expired"),
+            SessionCacheError::MissingAuthHeader => write!(f, "Missing Authorization header"),
+            SessionCacheError::InternalError(msg) => write!(f, "Internal error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for SessionCacheError {}
+
+// SessionCache 的内部管理器(私有)
+static SESSION_JWT_SECRET: std::sync::LazyLock<RwLock<Vec<u8>>> = std::sync::LazyLock::new(|| {
+    // 使用密码学安全的随机数生成器生成密钥
+    use rand::RngCore;
+    let mut secret = vec![0u8; 64];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    RwLock::new(secret)
+});
+
+static SESSION_CACHE_MANAGER: std::sync::LazyLock<DashMap<i64, (SessionCache, Instant)>> =
+    std::sync::LazyLock::new(|| DashMap::new());
+
+/// 会话级缓存,用于同一用户的不同请求间传递参数
+/// 基于Bearer token中的id区分不同Session
+#[derive(Debug, Clone)]
+pub struct SessionCache {
+    data: Arc<RwLock<HashMap<(String, TypeId), Box<dyn Any + Send + Sync>>>>,
+}
+
+impl SessionCache {
+    pub fn new() -> Self {
+        Self {
+            data: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// 获取值(需要类型实现Clone)
+    pub fn get<T: Any + Send + Sync + Clone + 'static>(&self, name: &str) -> Option<T> {
+        let key = (name.to_string(), TypeId::of::<T>());
+        let data = self.data.read().ok()?;
+        let value = data.get(&key).and_then(|boxed| boxed.downcast_ref::<T>())?;
+        Some(value.clone())
+    }
+
+    /// 获取值并应用函数
+    pub fn with_get<T: Any + Send + Sync + 'static, F, R>(&self, name: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        let key = (name.to_string(), TypeId::of::<T>());
+        let data = self.data.read().ok()?;
+        let value = data.get(&key).and_then(|boxed| boxed.downcast_ref::<T>())?;
+        Some(f(value))
+    }
+
+    /// 获取可变引用并应用函数
+    pub fn with_mut<T: Any + Send + Sync + 'static, F, R>(&self, name: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        let key = (name.to_string(), TypeId::of::<T>());
+        let mut data = self.data.write().ok()?;
+        let value = data
+            .get_mut(&key)
+            .and_then(|boxed| boxed.downcast_mut::<T>())?;
+        Some(f(value))
+    }
+
+    /// 插入或更新值
+    pub fn set<T: Any + Send + Sync + 'static>(&self, name: &str, value: T) {
+        let key = (name.to_string(), TypeId::of::<T>());
+        if let Ok(mut data) = self.data.write() {
+            data.insert(key, Box::new(value));
+        }
+    }
+
+    /// 移除并返回值
+    pub fn remove<T: Any + Send + Sync + 'static>(&self, name: &str) -> Option<T> {
+        let key = (name.to_string(), TypeId::of::<T>());
+        let mut data = self.data.write().ok()?;
+        data.remove(&key)
+            .and_then(|boxed| boxed.downcast::<T>().ok())
+            .map(|boxed| *boxed)
+    }
+
+    // ==================== 静态方法：Session管理 ====================
+
+    /// 设置JWT签发秘钥
+    pub fn set_jwt_secret(secret: &[u8]) {
+        if let Ok(mut jwt_secret) = SESSION_JWT_SECRET.write() {
+            *jwt_secret = secret.to_vec();
+        }
+    }
+
+    /// 获取JWT签发秘钥
+    fn get_jwt_secret() -> Vec<u8> {
+        SESSION_JWT_SECRET
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// 签发JWT token
+    /// 参数:
+    /// - user_id: 用户ID
+    /// - ttl: token有效期
+    /// 返回: JWT token字符串
+    pub fn generate_token(user_id: i64, ttl: std::time::Duration) -> Result<String, anyhow::Error> {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct Claims {
+            sub: i64,        // user_id
+            exp: usize,      // token过期时间戳
+            iat: usize,      // 签发时间戳
+            sess_exp: usize, // session过期时间戳（固定，不随访问更新）
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as usize;
+
+        let claims = Claims {
+            sub: user_id,
+            exp: now + ttl.as_secs() as usize,
+            iat: now,
+            sess_exp: now + ttl.as_secs() as usize,
+        };
+
+        let secret = Self::get_jwt_secret();
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(&secret),
+        )?;
+
+        Ok(token)
+    }
+
+    /// 解析JWT token
+    /// 返回: (user_id, session_exp_duration)
+    pub fn parse_token(token: &str) -> Result<(i64, Duration), SessionCacheError> {
+        use jsonwebtoken::{decode, DecodingKey, Validation};
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct Claims {
+            sub: i64,
+            exp: usize,
+            iat: usize,
+            sess_exp: usize,
+        }
+
+        let secret = Self::get_jwt_secret();
+        let token_data = decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(&secret),
+            &Validation::default(),
+        )
+        .map_err(|e| SessionCacheError::InvalidToken(format!("Token decode failed: {}", e)))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .ok_or_else(|| {
+                SessionCacheError::InternalError("Failed to get system time".to_string())
+            })?
+            .as_secs() as usize;
+
+        if token_data.claims.exp < now {
+            return Err(SessionCacheError::TokenExpired);
+        }
+
+        // 使用固定的session过期时间，不随访问更新
+        let session_exp = token_data.claims.sess_exp;
+        if session_exp < now {
+            return Err(SessionCacheError::SessionExpired);
+        }
+
+        let remaining_secs = session_exp - now;
+        Ok((
+            token_data.claims.sub,
+            Duration::from_secs(remaining_secs as u64),
+        ))
+    }
+
+    // ==================== 内部缓存管理器 ====================
+
+    /// 获取或创建Session缓存
+    /// 参数:
+    /// - token: JWT token
+    /// 返回: SessionCache实例
+    pub fn from_token(token: &str) -> Result<Self, SessionCacheError> {
+        let (user_id, ttl) = Self::parse_token(token)?;
+
+        let now = Instant::now();
+        let expires_at = now + ttl;
+
+        // 使用 DashMap 的 entry API 一次性完成检查和创建，避免竞态条件
+        let mut entry = SESSION_CACHE_MANAGER
+            .entry(user_id)
+            .or_insert_with(|| (SessionCache::new(), expires_at));
+
+        // 检查是否过期，如果过期则重新创建
+        if entry.value().1 < now {
+            // 已过期,重新创建
+            *entry.value_mut() = (SessionCache::new(), expires_at);
+        }
+
+        // 返回session的克隆
+        Ok(entry.value().0.clone())
+    }
+
+    /// 使指定用户的session失效（用于登出等场景）
+    pub fn invalidate(user_id: i64) {
+        SESSION_CACHE_MANAGER.remove(&user_id);
+    }
+
+    /// 内部方法:清理过期的session缓存（已废弃，使用后台清理任务替代）
+    #[allow(dead_code)]
+    fn cleanup_expired_internal() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        // 每100次调用触发一次清理
+        if CALL_COUNTER.fetch_add(1, Ordering::Relaxed) % 100 == 0 {
+            let now = Instant::now();
+            SESSION_CACHE_MANAGER.retain(|_, (_, expires_at)| *expires_at > now);
+        }
+    }
+
+    /// 内部方法:提供对session manager的访问，用于后台清理任务
+    /// 注意：这是一个完全私有的内部方法，仅供服务器清理任务使用
+    pub(crate) fn cleanup_expired_sessions() {
+        let now = Instant::now();
+        SESSION_CACHE_MANAGER.retain(|_, (_, expires_at)| *expires_at > now);
+    }
+}
 
 /// HTTP conditional preflight result
 #[derive(Debug, PartialEq)]
@@ -166,10 +501,15 @@ impl std::error::Error for HttpDateParseError {}
 pub fn parse_http_date(date_str: &str) -> Result<u64, HttpDateParseError> {
     // Use simple manual parsing method to handle RFC 1123 format
     // Format: "Fri, 12 Sep 2025 00:00:00 GMT"
-    if let Some(caps) =
-        regex::Regex::new(r"^\w+, (\d{1,2}) (\w+) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$")
-            .unwrap()
-            .captures(date_str)
+    static DATE_REGEX: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"^\w+, (\d{1,2}) (\w+) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$")
+        });
+
+    if let Some(caps) = DATE_REGEX
+        .as_ref()
+        .ok()
+        .and_then(|re| re.captures(date_str))
     {
         let day: u32 = caps[1].parse().map_err(|_| HttpDateParseError)?;
         let month_str = &caps[2];
@@ -1320,7 +1660,9 @@ impl HttpRequest {
         let mut host_header_count = 0usize;
         let mut has_valid_host = false;
         req.method = {
-            let method = rreq.method.unwrap();
+            let method = rreq
+                .method
+                .ok_or_else(|| anyhow!("Missing HTTP method in request"))?;
             match method.len() {
                 3 if method == "GET" => HttpMethod::GET,
                 3 if method == "PUT" => HttpMethod::PUT,
@@ -1343,7 +1685,9 @@ impl HttpRequest {
                 )))?,
             }
         };
-        let target = rreq.path.unwrap();
+        let target = rreq
+            .path
+            .ok_or_else(|| anyhow!("Missing HTTP path in request"))?;
         req.parse_request_target(target)?;
         req.version = rreq.version.unwrap_or(1) + 10;
         for h in rreq.headers.iter() {
@@ -1625,7 +1969,7 @@ impl HttpResponseBody {
         }
         match self {
             HttpResponseBody::Data(data) => data.as_slice(),
-            HttpResponseBody::Stream(_) => unreachable!("stream body should be converted to data"),
+            HttpResponseBody::Stream(_) => &[], // Return empty slice for stream body
         }
     }
 
@@ -1672,7 +2016,7 @@ impl Clone for HttpResponse {
             trailers: self.trailers.clone(),
             body: match &self.body {
                 HttpResponseBody::Data(data) => HttpResponseBody::Data(data.clone()),
-                HttpResponseBody::Stream(_) => panic!("Cannot clone Stream response"),
+                HttpResponseBody::Stream(_) => HttpResponseBody::Data(vec![]), // Clone stream as empty data
             },
         }
     }

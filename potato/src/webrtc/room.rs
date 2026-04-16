@@ -120,7 +120,10 @@ impl Room {
                 ));
             }
 
-            let broadcast_sender = forwarders.get(&forwarder_key).unwrap().clone();
+            let broadcast_sender = forwarders
+                .get(&forwarder_key)
+                .ok_or_else(|| anyhow::anyhow!("RTP forwarder not found for peer: {}", from_peer))?
+                .clone();
             let to_peer_pc = to_peer_obj.peer_connection.clone();
 
             (to_peer_pc, broadcast_sender)

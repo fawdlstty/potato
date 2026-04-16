@@ -48,8 +48,9 @@ impl WebRTCSFU {
         peer_senders: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>>,
     ) {
         // 使用RwLock的write锁来设置
-        let mut guard = self.peer_senders.try_write().unwrap();
-        *guard = Some(peer_senders);
+        if let Ok(mut guard) = self.peer_senders.try_write() {
+            *guard = Some(peer_senders);
+        }
     }
 
     /// 获取peer_senders的引用

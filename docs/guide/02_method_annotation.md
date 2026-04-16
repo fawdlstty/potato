@@ -11,7 +11,7 @@
 
 这六种除了描述处理方法外，其他特性完全一致。通过修改标注名即可实现不同的HTTP方法。
 
-标注有两种用法，一种是直接传递请求路径。示例：
+标注用于指定处理函数的HTTP方法和路径，直接传递路径即可。示例：
 
 ```rust
 #[potato::http_get("/hello")]
@@ -20,26 +20,11 @@ async fn hello() -> HttpResponse {
 }
 ```
 
-另一种用法是指定请求路径和鉴权参数。示例：
-
-```rust
-#[potato::http_get(path="/check", auth_arg=payload)]
-async fn check(payload: String) -> HttpResponse {
-    HttpResponse::html(format!("payload: [{payload}]"))
-}
-
-// 注：鉴权参数通过如下方式签发
-let token = ServerAuth::jwt_issue("payload".to_string(), std::time::Duration::from_secs(10000000)).await?;
-
-// 注：鉴权token通过如下形式修改，不指定默认即每次随机生成（通常在main函数入口的地方修改一次）
-ServerConfig::set_jwt_secret("AAABBBCCC").await;
-```
-
-当函数标注鉴权参数后，鉴权不通过，会返回401状态码，且不会实际调用处理函数。
+如需用户会话管理，请使用 SessionCache（见下方 SessionCache 参数章节）。
 
 ## 参数
 
-参数可以直接接受请求对象，也可以定义自定义请求参数，这请求参数将要求HTTP请求的query string或者body附带此值。示例请求对象：
+参数可以直接接受请求对象,也可以定义自定义请求参数,这请求参数将要求HTTP请求的query string或者body附带此值。示例请求对象:
 
 ```rust
 #[potato::http_get("/hello")]
@@ -54,7 +39,7 @@ async fn hello2(req: &mut HttpRequest) -> anyhow::Result<HttpResponse> {
 }
 ```
 
-下面是一个websocket服务器端示例代码：
+下面是一个websocket服务器端示例代码:
 
 ```rust
 #[potato::http_get("/ws")]
@@ -70,7 +55,7 @@ async fn websocket(req: &mut HttpRequest) -> anyhow::Result<()> {
 }
 ```
 
-另外就是处理函数的参数了。除了前文提到的鉴权用的参数外，剩余的均要求通过请求的query里或body里附带。示例：
+另外就是处理函数的参数了。除了前文提到的鉴权用的参数外,剩余的均要求通过请求的query里或body里附带。示例:
 
 ```rust
 #[potato::http_get("/hello_user")]
@@ -83,6 +68,74 @@ async fn upload(file1: PostFile) -> HttpResponse {
     HttpResponse::html(format!("file[{}] len: {}", file1.filename, file1.data.len()))
 }
 ```
+
+### OnceCache 参数
+
+支持 `cache: &mut OnceCache` 参数,用于在单次请求的前处理、后处理及handler方法间传递参数。收到请求时创建,请求完成后自动释放。
+
+```rust
+#[potato::preprocess]
+async fn pre_handler(req: &mut HttpRequest, cache: &mut OnceCache) {
+    cache.set("user_id", 12345u32);
+}
+
+#[potato::http_get("/profile")]
+#[potato::preprocess(pre_handler)]
+async fn get_profile(cache: &mut OnceCache) -> HttpResponse {
+    let user_id: u32 = *cache.get::<u32>("user_id");
+    HttpResponse::text(format!("User: {}", user_id))
+}
+
+#[potato::postprocess]
+fn post_handler(_req: &mut HttpRequest, res: &mut HttpResponse, cache: &mut OnceCache) {
+    cache.set("processed", true);
+}
+```
+
+常用方法:
+- `cache.get::<T>(name)` - 获取不可变引用（返回Option<&T>）
+- `cache.get_or_default::<T>(name, default)` - 获取值或返回默认值（需Clone）
+- `cache.get_mut::<T>(name)` - 获取可变引用  
+- `cache.set::<T>(name, value)` - 设置值
+- `cache.remove::<T>(name)` - 移除并返回值
+
+### SessionCache 参数
+
+支持 `cache: &mut SessionCache` 参数,用于跨请求保持用户会话数据。只需声明此参数,宏会自动验证 Bearer token 并加载对应会话。
+
+```rust
+// 登录接口签发token
+#[potato::http_post("/login")]
+async fn login(req: &mut HttpRequest) -> HttpResponse {
+    let user_id = 12345i64; // 从请求获取
+    let token = SessionCache::generate_token(user_id, std::time::Duration::from_secs(3600)).unwrap();
+    HttpResponse::json(serde_json::json!({ "token": token }))
+}
+
+// 直接使用SessionCache,宏自动处理token验证
+#[potato::http_get("/profile")]
+async fn get_profile(cache: &mut SessionCache) -> HttpResponse {
+    let count: u32 = cache.get("visits").unwrap_or(0);
+    cache.set("visits", count + 1);
+    HttpResponse::text(format!("Visits: {}", count + 1))
+}
+
+// 与OnceCache同时使用
+#[potato::http_get("/data")]
+async fn get_data(once: &mut OnceCache, session: &mut SessionCache) -> HttpResponse {
+    once.set("req_id", "abc"); // 单次请求
+    session.set("user", "john"); // 跨请求保持
+    HttpResponse::text("ok")
+}
+```
+
+常用方法:
+- `SessionCache::set_jwt_secret(secret)` - 设置JWT密钥(全局)
+- `SessionCache::generate_token(user_id, duration)` - 签发token
+- `cache.get::<T>(key)` - 获取值(需Clone)
+- `cache.set::<T>(key, value)` - 设置值
+- `cache.with_get::<T>(key, |v| ...)` - 读取并处理
+- `cache.with_mut::<T>(key, |v| ...)` - 可变引用处理
 
 ## 返回类型
 

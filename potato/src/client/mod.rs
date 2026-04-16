@@ -1032,7 +1032,9 @@ impl TransferSession {
                 };
 
                 self.conns.insert(conn_key.clone(), new_stream);
-                self.conns.get_mut(&conn_key).unwrap()
+                self.conns
+                    .get_mut(&conn_key)
+                    .ok_or_else(|| anyhow!("Failed to get connection after insert"))?
             }
         };
 

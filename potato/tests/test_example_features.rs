@@ -472,7 +472,9 @@ mod tests {
         }
 
         // 设置关闭信号
-        *SHUTDOWN_SIGNAL.lock().await = Some(server.shutdown_signal());
+        if let Some(tx) = server.shutdown_signal() {
+            *SHUTDOWN_SIGNAL.lock().await = Some(tx);
+        }
 
         let server_handle = tokio::spawn(async move {
             let _ = server.serve_http().await;
@@ -674,7 +676,9 @@ mod tests {
             // 使用当前目录作为静态文件目录
             ctx.use_location_route("/", ".", false);
         });
-        let shutdown_signal = server.shutdown_signal();
+        let shutdown_signal = server
+            .shutdown_signal()
+            .expect("Failed to get shutdown signal");
 
         let server_handle = tokio::spawn(async move {
             let _ = server.serve_http().await;

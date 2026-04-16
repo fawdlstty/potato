@@ -11,7 +11,7 @@ Function annotations are dedicated to server-side handler functions, used to spe
 
 These six methods are identical in functionality except for describing the processing method. Different HTTP methods can be achieved by modifying the annotation name.
 
-There are two ways to use annotations. One is to directly pass the request path. Example:
+Annotations specify the HTTP method and path for handler functions. Simply pass the path directly. Example:
 
 ```rust
 #[potato::http_get("/hello")]
@@ -20,22 +20,7 @@ async fn hello() -> HttpResponse {
 }
 ```
 
-Another usage is to specify the request path and authentication parameter. Example:
-
-```rust
-#[potato::http_get(path="/check", auth_arg=payload)]
-async fn check(payload: String) -> HttpResponse {
-    HttpResponse::html(format!("payload: [{payload}]"))
-}
-
-// Note: Authentication parameter is issued in the following way
-let token = ServerAuth::jwt_issue("payload".to_string(), std::time::Duration::from_secs(10000000)).await?;
-
-// Note: The authentication token can be modified in the following form. If not specified, it will be randomly generated each time by default (usually modified once at the main function entry)
-ServerConfig::set_jwt_secret("AAABBBCCC").await;
-```
-
-When a function annotation includes an authentication parameter, if authentication fails, a 401 status code will be returned and the handler function will not be called.
+For user session management, please use SessionCache (see SessionCache Parameter section below).
 
 ## Parameters
 
@@ -83,6 +68,74 @@ async fn upload(file1: PostFile) -> HttpResponse {
     HttpResponse::html(format!("file[{}] len: {}", file1.filename, file1.data.len()))
 }
 ```
+
+### OnceCache Parameter
+
+Supports `cache: &mut OnceCache` parameter for passing data between preprocess, postprocess, and handler methods within a single request. Created when request is received, automatically released after request completes.
+
+```rust
+#[potato::preprocess]
+async fn pre_handler(req: &mut HttpRequest, cache: &mut OnceCache) {
+    cache.set("user_id", 12345u32);
+}
+
+#[potato::http_get("/profile")]
+#[potato::preprocess(pre_handler)]
+async fn get_profile(cache: &mut OnceCache) -> HttpResponse {
+    let user_id: u32 = *cache.get::<u32>("user_id");
+    HttpResponse::text(format!("User: {}", user_id))
+}
+
+#[potato::postprocess]
+fn post_handler(_req: &mut HttpRequest, res: &mut HttpResponse, cache: &mut OnceCache) {
+    cache.set("processed", true);
+}
+```
+
+Common methods:
+- `cache.get::<T>(name)` - Get immutable reference (returns Option<&T>)
+- `cache.get_or_default::<T>(name, default)` - Get value or return default (requires Clone)
+- `cache.get_mut::<T>(name)` - Get mutable reference
+- `cache.set::<T>(name, value)` - Set value
+- `cache.remove::<T>(name)` - Remove and return value
+
+### SessionCache Parameter
+
+Supports `cache: &mut SessionCache` parameter for maintaining user session data across requests. Just declare this parameter, and the macro will automatically validate the Bearer token and load the corresponding session.
+
+```rust
+// Login endpoint to issue token
+#[potato::http_post("/login")]
+async fn login(req: &mut HttpRequest) -> HttpResponse {
+    let user_id = 12345i64; // Get from request
+    let token = SessionCache::generate_token(user_id, std::time::Duration::from_secs(3600)).unwrap();
+    HttpResponse::json(serde_json::json!({ "token": token }))
+}
+
+// Use SessionCache directly, macro handles token validation
+#[potato::http_get("/profile")]
+async fn get_profile(cache: &mut SessionCache) -> HttpResponse {
+    let count: u32 = cache.get("visits").unwrap_or(0);
+    cache.set("visits", count + 1);
+    HttpResponse::text(format!("Visits: {}", count + 1))
+}
+
+// Use with OnceCache simultaneously
+#[potato::http_get("/data")]
+async fn get_data(once: &mut OnceCache, session: &mut SessionCache) -> HttpResponse {
+    once.set("req_id", "abc"); // Single request
+    session.set("user", "john"); // Persists across requests
+    HttpResponse::text("ok")
+}
+```
+
+Common methods:
+- `SessionCache::set_jwt_secret(secret)` - Set JWT secret (global)
+- `SessionCache::generate_token(user_id, duration)` - Issue token
+- `cache.get::<T>(key)` - Get value (requires Clone)
+- `cache.set::<T>(key, value)` - Set value
+- `cache.with_get::<T>(key, |v| ...)` - Read and process
+- `cache.with_mut::<T>(key, |v| ...)` - Mutable reference processing
 
 ## Return Types
 
