@@ -21,7 +21,7 @@ mod tests {
     #[tokio::test]
     async fn test_http_server_basic() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         // 注意: 不禁用 handlers，以便宏路由可以工作
@@ -39,7 +39,7 @@ mod tests {
         sleep(Duration::from_millis(300)).await;
 
         // 访问 /hello 端点
-        let url = format!("http://{}/hello", server_addr);
+        let url = format!("http://{server_addr}/hello");
         match potato::get(&url, vec![]).await {
             Ok(res) => {
                 println!("HTTP Server /hello response: {}", res.http_code);
@@ -54,7 +54,7 @@ mod tests {
                 assert!(body.contains("hello world"));
             }
             Err(e) => {
-                println!("HTTP Server request error: {}", e);
+                println!("HTTP Server request error: {e}");
             }
         }
 
@@ -67,7 +67,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_args_server() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         // 注意: 不禁用 handlers，以便宏路由可以工作
@@ -81,7 +81,7 @@ mod tests {
 
         #[potato::http_get("/hello_user")]
         async fn hello_user(name: String) -> HttpResponse {
-            HttpResponse::html(format!("hello {}", name))
+            HttpResponse::html(format!("hello {name}"))
         }
 
         let server_handle = tokio::spawn(async move {
@@ -91,18 +91,18 @@ mod tests {
         sleep(Duration::from_millis(300)).await;
 
         // 测试获取客户端地址
-        let url = format!("http://{}/hello", server_addr);
+        let url = format!("http://{server_addr}/hello");
         match potato::get(&url, vec![]).await {
             Ok(res) => {
                 println!("Handler with HttpRequest: {}", res.http_code);
             }
             Err(e) => {
-                println!("HttpRequest handler error: {}", e);
+                println!("HttpRequest handler error: {e}");
             }
         }
 
         // 测试 URL 参数绑定
-        let url = format!("http://{}/hello_user?name=World", server_addr);
+        let url = format!("http://{server_addr}/hello_user?name=World");
         match potato::get(&url, vec![]).await {
             Ok(res) => {
                 println!("Handler with String param: {}", res.http_code);
@@ -118,7 +118,7 @@ mod tests {
                 }
             }
             Err(e) => {
-                println!("String param handler error: {}", e);
+                println!("String param handler error: {e}");
             }
         }
 
@@ -254,7 +254,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -263,7 +263,7 @@ mod tests {
 
         sleep(Duration::from_millis(300)).await;
 
-        let normal = potato::get(&format!("http://{}/pipeline_hooks", server_addr), vec![]).await?;
+        let normal = potato::get(&format!("http://{server_addr}/pipeline_hooks"), vec![]).await?;
         assert_eq!(normal.http_code, 200);
         assert_eq!(body_to_string(&normal), "handler|post_sync|post_async");
         assert_eq!(
@@ -341,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn test_http_methods_server() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         // 注意: 不禁用 handlers，以便宏路由可以工作
@@ -390,7 +390,7 @@ mod tests {
                 println!("GET: {}", res.http_code);
                 assert_eq!(res.http_code, 200);
             }
-            Err(e) => println!("GET error: {}", e),
+            Err(e) => println!("GET error: {e}"),
         }
 
         // 测试 POST
@@ -400,7 +400,7 @@ mod tests {
                 println!("POST: {}", res.http_code);
                 assert_eq!(res.http_code, 200);
             }
-            Err(e) => println!("POST error: {}", e),
+            Err(e) => println!("POST error: {e}"),
         }
 
         // 测试 PUT
@@ -410,7 +410,7 @@ mod tests {
                 println!("PUT: {}", res.http_code);
                 assert_eq!(res.http_code, 200);
             }
-            Err(e) => println!("PUT error: {}", e),
+            Err(e) => println!("PUT error: {e}"),
         }
 
         // 测试 DELETE
@@ -420,7 +420,7 @@ mod tests {
                 println!("DELETE: {}", res.http_code);
                 assert_eq!(res.http_code, 200);
             }
-            Err(e) => println!("DELETE error: {}", e),
+            Err(e) => println!("DELETE error: {e}"),
         }
 
         // 测试 HEAD
@@ -430,7 +430,7 @@ mod tests {
                 println!("HEAD: {}", res.http_code);
                 assert_eq!(res.http_code, 200);
             }
-            Err(e) => println!("HEAD error: {}", e),
+            Err(e) => println!("HEAD error: {e}"),
         }
 
         // 测试 OPTIONS
@@ -439,7 +439,7 @@ mod tests {
             Ok(res) => {
                 println!("OPTIONS: {}", res.http_code);
             }
-            Err(e) => println!("OPTIONS error: {}", e),
+            Err(e) => println!("OPTIONS error: {e}"),
         }
 
         server_handle.abort();
@@ -457,7 +457,7 @@ mod tests {
             LazyLock::new(|| Mutex::new(None));
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         // 注意: 不禁用 handlers，以便宏路由可以工作
@@ -490,7 +490,7 @@ mod tests {
             }
             Err(e) => {
                 // 关闭后连接可能失败，这是预期的
-                println!("Shutdown triggered (expected): {}", e);
+                println!("Shutdown triggered (expected): {e}");
             }
         }
 
@@ -506,7 +506,7 @@ mod tests {
     async fn test_client_basic() -> anyhow::Result<()> {
         // 启动一个本地服务器用于测试
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
@@ -527,7 +527,7 @@ mod tests {
                 assert!(res.http_code > 0);
             }
             Err(e) => {
-                println!("Client GET error: {}", e);
+                println!("Client GET error: {e}");
             }
         }
 
@@ -540,7 +540,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_with_args() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
@@ -562,7 +562,7 @@ mod tests {
                 assert!(res.http_code > 0);
             }
             Err(e) => {
-                println!("Client with args error: {}", e);
+                println!("Client with args error: {e}");
             }
         }
 
@@ -575,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_session() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
@@ -598,7 +598,7 @@ mod tests {
                 println!("Session request 1: {}", res.http_code);
             }
             Err(e) => {
-                println!("Session request 1 error: {}", e);
+                println!("Session request 1 error: {e}");
             }
         }
 
@@ -609,7 +609,7 @@ mod tests {
                 println!("Session request 2: {}", res.http_code);
             }
             Err(e) => {
-                println!("Session request 2 error: {}", e);
+                println!("Session request 2 error: {e}");
             }
         }
 
@@ -623,7 +623,7 @@ mod tests {
     #[tokio::test]
     async fn test_openapi_server() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
@@ -646,7 +646,7 @@ mod tests {
                 assert!(res.http_code == 200 || res.http_code == 404);
             }
             Err(e) => {
-                println!("OpenAPI request error: {}", e);
+                println!("OpenAPI request error: {e}");
             }
         }
 
@@ -657,7 +657,7 @@ mod tests {
                 println!("Swagger index response status: {}", res.http_code);
             }
             Err(e) => {
-                println!("Swagger index error: {}", e);
+                println!("Swagger index error: {e}");
             }
         }
 
@@ -669,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn test_location_route_server() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
@@ -695,7 +695,7 @@ mod tests {
                 assert!(res.http_code == 200 || res.http_code == 404 || res.http_code == 500);
             }
             Err(e) => {
-                println!("Static file request error: {}", e);
+                println!("Static file request error: {e}");
             }
         }
 
@@ -710,7 +710,7 @@ mod tests {
     #[tokio::test]
     async fn test_embed_route_server() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -730,13 +730,13 @@ mod tests {
         sleep(Duration::from_millis(300)).await;
 
         // 访问根路径（服务器会返回404因为没有配置路由）
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
         match potato::get(&url, vec![]).await {
             Ok(res) => {
                 println!("Embedded route test response status: {}", res.http_code);
             }
             Err(e) => {
-                println!("Embedded route test error: {}", e);
+                println!("Embedded route test error: {e}");
             }
         }
 
@@ -750,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn test_jwt_auth_server() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         // 设置 JWT 密钥
         potato::ServerConfig::set_jwt_secret("test_secret_key_12345").await;
@@ -781,7 +781,7 @@ mod tests {
                 assert_eq!(verified_payload, payload);
             }
             Err(e) => {
-                println!("JWT verification error: {}", e);
+                println!("JWT verification error: {e}");
             }
         }
 
@@ -798,7 +798,7 @@ mod tests {
     #[tokio::test]
     async fn test_websocket_server_and_client() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
@@ -860,7 +860,7 @@ mod tests {
                 }
             }
             Err(e) => {
-                println!("WebSocket connection failed: {}", e);
+                println!("WebSocket connection failed: {e}");
             }
         }
 
@@ -872,7 +872,7 @@ mod tests {
     #[tokio::test]
     async fn test_custom_middleware() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -922,7 +922,7 @@ mod tests {
                 assert!(body.contains("custom middleware sync"));
             }
             Err(e) => {
-                println!("Custom sync middleware request error: {}", e);
+                println!("Custom sync middleware request error: {e}");
             }
         }
 
@@ -941,7 +941,7 @@ mod tests {
                 assert!(body.contains("custom middleware async"));
             }
             Err(e) => {
-                println!("Custom async middleware request error: {}", e);
+                println!("Custom async middleware request error: {e}");
             }
         }
 
@@ -958,7 +958,7 @@ mod tests {
     #[tokio::test]
     async fn test_response_types() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
@@ -997,7 +997,7 @@ mod tests {
                 println!("Query string test: status {}", res.http_code);
             }
             Err(e) => {
-                println!("Query string error: {}", e);
+                println!("Query string error: {e}");
             }
         }
 
@@ -1006,13 +1006,13 @@ mod tests {
             "X-Test-Header".to_string(),
             "test-value".to_string(),
         ))];
-        let url = format!("{}", base_url);
+        let url = format!("{base_url}");
         match potato::get(&url, headers).await {
             Ok(res) => {
                 println!("Custom headers test: status {}", res.http_code);
             }
             Err(e) => {
-                println!("Custom headers error: {}", e);
+                println!("Custom headers error: {e}");
             }
         }
 
@@ -1024,7 +1024,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_requests() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
@@ -1057,7 +1057,7 @@ mod tests {
                     println!("Request {} error: {}", i, e);
                 }
                 Err(e) => {
-                    println!("Join error: {}", e);
+                    println!("Join error: {e}");
                 }
             }
         }
@@ -1072,7 +1072,7 @@ mod tests {
     #[tokio::test]
     async fn test_large_body_handling() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         server.configure(|ctx| {
@@ -1094,7 +1094,7 @@ mod tests {
                 println!("Small body response: {}", res.http_code);
             }
             Err(e) => {
-                println!("Small body error: {}", e);
+                println!("Small body error: {e}");
             }
         }
 
@@ -1105,7 +1105,7 @@ mod tests {
                 println!("Medium body response: {}", res.http_code);
             }
             Err(e) => {
-                println!("Medium body error: {}", e);
+                println!("Medium body error: {e}");
             }
         }
 
@@ -1116,7 +1116,7 @@ mod tests {
                 println!("Large body response: {}", res.http_code);
             }
             Err(e) => {
-                println!("Large body error: {}", e);
+                println!("Large body error: {e}");
             }
         }
 

@@ -358,6 +358,11 @@ async fn large_upload(req: &mut HttpRequest) -> HttpResponse {
 
 通过 `use_transfer_limit` 中间件限制连接的数据传输速率（单位：bits/sec）。
 
+**支持情况**：
+- ✅ **HTTP/1.1**：完全支持，基于 TCP 流的令牌桶算法实现
+- ❌ **HTTP/2**：不支持（使用 h2 框架，未实现速率限制）
+- ❌ **HTTP/3**：不支持（使用 QUIC/h3 框架，未实现速率限制）
+
 ```rust
 server.configure(|ctx| {
     // 入站 10 Mbps，出站 20 Mbps
@@ -369,3 +374,4 @@ server.configure(|ctx| {
 - 入站速率：限制接收请求数据的速度
 - 出站速率：限制发送响应数据的速度
 - 超出限制时自动延迟传输
+- 仅对 HTTP/1.1 连接生效

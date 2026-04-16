@@ -160,7 +160,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_decodes_all_chunked_response_chunks() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let listener = TcpListener::bind(&server_addr).await?;
 
         let server_task = tokio::spawn(async move {
@@ -201,7 +201,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_decodes_chunked_response_trailers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let listener = TcpListener::bind(&server_addr).await?;
 
         let server_task = tokio::spawn(async move {
@@ -244,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_creation_and_configuration() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -285,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_shutdown_signal() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -318,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_configuration_options() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -358,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_protocols_availability() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let _server = HttpServer::new(&server_addr);
 
         // serve_http 方法应该存在
@@ -372,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_from_string() -> anyhow::Result<()> {
         let port = get_test_port();
-        let addr_string = format!("127.0.0.1:{}", port);
+        let addr_string = format!("127.0.0.1:{port}");
 
         // 从 String 创建
         let _server1 = HttpServer::new(addr_string.clone());
@@ -389,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_signal_once() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -417,7 +417,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -460,7 +460,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -501,7 +501,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -542,7 +542,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -588,7 +588,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -626,7 +626,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -664,7 +664,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -701,7 +701,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -742,7 +742,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -776,7 +776,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -811,7 +811,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -847,7 +847,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -883,7 +883,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -924,7 +924,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -959,7 +959,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_rejects_connect_method_with_status() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -994,7 +994,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -1207,7 +1207,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_rejects_authority_form_for_non_connect() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -1237,7 +1237,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_rejects_origin_form_for_connect() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -1277,7 +1277,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -1329,7 +1329,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -1398,7 +1398,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -1432,7 +1432,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -1470,7 +1470,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -1508,7 +1508,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -1544,7 +1544,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         let server_handle = tokio::spawn(async move {
@@ -1575,7 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn test_static_file_route_supports_range_partial_content() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let temp_dir = env::temp_dir().join(format!("potato-range-{}", port));
         fs::create_dir_all(&temp_dir)?;
         let file_path = temp_dir.join("sample.txt");
@@ -1618,7 +1618,7 @@ mod tests {
     #[tokio::test]
     async fn test_static_file_route_returns_416_for_unsatisfiable_range() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let temp_dir = env::temp_dir().join(format!("potato-range-{}", port));
         fs::create_dir_all(&temp_dir)?;
         let file_path = temp_dir.join("sample.txt");
@@ -1772,7 +1772,7 @@ mod tests {
     #[tokio::test]
     async fn test_embedded_route_supports_range_partial_content() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
         let mut assets: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
         assets.insert("sample.txt".to_string(), Cow::Borrowed(b"HelloRangeWorld"));
@@ -1808,7 +1808,7 @@ mod tests {
     #[tokio::test]
     async fn test_embedded_route_etag_roundtrip_returns_304() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
         let mut assets: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
         assets.insert("etag.txt".to_string(), Cow::Borrowed(b"etag-body"));
@@ -1847,7 +1847,7 @@ mod tests {
     #[tokio::test]
     async fn test_embedded_route_returns_416_for_unsatisfiable_range() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
         let mut assets: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
         assets.insert("sample.txt".to_string(), Cow::Borrowed(b"short"));

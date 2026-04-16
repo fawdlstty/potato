@@ -106,7 +106,7 @@ impl WebRTCClient {
                     ("unknown", media_type)
                 };
 
-                let stream_id = format!("{}_{}", publisher_id, media_type);
+                let stream_id = format!("{publisher_id}_{media_type}");
                 println!(
                     "媒体流 stream_id: {} (from track.stream_id: {})",
                     stream_id, stream_id_str
@@ -130,7 +130,7 @@ impl WebRTCClient {
                                 .dispatch_rtp_packet_direct(&stream_id, packet_data)
                                 .await
                             {
-                                eprintln!("发送媒体包失败: {}", e);
+                                eprintln!("发送媒体包失败: {e}");
                             }
                         }
                         Err(_) => {
@@ -204,7 +204,7 @@ impl WebRTCClient {
                     ))
                     .await
                 {
-                    eprintln!("发送离开房间信令失败: {}", e);
+                    eprintln!("发送离开房间信令失败: {e}");
                 }
             }
 
@@ -303,7 +303,7 @@ impl WebRTCClient {
                             ))
                             .await
                         {
-                            eprintln!("发送 ICE 候选失败: {}", e);
+                            eprintln!("发送 ICE 候选失败: {e}");
                         }
                     }
                 })
@@ -396,7 +396,7 @@ impl<'a> SubscriptionBuilder<'a> {
         }
 
         // 4. 创建媒体流处理器
-        let stream_id = format!("{}_{}", self.publisher_id, media_type);
+        let stream_id = format!("{}_{media_type}", self.publisher_id);
         let config = if media_type == "video" {
             MediaStreamConfig {
                 media_type: MediaType::Video,
@@ -460,7 +460,7 @@ impl Drop for WebRTCClient {
         let pc = self.peer_connection.clone();
         tokio::spawn(async move {
             if let Err(e) = pc.close().await {
-                eprintln!("关闭PeerConnection失败: {}", e);
+                eprintln!("关闭PeerConnection失败: {e}");
             }
         });
     }

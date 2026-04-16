@@ -133,7 +133,7 @@ impl AcmeManager {
 
         std::fs::create_dir_all(&cert_dir)?;
 
-        let account_path = format!("{}/account.json", cert_dir);
+        let account_path = format!("{cert_dir}/account.json");
 
         // 尝试加载已有账户
         let account = if let Ok(creds_str) = std::fs::read_to_string(&account_path) {
@@ -155,8 +155,8 @@ impl AcmeManager {
 
         // 尝试加载已有证书
         let cert_dir_clone = cert_dir.clone();
-        let cert_path = format!("{}/cert.pem", cert_dir_clone);
-        let key_path = format!("{}/key.pem", cert_dir_clone);
+        let cert_path = format!("{cert_dir_clone}/cert.pem");
+        let key_path = format!("{cert_dir_clone}/key.pem");
 
         let acceptor = if std::path::Path::new(&cert_path).exists()
             && std::path::Path::new(&key_path).exists()
@@ -185,7 +185,7 @@ impl AcmeManager {
         let (account, credentials) = Account::builder()?
             .create(
                 &NewAccount {
-                    contact: &[&format!("mailto:{}", email)],
+                    contact: &[&format!("mailto:{email}")],
                     terms_of_service_agreed: true,
                     only_return_existing: false,
                 },
@@ -322,13 +322,13 @@ impl AcmeManager {
                     match self.obtain_certificate().await {
                         Ok((cert_pem, key_pem)) => {
                             if let Err(e) = acceptor.reload(&cert_pem, &key_pem).await {
-                                eprintln!("[ACME] Failed to reload certificate: {}", e);
+                                eprintln!("[ACME] Failed to reload certificate: {e}");
                             } else {
                                 println!("[ACME] Certificate renewed successfully");
                             }
                         }
                         Err(e) => {
-                            eprintln!("[ACME] Failed to renew certificate: {}", e);
+                            eprintln!("[ACME] Failed to renew certificate: {e}");
                         }
                     }
                 } else {
@@ -340,13 +340,13 @@ impl AcmeManager {
                 match self.obtain_certificate().await {
                     Ok((cert_pem, key_pem)) => {
                         if let Err(e) = acceptor.reload(&cert_pem, &key_pem).await {
-                            eprintln!("[ACME] Failed to reload certificate: {}", e);
+                            eprintln!("[ACME] Failed to reload certificate: {e}");
                         } else {
                             println!("[ACME] Certificate obtained and loaded successfully");
                         }
                     }
                     Err(e) => {
-                        eprintln!("[ACME] Failed to obtain certificate: {}", e);
+                        eprintln!("[ACME] Failed to obtain certificate: {e}");
                     }
                 }
             }

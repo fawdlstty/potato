@@ -19,7 +19,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_basic_server_client_interaction() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         // 启动服务器
@@ -30,7 +30,7 @@ mod integration_tests {
         sleep(Duration::from_millis(300)).await;
 
         // 测试基本GET请求
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
         match potato::get(&url, vec![]).await {
             Ok(res) => {
                 // 服务器应该返回某种响应
@@ -51,7 +51,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_concurrent_requests() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let addr_clone = server_addr.clone();
 
         let mut server = HttpServer::new(&server_addr);
@@ -67,7 +67,7 @@ mod integration_tests {
             .map(|i| {
                 let addr = addr_clone.clone();
                 tokio::spawn(async move {
-                    let url = format!("http://{}/test{}", addr, i);
+                    let url = format!("http://{addr}/test{i}");
                     let _ = potato::get(&url, vec![]).await;
                 })
             })
@@ -86,7 +86,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_various_http_methods() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -96,7 +96,7 @@ mod integration_tests {
 
         sleep(Duration::from_millis(300)).await;
 
-        let url = format!("http://{}/api/test", server_addr);
+        let url = format!("http://{server_addr}/api/test");
 
         // 测试GET
         let _ = potato::get(&url, vec![]).await;
@@ -124,7 +124,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_session_reuse() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -138,7 +138,7 @@ mod integration_tests {
 
         // 使用同一会话发送多个请求
         for i in 0..3 {
-            let url = format!("http://{}/path{}", server_addr, i);
+            let url = format!("http://{server_addr}/path{i}");
             let _ = session.get(&url, vec![]).await;
             sleep(Duration::from_millis(50)).await;
         }
@@ -151,7 +151,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_custom_headers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -161,7 +161,7 @@ mod integration_tests {
 
         sleep(Duration::from_millis(300)).await;
 
-        let url = format!("http://{}/api", server_addr);
+        let url = format!("http://{server_addr}/api");
         let headers = vec![
             potato::Headers::User_Agent("test-agent/1.0".into()),
             potato::Headers::Custom(("X-Test-Header".to_string(), "test-value".to_string())),
@@ -177,7 +177,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_content_types() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -188,13 +188,13 @@ mod integration_tests {
         sleep(Duration::from_millis(300)).await;
 
         // 发送JSON内容
-        let json_url = format!("http://{}/json", server_addr);
+        let json_url = format!("http://{server_addr}/json");
         let json_body = r#"{"test": "data"}"#.as_bytes().to_vec();
         let headers = vec![potato::Headers::Content_Type("application/json".into())];
         let _ = potato::post(&json_url, json_body, headers).await;
 
         // 发送表单数据
-        let form_url = format!("http://{}/form", server_addr);
+        let form_url = format!("http://{server_addr}/form");
         let form_body = b"key=value&foo=bar".to_vec();
         let headers = vec![potato::Headers::Content_Type(
             "application/x-www-form-urlencoded".into(),
@@ -209,7 +209,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_response_handling() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -219,7 +219,7 @@ mod integration_tests {
 
         sleep(Duration::from_millis(300)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
         match potato::get(&url, vec![]).await {
             Ok(response) => {
                 println!("Response code: {}", response.http_code);
@@ -234,7 +234,7 @@ mod integration_tests {
                 assert!(!response.headers.is_empty() || response.headers.is_empty());
             }
             Err(e) => {
-                println!("Request error: {}", e);
+                println!("Request error: {e}");
             }
         }
 
@@ -246,7 +246,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_websocket_connection() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -270,7 +270,7 @@ mod integration_tests {
             }
             Err(e) => {
                 // 没有WebSocket端点是正常的
-                println!("WebSocket connection failed (expected): {}", e);
+                println!("WebSocket connection failed (expected): {e}");
             }
         }
 
@@ -282,7 +282,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_large_request_body() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -301,7 +301,7 @@ mod integration_tests {
                 println!("Large request sent successfully");
             }
             Err(e) => {
-                println!("Large request failed: {}", e);
+                println!("Large request failed: {e}");
             }
         }
 
@@ -319,7 +319,7 @@ mod integration_tests {
                 panic!("Should not connect to non-existent server");
             }
             Err(e) => {
-                println!("Expected connection error: {}", e);
+                println!("Expected connection error: {e}");
                 assert!(true);
             }
         }
@@ -331,7 +331,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_response_body_parsing() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -341,7 +341,7 @@ mod integration_tests {
 
         sleep(Duration::from_millis(300)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
         match potato::get(&url, vec![]).await {
             Ok(response) => {
                 // 尝试将响应体解析为 UTF-8 字符串
@@ -351,7 +351,7 @@ mod integration_tests {
                             println!("Response as string length: {}", text.len());
                         }
                         Err(e) => {
-                            println!("Response is not valid UTF-8: {}", e);
+                            println!("Response is not valid UTF-8: {e}");
                         }
                     },
                     potato::HttpResponseBody::Stream(_) => {
@@ -360,7 +360,7 @@ mod integration_tests {
                 }
             }
             Err(e) => {
-                println!("Request failed: {}", e);
+                println!("Request failed: {e}");
             }
         }
 

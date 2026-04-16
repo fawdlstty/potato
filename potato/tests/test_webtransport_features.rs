@@ -2,10 +2,6 @@
 
 #[cfg(feature = "http3")]
 mod tests {
-    use potato::WebTransportSession;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
     #[tokio::test]
     async fn test_webtransport_session_creation() {
         // 测试会话创建 - 这里只是基本结构测试

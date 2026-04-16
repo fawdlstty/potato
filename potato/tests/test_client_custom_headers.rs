@@ -18,7 +18,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_macro_custom_headers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -27,7 +27,7 @@ mod tests {
 
         sleep(Duration::from_millis(200)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
 
         // 测试混合使用标准 header 和 custom header
         let _res = potato::get!(
@@ -48,7 +48,7 @@ mod tests {
     #[tokio::test]
     async fn test_post_macro_custom_headers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -79,7 +79,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_macro_custom_headers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -109,7 +109,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_macro_custom_headers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -138,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn test_patch_macro_custom_headers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -167,7 +167,7 @@ mod tests {
     #[tokio::test]
     async fn test_other_macros_custom_headers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -176,7 +176,7 @@ mod tests {
 
         sleep(Duration::from_millis(200)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
 
         // 测试 head 宏
         let _res = potato::head!(&url, "X-Test-Head" = "head-value").await;
@@ -198,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn test_pure_custom_headers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -207,7 +207,7 @@ mod tests {
 
         sleep(Duration::from_millis(200)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
 
         // 只使用 custom header
         let _res = potato::get!(
@@ -228,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn test_standard_headers_backward_compat() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -237,7 +237,7 @@ mod tests {
 
         sleep(Duration::from_millis(200)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
 
         // 只使用标准 header（向后兼容）
         let _res = potato::get!(

@@ -53,7 +53,7 @@ mod http3_tests {
     #[tokio::test]
     async fn test_serve_http3_accepts_http3_requests() -> anyhow::Result<()> {
         let port = get_test_port();
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("127.0.0.1:{port}");
         let (cert_file, key_file, cert_der) = create_test_cert_files()?;
 
         let mut server = potato::HttpServer::new(&addr);

@@ -17,7 +17,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_string_return() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::http_get("/test-string")]
         async fn handler_string() -> String {
@@ -49,7 +49,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_static_str_return() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::http_get("/test-static-str")]
         async fn handler_static_str() -> &'static str {
@@ -81,7 +81,7 @@ mod tests {
     #[tokio::test]
     async fn test_async_result_string_return() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::http_get("/test-result-string")]
         async fn handler_result_string(success: bool) -> anyhow::Result<String> {
@@ -117,7 +117,7 @@ mod tests {
     #[tokio::test]
     async fn test_sync_string_return() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::http_get("/test-string-sync")]
         fn handler_string_sync() -> String {
@@ -149,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn test_sync_static_str_return() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::http_get("/test-static-str-sync")]
         fn handler_static_str_sync() -> &'static str {

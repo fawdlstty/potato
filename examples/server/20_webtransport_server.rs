@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
                     Err(e) => {
-                        eprintln!("接受流失败: {}", e);
+                        eprintln!("接受流失败: {e}");
                         break;
                     }
                 }
@@ -61,7 +61,7 @@ async fn handle_bi_stream(mut stream: potato::WebTransportStream) {
 
                 // 回显数据
                 if let Err(e) = stream.send(&data).await {
-                    eprintln!("发送数据失败: {}", e);
+                    eprintln!("发送数据失败: {e}");
                     break;
                 }
             }
@@ -70,7 +70,7 @@ async fn handle_bi_stream(mut stream: potato::WebTransportStream) {
                 break;
             }
             Err(e) => {
-                eprintln!("接收数据失败: {}", e);
+                eprintln!("接收数据失败: {e}");
                 break;
             }
         }

@@ -82,7 +82,7 @@ fn parse_cors_attr(tokens: &proc_macro2::TokenStream) -> CorsAttrConfig {
 
     match parse_inner.parse2(tokens.clone()) {
         Ok(cfg) => cfg,
-        Err(e) => panic!("Failed to parse cors attributes: {}", e),
+        Err(e) => panic!("Failed to parse cors attributes: {e}"),
     }
 }
 
@@ -1548,19 +1548,19 @@ pub fn postprocess(attr: TokenStream, input: TokenStream) -> TokenStream {
 /// * 命名参数: `#[potato::limit_size(header = 2 * 1024 * 1024, body = 500 * 1024 * 1024)]`
 ///
 /// # 示例
-/// ```rust
+/// ```rust,ignore
 /// // 限制 body 为 1GB
 /// #[potato::http_post("/upload")]
 /// #[potato::limit_size(1024 * 1024 * 1024)]
-/// async fn large_upload(req: &mut HttpRequest) -> HttpResponse {
-///     // ...
+/// async fn large_upload(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+///     todo!()
 /// }
 ///
 /// // 分别限制 header 和 body
 /// #[potato::http_post("/upload")]
 /// #[potato::limit_size(header = 2 * 1024 * 1024, body = 500 * 1024 * 1024)]
-/// async fn medium_upload(req: &mut HttpRequest) -> HttpResponse {
-///     // ...
+/// async fn medium_upload(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+///     todo!()
 /// }
 /// ```
 #[proc_macro_attribute]

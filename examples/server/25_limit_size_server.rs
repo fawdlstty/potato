@@ -5,7 +5,7 @@
 #[potato::http_post("/upload")]
 async fn upload_file(req: &mut potato::HttpRequest) -> potato::HttpResponse {
     let body_size = req.body.len();
-    potato::HttpResponse::text(format!("upload success, body size: {} bytes", body_size))
+    potato::HttpResponse::text(format!("upload success, body size: {body_size} bytes"))
 }
 
 // 使用注解覆盖全局限制: 允许 100MB body
@@ -14,8 +14,7 @@ async fn upload_file(req: &mut potato::HttpRequest) -> potato::HttpResponse {
 async fn large_upload(req: &mut potato::HttpRequest) -> potato::HttpResponse {
     let body_size = req.body.len();
     potato::HttpResponse::text(format!(
-        "large upload success, body size: {} bytes",
-        body_size
+        "large upload success, body size: {body_size} bytes"
     ))
 }
 
@@ -25,8 +24,7 @@ async fn large_upload(req: &mut potato::HttpRequest) -> potato::HttpResponse {
 async fn medium_upload(req: &mut potato::HttpRequest) -> potato::HttpResponse {
     let body_size = req.body.len();
     potato::HttpResponse::text(format!(
-        "medium upload success, body size: {} bytes",
-        body_size
+        "medium upload success, body size: {body_size} bytes"
     ))
 }
 
@@ -36,8 +34,7 @@ async fn medium_upload(req: &mut potato::HttpRequest) -> potato::HttpResponse {
 async fn small_upload(req: &mut potato::HttpRequest) -> potato::HttpResponse {
     let body_size = req.body.len();
     potato::HttpResponse::text(format!(
-        "small upload success, body size: {} bytes",
-        body_size
+        "small upload success, body size: {body_size} bytes"
     ))
 }
 

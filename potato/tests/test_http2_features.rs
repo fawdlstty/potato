@@ -135,7 +135,7 @@ mod http2_tests {
     #[tokio::test]
     async fn test_serve_http2_accepts_https_http11_fallback() -> anyhow::Result<()> {
         let port = get_test_port();
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("127.0.0.1:{port}");
         let (cert_file, key_file, cert) = create_test_cert_files()?;
 
         let mut server = potato::HttpServer::new(&addr);
@@ -163,7 +163,7 @@ mod http2_tests {
     #[tokio::test]
     async fn test_serve_http2_accepts_http2_requests() -> anyhow::Result<()> {
         let port = get_test_port();
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("127.0.0.1:{port}");
         let (cert_file, key_file, cert) = create_test_cert_files()?;
 
         let mut server = potato::HttpServer::new(&addr);
@@ -201,7 +201,7 @@ mod http2_tests {
     #[tokio::test]
     async fn test_http2_head_response_has_no_body() -> anyhow::Result<()> {
         let port = get_test_port();
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("127.0.0.1:{port}");
         let (cert_file, key_file, cert) = create_test_cert_files()?;
 
         let mut server = potato::HttpServer::new(&addr);
@@ -239,7 +239,7 @@ mod http2_tests {
     #[tokio::test]
     async fn test_http2_204_and_trailers_semantics() -> anyhow::Result<()> {
         let port = get_test_port();
-        let addr = format!("127.0.0.1:{}", port);
+        let addr = format!("127.0.0.1:{port}");
         let (cert_file, key_file, cert) = create_test_cert_files()?;
 
         let mut server = potato::HttpServer::new(&addr);

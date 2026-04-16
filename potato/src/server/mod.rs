@@ -133,10 +133,7 @@ impl Clone for PipeContextItem {
             #[cfg(feature = "webdav")]
             PipeContextItem::Webdav(v) => PipeContextItem::Webdav(v.clone()),
             #[cfg(feature = "http3")]
-            PipeContextItem::WebTransport(_) => {
-                // WebTransport cannot be cloned, so we panic to indicate misuse
-                panic!("WebTransport handler cannot be cloned")
-            }
+            PipeContextItem::WebTransport(_) => panic!("WebTransport handler cannot be cloned"),
             #[cfg(feature = "webrtc")]
             PipeContextItem::WebRTC(v) => PipeContextItem::WebRTC(v.clone()),
         }
@@ -502,6 +499,7 @@ impl PipeContext {
     ///
     /// # 示例
     /// ```rust
+    /// let mut server = potato::HttpServer::new("127.0.0.1:8080");
     /// server.configure(|ctx| {
     ///     ctx.use_limit_size(1024 * 1024, 50 * 1024 * 1024); // 1MB header, 50MB body
     ///     ctx.use_handlers();
@@ -522,6 +520,7 @@ impl PipeContext {
     ///
     /// # 示例
     /// ```rust
+    /// let mut server = potato::HttpServer::new("127.0.0.1:8080");
     /// server.configure(|ctx| {
     ///     ctx.use_transfer_limit(10_000_000, 20_000_000); // 入站 10 Mbps，出站 20 Mbps
     ///     ctx.use_handlers();
@@ -1099,7 +1098,7 @@ impl PipeContext {
 
                     match transfer_session.transfer(req, *modify_content).await {
                         Ok(response) => return response,
-                        Err(err) => return HttpResponse::error(format!("{}", err)),
+                        Err(err) => return HttpResponse::error(format!("{err}")),
                     }
                 }
 
@@ -1172,7 +1171,6 @@ impl PipeContext {
                             _ => http::Version::HTTP_11,
                         };
                         // Modify URI to remove the specified path prefix and preserve original scheme and authority
-                        use std::str::FromStr;
                         let adjusted_path = if req.url_path.starts_with(path) {
                             // Remove the path prefix from the original path
                             &req.url_path[path.len()..]
@@ -1190,7 +1188,7 @@ impl PipeContext {
                         // Try to get original URI and preserve scheme/authority if available
                         match req.get_uri(false) {
                             Ok(original_uri) => {
-                                *new_req.uri_mut() = http::uri::Builder::new()
+                                *new_req.uri_mut() = match http::uri::Builder::new()
                                     .scheme(
                                         original_uri.scheme().map(|s| s.as_str()).unwrap_or("http"),
                                     )
@@ -1202,14 +1200,28 @@ impl PipeContext {
                                     )
                                     .path_and_query(final_path)
                                     .build()
-                                    .unwrap_or_else(|_| http::Uri::from_str(final_path).unwrap());
+                                {
+                                    Ok(uri) => uri,
+                                    Err(e) => {
+                                        return HttpResponse::error(format!(
+                                            "Failed to build URI: {e}"
+                                        ));
+                                    }
+                                };
                             }
                             Err(_) => {
                                 // If original URI is not available, construct with path only
-                                *new_req.uri_mut() = http::uri::Builder::new()
+                                *new_req.uri_mut() = match http::uri::Builder::new()
                                     .path_and_query(final_path)
                                     .build()
-                                    .unwrap_or_else(|_| http::Uri::from_str(final_path).unwrap());
+                                {
+                                    Ok(uri) => uri,
+                                    Err(e) => {
+                                        return HttpResponse::error(format!(
+                                            "Failed to build URI: {e}"
+                                        ));
+                                    }
+                                };
                             }
                         };
                         for (k, v) in req.headers.iter() {
@@ -1260,7 +1272,7 @@ impl PipeContext {
                         let host = req.get_header("Host").unwrap_or("127.0.0.1:8080");
                         let json_response = serde_json::json!({
                             "status": "WebRTC REST signaling endpoint",
-                            "ws_url": format!("ws://{}{}", host, config.ws_path),
+                            "ws_url": format!("ws://{host}{}", config.ws_path),
                             "rest_prefix": config.rest_prefix,
                         });
                         let mut res = HttpResponse::json(json_response.to_string());
@@ -1426,7 +1438,7 @@ impl HttpServer {
         let acceptor_clone = acme_acceptor.clone();
         tokio::spawn(async move {
             if let Err(e) = manager_clone.start_renewal_loop(acceptor_clone).await {
-                eprintln!("[ACME] Renewal loop error: {}", e);
+                eprintln!("[ACME] Renewal loop error: {e}");
             }
         });
 

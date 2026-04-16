@@ -29,7 +29,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_request_methods() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -90,7 +90,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_request_headers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -101,7 +101,7 @@ mod tests {
         sleep(Duration::from_millis(200)).await;
 
         let mut session = potato::Session::new();
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
 
         // 测试带请求头的请求
         let headers = vec![
@@ -120,7 +120,7 @@ mod tests {
     #[tokio::test]
     async fn test_global_client_api() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -130,7 +130,7 @@ mod tests {
 
         sleep(Duration::from_millis(200)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
 
         let _res = potato::get!(&url).await;
         println!("✅ Global GET macro works");
@@ -182,7 +182,7 @@ mod tests {
         // 与客户端 API 配合
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -192,7 +192,7 @@ mod tests {
 
         sleep(Duration::from_millis(200)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
 
         // 使用 tokio 的超时包装
         let result = tokio::time::timeout(Duration::from_secs(5), potato::get!(&url)).await;
@@ -217,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_session_multiple_requests() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -247,7 +247,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_json_api() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -273,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_json_str_api() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
 
@@ -298,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_macro_headers() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -307,7 +307,7 @@ mod tests {
 
         sleep(Duration::from_millis(200)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
         let _res = potato::get!(&url, User_Agent = "test-client/1.0").await;
         let _res = potato::post!(&url, vec![], User_Agent = "test-client/1.0").await;
 

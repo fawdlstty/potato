@@ -358,6 +358,11 @@ async fn large_upload(req: &mut HttpRequest) -> HttpResponse {
 
 Limit connection data transfer rate using `use_transfer_limit` middleware (unit: bits/sec).
 
+**Support Status**:
+- ✅ **HTTP/1.1**: Fully supported, implemented with token bucket algorithm on TCP streams
+- ❌ **HTTP/2**: Not supported (uses h2 framework, rate limiting not implemented)
+- ❌ **HTTP/3**: Not supported (uses QUIC/h3 framework, rate limiting not implemented)
+
 ```rust
 server.configure(|ctx| {
     // Inbound 10 Mbps, Outbound 20 Mbps
@@ -369,3 +374,4 @@ server.configure(|ctx| {
 - Inbound rate: limits request data reception speed
 - Outbound rate: limits response data transmission speed
 - Auto-delays transfer when rate limit exceeded
+- Only effective for HTTP/1.1 connections

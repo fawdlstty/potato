@@ -36,14 +36,14 @@ impl H3SessionImpl {
 
         // 连接到服务器
         let quic_conn = endpoint
-            .connect(format!("{}:{}", host, port).parse()?, &host)?
+            .connect(format!("{host}:{port}").parse()?, &host)?
             .await
-            .map_err(|e| anyhow!("QUIC connection failed: {}", e))?;
+            .map_err(|e| anyhow!("QUIC connection failed: {e}"))?;
 
         // 初始化 HTTP/3 客户端
         let (mut driver, send_request) = h3::client::new(h3_quinn::Connection::new(quic_conn))
             .await
-            .map_err(|e| anyhow!("HTTP/3 client initialization failed: {}", e))?;
+            .map_err(|e| anyhow!("HTTP/3 client initialization failed: {e}"))?;
 
         // 启动驱动任务
         let driver_handle = tokio::spawn(async move {
@@ -182,9 +182,9 @@ impl H3Session {
             let query: Vec<String> = req
                 .url_query
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
+                .map(|(k, v)| format!("{k}={v}"))
                 .collect();
-            format!("{}?{}", uri_str, query.join("&")).parse()?
+            format!("{uri_str}?{}", query.join("&")).parse()?
         } else {
             uri_str.parse()?
         };
@@ -222,27 +222,27 @@ impl H3Session {
             .send_request
             .send_request(request)
             .await
-            .map_err(|e| anyhow!("Failed to send request: {}", e))?;
+            .map_err(|e| anyhow!("Failed to send request: {e}"))?;
 
         // 如果有请求体，发送数据
         if has_body {
             stream
                 .send_data(bytes::Bytes::from(req.body.to_vec()))
                 .await
-                .map_err(|e| anyhow!("Failed to send request body: {}", e))?;
+                .map_err(|e| anyhow!("Failed to send request body: {e}"))?;
         }
 
         // 完成请求发送
         stream
             .finish()
             .await
-            .map_err(|e| anyhow!("Failed to finish request: {}", e))?;
+            .map_err(|e| anyhow!("Failed to finish request: {e}"))?;
 
         // 接收响应
         let response = stream
             .recv_response()
             .await
-            .map_err(|e| anyhow!("Failed to receive response: {}", e))?;
+            .map_err(|e| anyhow!("Failed to receive response: {e}"))?;
 
         let status = response.status().as_u16();
         let response_headers: Vec<(String, String)> = response
@@ -304,7 +304,7 @@ impl H3Session {
                         body_data.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
                     }
                     Ok(None) => break,
-                    Err(e) => return Err(anyhow!("Failed to read response body: {}", e)),
+                    Err(e) => return Err(anyhow!("Failed to read response body: {e}")),
                 }
             }
 
@@ -415,15 +415,15 @@ impl WebTransport {
 
         // 连接到服务器
         let connection = endpoint
-            .connect(format!("{}:{}", host, port).parse()?, host)?
+            .connect(format!("{host}:{port}").parse()?, host)?
             .await
-            .map_err(|e| anyhow!("QUIC connection failed: {}", e))?;
+            .map_err(|e| anyhow!("QUIC connection failed: {e}"))?;
 
         // 发送 HTTP/3 CONNECT 请求以建立 WebTransport 会话
         let (mut driver, mut send_request) =
             h3::client::new(h3_quinn::Connection::new(connection.clone()))
                 .await
-                .map_err(|e| anyhow!("HTTP/3 client initialization failed: {}", e))?;
+                .map_err(|e| anyhow!("HTTP/3 client initialization failed: {e}"))?;
 
         // 启动驱动任务
         let driver_handle = tokio::spawn(async move {
@@ -436,21 +436,21 @@ impl WebTransport {
             .uri(&path)
             .header(":protocol", "webtransport")
             .header(":scheme", "https")
-            .header(":authority", format!("{}:{}", host, port))
+            .header(":authority", format!("{host}:{port}"))
             .body(())
-            .map_err(|e| anyhow!("Failed to build CONNECT request: {}", e))?;
+            .map_err(|e| anyhow!("Failed to build CONNECT request: {e}"))?;
 
         // 发送 CONNECT 请求
         let mut stream = send_request
             .send_request(req)
             .await
-            .map_err(|e| anyhow!("Failed to send CONNECT request: {}", e))?;
+            .map_err(|e| anyhow!("Failed to send CONNECT request: {e}"))?;
 
         // 等待响应
         let response = stream
             .recv_response()
             .await
-            .map_err(|e| anyhow!("Failed to get response: {}", e))?;
+            .map_err(|e| anyhow!("Failed to get response: {e}"))?;
 
         if response.status() != 200 {
             return Err(anyhow!(

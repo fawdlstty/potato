@@ -19,7 +19,7 @@ async fn limited_3_handler() -> String {
 #[potato::http_post("/limited-10")]
 #[potato::max_concurrency(10)]
 async fn limited_10_handler(name: String) -> String {
-    format!("<h1>Hello {}, max 10 concurrent</h1>", name)
+    format!("<h1>Hello {name}, max 10 concurrent</h1>")
 }
 
 // 示例3：与其他标注一起使用 - CORS + max_concurrency
@@ -27,7 +27,7 @@ async fn limited_10_handler(name: String) -> String {
 #[potato::cors(origin = "https://example.com")]
 #[potato::max_concurrency(5)]
 async fn update_handler(data: String) -> String {
-    format!("Updated: {}", data)
+    format!("Updated: {data}")
 }
 
 // 示例4：与preprocess/postprocess一起使用
@@ -60,7 +60,7 @@ async fn delete_resource(id: String) -> anyhow::Result<String> {
     if id.is_empty() {
         anyhow::bail!("ID cannot be empty");
     }
-    Ok(format!("Resource {} deleted", id))
+    Ok(format!("Resource {id} deleted"))
 }
 
 #[tokio::main]

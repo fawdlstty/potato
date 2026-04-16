@@ -18,7 +18,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_macro_custom_variable_syntax() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -27,7 +27,7 @@ mod tests {
 
         sleep(Duration::from_millis(200)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
 
         // 测试 Custom(key) = value 语法
         let header_key = "X-Custom-Key";
@@ -49,7 +49,7 @@ mod tests {
     #[tokio::test]
     async fn test_post_macro_custom_variable_syntax() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -58,7 +58,7 @@ mod tests {
 
         sleep(Duration::from_millis(200)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
 
         // 测试 Custom(key) = value 语法与字符串字面量混合使用
         let auth_key = "Authorization";
@@ -82,7 +82,7 @@ mod tests {
     #[tokio::test]
     async fn test_mixed_header_syntax() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
         let server_handle = tokio::spawn(async move {
@@ -91,7 +91,7 @@ mod tests {
 
         sleep(Duration::from_millis(200)).await;
 
-        let url = format!("http://{}/", server_addr);
+        let url = format!("http://{server_addr}/");
 
         // 混合使用三种语法：
         // 1. 标准 header: User_Agent

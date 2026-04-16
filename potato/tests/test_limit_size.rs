@@ -29,7 +29,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         server.configure(|ctx| {
@@ -96,7 +96,7 @@ mod tests {
         Ok(())
     }
 
-    /// 测试 handler 注解覆盖全局限制
+    /// 测试 handler 注解的limit_size检查
     #[tokio::test]
     async fn test_handler_annotation_override() -> anyhow::Result<()> {
         // 全局限制 10MB
@@ -105,15 +105,15 @@ mod tests {
             HttpResponse::text(format!("upload success, size: {}", req.body.len()))
         }
 
-        // 注解限制 10MB（与全局相同）
-        #[potato::http_post("/large-upload")]
-        #[potato::limit_size(10 * 1024 * 1024)]
-        async fn large_upload(req: &mut HttpRequest) -> HttpResponse {
-            HttpResponse::text(format!("large upload success, size: {}", req.body.len()))
+        // 注解限制 100字节（更小）
+        #[potato::http_post("/small-upload")]
+        #[potato::limit_size(100)]
+        async fn small_upload(req: &mut HttpRequest) -> HttpResponse {
+            HttpResponse::text(format!("small upload success, size: {}", req.body.len()))
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         server.configure(|ctx| {
@@ -126,30 +126,53 @@ mod tests {
         });
         sleep(Duration::from_millis(300)).await;
 
-        // 测试 5MB body 到 /large-upload (应该成功)
+        // 测试 50字节 body 到 /small-upload (应该成功)
         let mut stream = connect_with_retry(&server_addr).await?;
-        let medium_body = vec![b'y'; 5 * 1024 * 1024]; // 5MB
+        let small_body = vec![b'a'; 50]; // 50字节
         let request = format!(
-            "POST /large-upload HTTP/1.1\r\n\
+            "POST /small-upload HTTP/1.1\r\n\
              Host: 127.0.0.1:{}\r\n\
              Content-Length: {}\r\n\
              Connection: close\r\n\
              \r\n",
             port,
-            medium_body.len()
+            small_body.len()
         );
         stream.write_all(request.as_bytes()).await?;
-        stream.write_all(&medium_body).await?;
+        stream.write_all(&small_body).await?;
         stream.shutdown().await?;
 
         let mut response = Vec::new();
         use tokio::io::AsyncReadExt;
         stream.read_to_end(&mut response).await?;
         let response_text = String::from_utf8_lossy(&response);
-        // 应该成功
+        // 应该成功 (50字节 < 100字节限制)
         assert!(response_text.contains("200 OK"));
-        assert!(response_text.contains("large upload success"));
-        println!("✅ Handler annotation override test passed");
+        assert!(response_text.contains("small upload success"));
+        println!("✅ Handler annotation small body test passed");
+
+        // 测试 200字节 body 到 /small-upload (应该失败，注解限制100字节)
+        let mut stream2 = connect_with_retry(&server_addr).await?;
+        let large_body = vec![b'b'; 200]; // 200字节
+        let request2 = format!(
+            "POST /small-upload HTTP/1.1\r\n\
+             Host: 127.0.0.1:{}\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            port,
+            large_body.len()
+        );
+        stream2.write_all(request2.as_bytes()).await?;
+        stream2.write_all(&large_body).await?;
+        stream2.shutdown().await?;
+
+        let mut response2 = Vec::new();
+        stream2.read_to_end(&mut response2).await?;
+        let response_text2 = String::from_utf8_lossy(&response2);
+        // 应该返回 413 (200字节 > 100字节注解限制)
+        assert!(response_text2.contains("413"));
+        println!("✅ Handler annotation large body test passed");
 
         server_handle.abort();
         Ok(())
@@ -174,7 +197,7 @@ mod tests {
     async fn test_limit_size_annotation_compilation() -> anyhow::Result<()> {
         // 此测试验证注解能够正确编译
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         server.configure(|ctx| {
@@ -221,7 +244,7 @@ mod tests {
         }
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
         server.configure(|ctx| {

@@ -79,7 +79,7 @@ impl WebTransportSession {
             Err(quinn::ConnectionError::ConnectionClosed(_)) => {
                 Err(anyhow::anyhow!("WebTransport connection closed"))
             }
-            Err(e) => Err(anyhow::anyhow!("Failed to read datagram: {}", e)),
+            Err(e) => Err(anyhow::anyhow!("Failed to read datagram: {e}")),
         }
     }
 
@@ -148,7 +148,7 @@ impl WebTransportStream {
             Err(quinn::ReadError::Reset(_)) => Ok(None),
             // 流已关闭
             Err(quinn::ReadError::ClosedStream) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("Failed to read from stream: {}", e)),
+            Err(e) => Err(anyhow::anyhow!("Failed to read from stream: {e}")),
         }
     }
 
@@ -326,7 +326,7 @@ pub async fn serve_http3_impl(
                                     )) = item
                                     {
                                         if path == wt_path
-                                            || path.starts_with(&format!("{}/", wt_path))
+                                            || path.starts_with(&format!("{wt_path}/"))
                                         {
                                             wt_handler = Some((config, handler));
                                             break;
@@ -409,9 +409,21 @@ pub async fn serve_http3_impl(
                     }
 
                     let mut request_body = Vec::new();
+                    let max_body_bytes = crate::global_config::ServerConfig::get_max_body_bytes();
                     loop {
                         match stream.recv_data().await {
                             Ok(Some(mut chunk)) => {
+                                let chunk_len = chunk.remaining();
+                                if request_body.len() + chunk_len > max_body_bytes {
+                                    let response =
+                                        match http::Response::builder().status(413).body(()) {
+                                            Ok(resp) => resp,
+                                            Err(_) => return,
+                                        };
+                                    let _ = stream.send_response(response).await;
+                                    let _ = stream.finish().await;
+                                    return;
+                                }
                                 request_body
                                     .extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
                             }

@@ -27,7 +27,7 @@ mod tests {
         // 在真实场景中需要有效的证书文件
 
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         // 创建服务器
         let mut server = HttpServer::new(&server_addr);
@@ -53,7 +53,7 @@ mod tests {
             }
             Some(Err(e)) => {
                 // 预期的错误（证书不存在或 jemalloc 初始化失败）
-                println!("Expected error: {}", e);
+                println!("Expected error: {e}");
                 // 检查是否是证书错误、文件不存在错误或 jemalloc 错误
                 if e.to_string().contains("cert.pem")
                     || e.to_string().contains("key.pem")
@@ -80,7 +80,7 @@ mod tests {
     #[tokio::test]
     async fn test_https_server_creation() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         // 创建服务器应该总是成功的
         let _server = HttpServer::new(&server_addr);

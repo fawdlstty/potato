@@ -18,7 +18,7 @@ async fn test_once_cache_in_handler() -> anyhow::Result<()> {
     }
 
     let port = 18090;
-    let server_addr = format!("127.0.0.1:{}", port);
+    let server_addr = format!("127.0.0.1:{port}");
     let mut server = HttpServer::new(&server_addr);
 
     let server_handle = tokio::spawn(async move {
@@ -41,7 +41,7 @@ async fn test_once_cache_in_handler() -> anyhow::Result<()> {
             println!("✅ Handler with OnceCache test passed");
         }
         Err(e) => {
-            panic!("Handler with OnceCache test failed: {}", e);
+            panic!("Handler with OnceCache test failed: {e}");
         }
     }
 
@@ -61,7 +61,7 @@ async fn test_once_cache_in_preprocess() -> anyhow::Result<()> {
 
     // 测试 preprocess 中使用 OnceCache 传递数据给 handler
     #[potato::preprocess]
-    async fn pre_with_cache(req: &mut HttpRequest, cache: &mut OnceCache) {
+    async fn pre_with_cache(_req: &mut HttpRequest, cache: &mut OnceCache) {
         PREPROCESS_CALLED.fetch_add(1, Ordering::Relaxed);
         cache.set("user_id", 12345u32);
         cache.set("username", "test_user".to_string());
@@ -80,7 +80,7 @@ async fn test_once_cache_in_preprocess() -> anyhow::Result<()> {
     }
 
     let port = 18091;
-    let server_addr = format!("127.0.0.1:{}", port);
+    let server_addr = format!("127.0.0.1:{port}");
     let mut server = HttpServer::new(&server_addr);
 
     let server_handle = tokio::spawn(async move {
@@ -105,7 +105,7 @@ async fn test_once_cache_in_preprocess() -> anyhow::Result<()> {
             println!("✅ Preprocess with OnceCache test passed");
         }
         Err(e) => {
-            panic!("Preprocess with OnceCache test failed: {}", e);
+            panic!("Preprocess with OnceCache test failed: {e}");
         }
     }
 
@@ -152,7 +152,7 @@ async fn test_once_cache_in_postprocess() -> anyhow::Result<()> {
     }
 
     let port = 18092;
-    let server_addr = format!("127.0.0.1:{}", port);
+    let server_addr = format!("127.0.0.1:{port}");
     let mut server = HttpServer::new(&server_addr);
 
     let server_handle = tokio::spawn(async move {
@@ -177,7 +177,7 @@ async fn test_once_cache_in_postprocess() -> anyhow::Result<()> {
             println!("✅ Postprocess with OnceCache test passed");
         }
         Err(e) => {
-            panic!("Postprocess with OnceCache test failed: {}", e);
+            panic!("Postprocess with OnceCache test failed: {e}");
         }
     }
 
@@ -199,7 +199,7 @@ async fn test_once_cache_full_pipeline() -> anyhow::Result<()> {
 
     // 完整流程:preprocess -> handler -> postprocess 都使用 cache
     #[potato::preprocess]
-    fn pre_set_cache(req: &mut HttpRequest, cache: &mut OnceCache) {
+    fn pre_set_cache(_req: &mut HttpRequest, cache: &mut OnceCache) {
         PRE_CALLED.fetch_add(1, Ordering::Relaxed);
         cache.set("step", "preprocess".to_string());
         cache.set("data_from_pre", "pre_data".to_string());
@@ -244,7 +244,7 @@ async fn test_once_cache_full_pipeline() -> anyhow::Result<()> {
     }
 
     let port = 18093;
-    let server_addr = format!("127.0.0.1:{}", port);
+    let server_addr = format!("127.0.0.1:{port}");
     let mut server = HttpServer::new(&server_addr);
 
     let server_handle = tokio::spawn(async move {
@@ -270,7 +270,7 @@ async fn test_once_cache_full_pipeline() -> anyhow::Result<()> {
             println!("✅ Full pipeline with OnceCache test passed");
         }
         Err(e) => {
-            panic!("Full pipeline with OnceCache test failed: {}", e);
+            panic!("Full pipeline with OnceCache test failed: {e}");
         }
     }
 
@@ -296,7 +296,7 @@ async fn test_once_cache_remove() -> anyhow::Result<()> {
     }
 
     let port = 18094;
-    let server_addr = format!("127.0.0.1:{}", port);
+    let server_addr = format!("127.0.0.1:{port}");
     let mut server = HttpServer::new(&server_addr);
 
     let server_handle = tokio::spawn(async move {
@@ -312,7 +312,7 @@ async fn test_once_cache_remove() -> anyhow::Result<()> {
             println!("✅ OnceCache remove test passed");
         }
         Err(e) => {
-            panic!("OnceCache remove test failed: {}", e);
+            panic!("OnceCache remove test failed: {e}");
         }
     }
 

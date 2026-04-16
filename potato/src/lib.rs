@@ -154,11 +154,11 @@ pub enum SessionCacheError {
 impl std::fmt::Display for SessionCacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SessionCacheError::InvalidToken(msg) => write!(f, "Invalid token: {}", msg),
+            SessionCacheError::InvalidToken(msg) => write!(f, "Invalid token: {msg}"),
             SessionCacheError::TokenExpired => write!(f, "Token has expired"),
             SessionCacheError::SessionExpired => write!(f, "Session has expired"),
             SessionCacheError::MissingAuthHeader => write!(f, "Missing Authorization header"),
-            SessionCacheError::InternalError(msg) => write!(f, "Internal error: {}", msg),
+            SessionCacheError::InternalError(msg) => write!(f, "Internal error: {msg}"),
         }
     }
 }
@@ -315,7 +315,7 @@ impl SessionCache {
             &DecodingKey::from_secret(&secret),
             &Validation::default(),
         )
-        .map_err(|e| SessionCacheError::InvalidToken(format!("Token decode failed: {}", e)))?;
+        .map_err(|e| SessionCacheError::InvalidToken(format!("Token decode failed: {e}")))?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -682,11 +682,7 @@ impl Websocket {
                 HttpResponseBody::Data(data) => str::from_utf8(&data[..])?,
                 HttpResponseBody::Stream(_) => "stream response",
             };
-            Err(anyhow!(
-                "Server return code[{}]: {}",
-                res.http_code,
-                body_str
-            ))?;
+            Err(anyhow!("Server return code[{}]: {body_str}", res.http_code))?;
         }
         let stream = sess
             .sess_impl
@@ -1728,9 +1724,8 @@ impl HttpRequest {
                     req.headers.insert(
                         expect_key,
                         LocalHipStr::from(format!(
-                            "{}, {}",
-                            existing.as_str(),
-                            normalized_header_value
+                            "{}, {normalized_header_value}",
+                            existing.as_str()
                         )),
                     );
                 } else {
@@ -2694,7 +2689,7 @@ impl HttpResponse {
                 }
                 transfer_encoding_seen = true;
                 if let Some(existing) = req.headers.get_mut("Transfer-Encoding") {
-                    *existing = format!("{}, {}", existing.as_ref(), header_value).into();
+                    *existing = format!("{}, {header_value}", existing.as_ref()).into();
                 } else {
                     req.headers
                         .insert("Transfer-Encoding".into(), header_value.to_string().into());
@@ -2743,15 +2738,19 @@ pub fn load_embed<T: Embed>() -> HashMap<String, Cow<'static, [u8]>> {
 ///
 /// # 示例
 ///
-/// ```rust
-/// // 基本连接
-/// let mut wt = potato::webtransport!("https://server.com/wt").await?;
+/// ```rust,no_run
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     // 基本连接
+///     let mut wt = potato::webtransport!("https://server.com/wt").await?;
 ///
-/// // 带自定义头连接
-/// let mut wt = potato::webtransport!(
-///     "https://server.com/wt",
-///     Authorization = "Bearer token"
-/// ).await?;
+///     // 带自定义头连接
+///     let mut wt = potato::webtransport!(
+///         "https://server.com/wt",
+///         Authorization = "Bearer token"
+///     ).await?;
+///     Ok(())
+/// }
 /// ```
 #[cfg(feature = "http3")]
 #[macro_export]

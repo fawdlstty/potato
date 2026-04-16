@@ -174,9 +174,9 @@ impl H2Session {
             let query: Vec<String> = req
                 .url_query
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
+                .map(|(k, v)| format!("{k}={v}"))
                 .collect();
-            format!("{}?{}", uri_str, query.join("&")).parse()?
+            format!("{uri_str}?{}", query.join("&")).parse()?
         } else {
             uri_str.parse()?
         };
@@ -217,7 +217,7 @@ impl H2Session {
             let mut send_stream = stream;
             send_stream
                 .send_data(Bytes::from(req.body.to_vec()), true)
-                .map_err(|e| anyhow!("Failed to send request body: {}", e))?;
+                .map_err(|e| anyhow!("Failed to send request body: {e}"))?;
         }
 
         // 等待响应

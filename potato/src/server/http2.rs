@@ -119,7 +119,7 @@ fn h2_method_to_http_method(method: &http::Method) -> anyhow::Result<HttpMethod>
         "PROPFIND" => HttpMethod::PROPFIND,
         "PROPPATCH" => HttpMethod::PROPPATCH,
         "TRACE" => HttpMethod::TRACE,
-        _ => anyhow::bail!("Unsupported HTTP method: {}", method),
+        _ => anyhow::bail!("Unsupported HTTP method: {method}"),
     })
 }
 
@@ -198,7 +198,7 @@ async fn handle_h2_request(
                 let response = http::Response::builder()
                     .status(400)
                     .body(())
-                    .map_err(|e| anyhow::anyhow!("Failed to build response: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to build response: {e}"))?;
                 let _ = respond.send_response(response, true);
                 return Ok(());
             }
@@ -208,8 +208,18 @@ async fn handle_h2_request(
     }
 
     let mut request_body = Vec::new();
+    let max_body_bytes = crate::global_config::ServerConfig::get_max_body_bytes();
     while let Some(chunk) = req_head.body_mut().data().await {
-        request_body.extend_from_slice(&chunk?);
+        let chunk = chunk?;
+        if request_body.len() + chunk.len() > max_body_bytes {
+            let response = http::Response::builder()
+                .status(413)
+                .body(())
+                .map_err(|e| anyhow::anyhow!("Failed to build response: {e}"))?;
+            let _ = respond.send_response(response, true);
+            return Ok(());
+        }
+        request_body.extend_from_slice(&chunk);
     }
     req.body = request_body.into();
 
@@ -224,7 +234,7 @@ async fn handle_h2_request(
     }
     let response = response_builder
         .body(())
-        .map_err(|e| anyhow::anyhow!("Failed to build response: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to build response: {e}"))?;
 
     let suppress_body = should_suppress_response_body(res.http_code, req.method);
     let eos = suppress_body && res.trailers.is_empty();
@@ -238,20 +248,20 @@ async fn handle_h2_request(
                     let eos = res.trailers.is_empty();
                     stream
                         .send_data(bytes::Bytes::from(data), eos)
-                        .map_err(|e| anyhow::anyhow!("Failed to send data: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Failed to send data: {e}"))?;
                 }
             }
             crate::HttpResponseBody::Stream(mut rx) => {
                 while let Some(chunk) = rx.recv().await {
                     stream
                         .send_data(bytes::Bytes::from(chunk), false)
-                        .map_err(|e| anyhow::anyhow!("Failed to send data: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Failed to send data: {e}"))?;
                 }
                 // 发送空帧表示结束
                 if !res.trailers.is_empty() {
                     stream
                         .send_data(bytes::Bytes::new(), false)
-                        .map_err(|e| anyhow::anyhow!("Failed to send data: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Failed to send data: {e}"))?;
                 }
             }
         }
@@ -271,7 +281,7 @@ async fn handle_h2_request(
         }
         stream
             .send_trailers(trailers)
-            .map_err(|e| anyhow::anyhow!("Failed to send trailers: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to send trailers: {e}"))?;
     }
 
     Ok(())

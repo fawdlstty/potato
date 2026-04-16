@@ -35,7 +35,7 @@ async fn connect_with_retry(addr: &str) -> anyhow::Result<TcpStream> {
 #[tokio::test]
 async fn test_transfer_rate_limit() -> anyhow::Result<()> {
     let port = get_test_port();
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
     let mut server = HttpServer::new(&addr);
 
     server.configure(|ctx| {
@@ -87,7 +87,7 @@ async fn test_transfer_rate_limit() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_no_rate_limit() -> anyhow::Result<()> {
     let port = get_test_port();
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
     let mut server = HttpServer::new(&addr);
 
     server.configure(|ctx| {

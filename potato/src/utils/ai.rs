@@ -196,7 +196,7 @@ impl OllamaSender {
             "done": false
         }))?;
         // Ollama 使用 NDJSON 格式（newline-delimited JSON）
-        let payload = format!("{}\n", root);
+        let payload = format!("{root}\n");
         self.tx.send(payload.into_bytes()).await?;
         Ok(())
     }
@@ -209,7 +209,7 @@ impl OllamaSender {
             "done": true,
             "done_reason": "stop"
         }))?;
-        let payload = format!("{}\n", root);
+        let payload = format!("{root}\n");
         self.tx.send(payload.into_bytes()).await?;
         Ok(())
     }

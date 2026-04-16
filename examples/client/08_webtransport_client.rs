@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
             println!("流已关闭，无响应");
         }
         Err(e) => {
-            eprintln!("接收响应失败: {}", e);
+            eprintln!("接收响应失败: {e}");
         }
     }
 

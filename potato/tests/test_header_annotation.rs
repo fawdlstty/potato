@@ -18,7 +18,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_header_annotation() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::http_get("/single-header")]
         #[header(Cache_Control = "no-store, no-cache, max-age=0")]
@@ -59,7 +59,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_header_annotations() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::http_get("/multi-headers")]
         #[header(Cache_Control = "no-cache")]
@@ -102,7 +102,7 @@ mod tests {
     #[tokio::test]
     async fn test_header_with_http_request() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::http_get("/req-header")]
         #[header(X_Request_Processed = "true")]
@@ -142,7 +142,7 @@ mod tests {
     #[tokio::test]
     async fn test_header_with_different_return_types() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         // 测试 String 返回类型
         #[potato::http_get("/string-return")]
@@ -198,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn test_potato_header_with_custom_syntax() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::http_get("/potato-custom-header")]
         #[potato::header(Authorization = "Bearer TEST_TOKEN")]

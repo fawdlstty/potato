@@ -29,7 +29,7 @@ async fn string_return() -> String {
 #[header(X_Processed = "true")]
 async fn with_request(req: &mut HttpRequest) -> HttpResponse {
     let addr = req.get_client_addr().await.map(|a| a.to_string()).unwrap_or("unknown".to_string());
-    HttpResponse::text(format!("Request from: {}", addr))
+    HttpResponse::text(format!("Request from: {addr}"))
 }
 
 // 示例5：header与Result返回类型一起使用

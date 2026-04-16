@@ -36,12 +36,12 @@ impl Room {
 
     /// 创建RTP转发器（在发布者推流时调用）
     pub async fn create_rtp_forwarder(&self, peer_id: &str) -> Result<()> {
-        let forwarder_key = format!("{}_rtp", peer_id);
+        let forwarder_key = format!("{peer_id}_rtp");
         let mut forwarders = self.rtp_forwarders.lock().await;
 
         // 如果已经存在，则不重复创建
         if forwarders.contains_key(&forwarder_key) {
-            println!("RTP转发器已存在: {}", peer_id);
+            println!("RTP转发器已存在: {peer_id}");
             return Ok(());
         }
 
@@ -49,7 +49,7 @@ impl Room {
         let (tx, _) = tokio::sync::broadcast::channel::<webrtc::rtp::packet::Packet>(1000);
         forwarders.insert(forwarder_key, Arc::new(tx));
 
-        println!("为发布者 {} 创建RTP转发器", peer_id);
+        println!("为发布者 {peer_id} 创建RTP转发器");
         Ok(())
     }
 
@@ -72,7 +72,7 @@ impl Room {
         if let Some(peer) = peers.remove(peer_id) {
             // 关闭PeerConnection
             if let Err(e) = peer.peer_connection.close().await {
-                eprintln!("关闭Peer {} 的PeerConnection失败: {}", peer_id, e);
+                eprintln!("关闭Peer {peer_id} 的PeerConnection失败: {e}");
             }
         } else {
             return Err(anyhow!("Peer not found"));
@@ -84,7 +84,7 @@ impl Room {
 
         // 清理该Peer的RTP转发器
         let mut forwarders = self.rtp_forwarders.lock().await;
-        forwarders.remove(&format!("{}_rtp", peer_id));
+        forwarders.remove(&format!("{peer_id}_rtp"));
 
         Ok(())
     }
@@ -98,25 +98,24 @@ impl Room {
             // 获取发送方Peer（用于验证存在性）
             let _from_peer_obj = peers
                 .get(from_peer)
-                .ok_or_else(|| anyhow::anyhow!("Publisher peer not found: {}", from_peer))?;
+                .ok_or_else(|| anyhow::anyhow!("Publisher peer not found: {from_peer}"))?;
 
             // 获取接收方Peer（验证存在性）
             let to_peer_obj = peers
                 .get(to_peer)
-                .ok_or_else(|| anyhow::anyhow!("Subscriber peer not found: {}", to_peer))?;
+                .ok_or_else(|| anyhow::anyhow!("Subscriber peer not found: {to_peer}"))?;
 
-            println!("准备转发 {} 的轨道给 {}", from_peer, to_peer);
+            println!("准备转发 {from_peer} 的轨道给 {to_peer}");
 
             // 获取broadcast sender用于接收RTP包
             let forwarders = self.rtp_forwarders.lock().await;
-            let forwarder_key = format!("{}_rtp", from_peer);
+            let forwarder_key = format!("{from_peer}_rtp");
 
             if !forwarders.contains_key(&forwarder_key) {
                 drop(forwarders);
                 drop(peers);
                 return Err(anyhow::anyhow!(
-                    "RTP forwarder not found for peer: {}",
-                    from_peer
+                    "RTP forwarder not found for peer: {from_peer}"
                 ));
             }
 
@@ -146,8 +145,8 @@ impl Room {
         let track_local =
             webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP::new(
                 codec,
-                format!("{}_video_track", from_peer), // track id
-                format!("{}_video", from_peer),       // stream_id - 匹配客户端期望格式
+                format!("{from_peer}_video_track"), // track id
+                format!("{from_peer}_video"),       // stream_id - 匹配客户端期望格式
             );
 
         // 使用Arc包装TrackLocal以便在多个地方使用
@@ -155,7 +154,7 @@ impl Room {
 
         // 将TrackLocal添加到订阅者的PeerConnection
         let _rtp_sender = to_peer_pc.add_track(track_local_arc.clone()).await?;
-        println!("已为订阅者 {} 添加TrackLocal", to_peer);
+        println!("已为订阅者 {to_peer} 添加TrackLocal");
 
         // 启动RTP转发任务：从broadcast channel接收RTP包并写入TrackLocal
         let track_local_for_task = track_local_arc.clone();
@@ -163,23 +162,23 @@ impl Room {
         let from_peer_id = from_peer.to_string();
         tokio::spawn(async move {
             let mut receiver = broadcast_sender.subscribe();
-            println!("启动RTP转发任务: {} -> {}", from_peer_id, subscriber_id);
+            println!("启动RTP转发任务: {from_peer_id} -> {subscriber_id}");
 
             loop {
                 match receiver.recv().await {
                     Ok(rtp_packet) => {
                         // 直接写入RTP包 - TrackLocal trait有write方法
                         if let Err(e) = track_local_for_task.write(&rtp_packet.payload).await {
-                            eprintln!("写入RTP包失败: {}", e);
+                            eprintln!("写入RTP包失败: {e}");
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("RTP转发滞后，丢失了 {} 个包", n);
+                        eprintln!("RTP转发滞后，丢失了 {n} 个包");
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        println!("RTP转发器关闭: {} -> {}", from_peer_id, subscriber_id);
+                        println!("RTP转发器关闭: {from_peer_id} -> {subscriber_id}");
                         break;
                     }
                 }

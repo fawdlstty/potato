@@ -31,7 +31,7 @@ async fn get_profile(cache: &mut OnceCache) -> HttpResponse {
         println!("User ID is cached");
     }
     
-    HttpResponse::text(format!("Profile: {} (ID: {}, Role: {})", username, user_id, role))
+    HttpResponse::text(format!("Profile: {username} (ID: {user_id}, Role: {role})"))
 }
 
 // 3. 在 postprocess 中读取和修改缓存
@@ -45,7 +45,7 @@ fn log_postprocess(_req: &mut HttpRequest, res: &mut HttpResponse, cache: &mut O
     
     // 可以基于缓存数据修改响应
     let user_id: u32 = *cache.get::<u32>("user_id").expect("user_id not found");
-    println!("Request processed for user {}", user_id);
+    println!("Request processed for user {user_id}");
 }
 
 // 4. 在 handler 和 postprocess 之间传递数据

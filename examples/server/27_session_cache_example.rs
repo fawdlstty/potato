@@ -19,7 +19,7 @@ async fn login(req: &mut HttpRequest) -> HttpResponse {
             "token": token,
             "expires_in": 3600
         })),
-        Err(e) => HttpResponse::error(format!("Failed to generate token: {}", e)),
+        Err(e) => HttpResponse::error(format!("Failed to generate token: {e}")),
     }
 }
 
@@ -44,7 +44,7 @@ async fn update_profile(req: &mut HttpRequest, cache: &mut SessionCache) -> Http
     // 解析请求体
     let new_profile: serde_json::Value = match serde_json::from_slice(&req.body) {
         Ok(val) => val,
-        Err(e) => return HttpResponse::error(format!("Invalid JSON: {}", e)),
+        Err(e) => return HttpResponse::error(format!("Invalid JSON: {e}")),
     };
     
     // 保存到session

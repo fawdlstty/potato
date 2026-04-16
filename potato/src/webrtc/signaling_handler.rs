@@ -82,7 +82,7 @@ impl WebRtcSignalingHandler {
                     match result? {
                         WsFrame::Text(text) => {
                             if let Err(e) = self.handle_signaling_message(ws, &text, &tx).await {
-                                eprintln!("处理信令消息失败: {}", e);
+                                eprintln!("处理信令消息失败: {e}");
                             }
                         }
                         WsFrame::Binary(_) => {
@@ -94,7 +94,7 @@ impl WebRtcSignalingHandler {
                 // 接收异步发送的消息（如ICE候选转发）
                 Some(message) = rx.recv() => {
                     if let Err(e) = ws.send_text(&message).await {
-                        eprintln!("发送WebSocket消息失败: {}", e);
+                        eprintln!("发送WebSocket消息失败: {e}");
                         return Ok(());
                     }
                 }
@@ -112,7 +112,7 @@ impl WebRtcSignalingHandler {
         let msg: SignalingMessage = match serde_json::from_str(text) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("解析信令消息失败: {}", e);
+                eprintln!("解析信令消息失败: {e}");
                 return Err(anyhow::anyhow!("Invalid signaling message"));
             }
         };
@@ -148,12 +148,12 @@ impl WebRtcSignalingHandler {
                     if let Some(room) = self.sfu.get_room(&params.room_id).await {
                         // 先广播peer离开事件
                         if let Err(e) = room.broadcast_peer_left(&params.peer_id).await {
-                            eprintln!("广播peer离开事件失败: {}", e);
+                            eprintln!("广播peer离开事件失败: {e}");
                         }
 
                         // 从房间中移除peer
                         if let Err(e) = room.remove_peer(&params.peer_id).await {
-                            eprintln!("从房间移除peer失败: {}", e);
+                            eprintln!("从房间移除peer失败: {e}");
                         }
 
                         // 清理RTP转发器
@@ -352,7 +352,7 @@ impl WebRtcSignalingHandler {
                 };
 
                 if let Err(e) = peer.peer_connection.add_ice_candidate(ice_candidate).await {
-                    eprintln!("添加ICE候选失败: {}", e);
+                    eprintln!("添加ICE候选失败: {e}");
                 }
             }
 

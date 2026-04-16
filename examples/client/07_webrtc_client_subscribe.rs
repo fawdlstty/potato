@@ -41,13 +41,13 @@ async fn main() -> anyhow::Result<()> {
             while let Some(frame) = video_subscription.recv().await {
                 frame_count += 1;
                 if frame.is_keyframe {
-                    println!("[视频帧 #{}] 关键帧: {} 字节, 时间戳: {}", 
-                        frame_count, frame.data.len(), frame.timestamp);
+                    println!("[视频帧 #{frame_count}] 关键帧: {} 字节, 时间戳: {}", 
+                        frame.data.len(), frame.timestamp);
                 } else if frame_count % 30 == 0 {
-                    println!("[视频帧 #{}] 收到 {} 字节", frame_count, frame.data.len());
+                    println!("[视频帧 #{frame_count}] 收到 {} 字节", frame.data.len());
                 }
             }
-            println!("视频流结束，共收到 {} 帧", frame_count);
+            println!("视频流结束，共收到 {frame_count} 帧");
         });
         
         // 订阅音频流
@@ -59,10 +59,10 @@ async fn main() -> anyhow::Result<()> {
             while let Some(audio) = audio_subscription.recv().await {
                 audio_count += 1;
                 if audio_count % 100 == 0 {
-                    println!("[音频包 #{}] 收到 {} 字节", audio_count, audio.data.len());
+                    println!("[音频包 #{audio_count}] 收到 {} 字节", audio.data.len());
                 }
             }
-            println!("音频流结束，共收到 {} 包", audio_count);
+            println!("音频流结束，共收到 {audio_count} 包");
         });
     } else {
         println!("房间内没有推流者");

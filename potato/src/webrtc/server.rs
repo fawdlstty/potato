@@ -124,7 +124,7 @@ impl WebRTCSFU {
                             // 将RTP包发送给所有订阅者
                             // 通过房间的rtp_forwarders broadcast channel
                             let forwarders = room.rtp_forwarders.lock().await;
-                            let forwarder_key = format!("{}_rtp", peer_id);
+                            let forwarder_key = format!("{peer_id}_rtp");
 
                             if let Some(sender) = forwarders.get(&forwarder_key) {
                                 // 发送RTP包到broadcast channel
@@ -133,11 +133,11 @@ impl WebRTCSFU {
                             } else {
                                 // 如果转发器不存在，说明还没有创建
                                 // 这在正常情况下不应该发生，因为create_rtp_forwarder应该在添加peer时调用
-                                eprintln!("RTP转发器不存在: {}，RTP包将被丢弃", peer_id);
+                                eprintln!("RTP转发器不存在: {peer_id}，RTP包将被丢弃");
                             }
                         }
                         Err(_) => {
-                            println!("Peer {} 的轨道 {} 结束", peer_id, track.id());
+                            println!("Peer {peer_id} 的轨道 {} 结束", track.id());
                             break;
                         }
                     }
@@ -157,7 +157,7 @@ impl WebRTCSFU {
             Box::pin(async move {
                 if let Some(candidate) = candidate {
                     if let Ok(json) = candidate.to_json() {
-                        println!("Peer {} ICE候选: {}", peer_id, json.candidate);
+                        println!("Peer {peer_id} ICE候选: {}", json.candidate);
 
                         // 修复问题1：通过peer_senders发送ICE候选给客户端
                         let senders_guard = peer_senders.read().await;
@@ -178,7 +178,7 @@ impl WebRTCSFU {
                                 });
 
                                 if let Err(e) = tx.send(ice_msg.to_string()) {
-                                    eprintln!("发送ICE候选失败: {}", e);
+                                    eprintln!("发送ICE候选失败: {e}");
                                 }
                             }
                         }
@@ -243,7 +243,7 @@ impl WebRTCSFU {
         // 删除空房间
         for room_id in empty_rooms {
             rooms.remove(&room_id);
-            println!("清理空房间: {}", room_id);
+            println!("清理空房间: {room_id}");
         }
 
         Ok(())
@@ -285,7 +285,7 @@ impl WebRTCSFU {
             Box::pin(async move {
                 if let Some(candidate) = candidate {
                     if let Ok(json) = candidate.to_json() {
-                        println!("订阅者 {} ICE候选: {}", subscriber_id, json.candidate);
+                        println!("订阅者 {subscriber_id} ICE候选: {}", json.candidate);
 
                         // 修复问题1：通过peer_senders发送ICE候选给客户端
                         let senders_guard = peer_senders.read().await;
@@ -306,7 +306,7 @@ impl WebRTCSFU {
                                 });
 
                                 if let Err(e) = tx.send(ice_msg.to_string()) {
-                                    eprintln!("发送ICE候选失败: {}", e);
+                                    eprintln!("发送ICE候选失败: {e}");
                                 }
                             }
                         }

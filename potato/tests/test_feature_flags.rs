@@ -26,7 +26,7 @@ mod webdav_tests {
     #[tokio::test]
     async fn test_webdav_localfs_server() -> anyhow::Result<()> {
         let port = get_test_port();
-        let server_addr = format!("127.0.0.1:{}", port);
+        let server_addr = format!("127.0.0.1:{port}");
 
         // 创建临时目录用于 WebDAV
         let temp_dir = std::env::temp_dir().join(format!("potato_webdav_test_{}", port));
@@ -64,7 +64,7 @@ mod webdav_tests {
                 }
             }
             Err(e) => {
-                println!("WebDAV GET error: {}", e);
+                println!("WebDAV GET error: {e}");
             }
         }
 
