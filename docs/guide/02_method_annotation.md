@@ -300,3 +300,19 @@ async fn large_upload(req: &mut HttpRequest) -> HttpResponse {
 
 - Handler 注解 > 中间件 `use_limit_size` > 全局配置（默认 100MB）
 - 注解仅对当前 handler 生效，覆盖全局和中间件限制
+
+## 传输速率限制
+
+通过 `use_transfer_limit` 中间件限制连接的数据传输速率（单位：bits/sec）。
+
+```rust
+server.configure(|ctx| {
+    // 入站 10 Mbps，出站 20 Mbps
+    ctx.use_transfer_limit(10_000_000, 20_000_000);
+    ctx.use_handlers();
+});
+```
+
+- 入站速率：限制接收请求数据的速度
+- 出站速率：限制发送响应数据的速度
+- 超出限制时自动延迟传输

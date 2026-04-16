@@ -300,3 +300,19 @@ async fn large_upload(req: &mut HttpRequest) -> HttpResponse {
 
 - Handler annotation > Middleware `use_limit_size` > Global config (default 100MB)
 - Annotation only applies to current handler, overrides global and middleware limits
+
+## Transfer Rate Limit
+
+Limit connection data transfer rate using `use_transfer_limit` middleware (unit: bits/sec).
+
+```rust
+server.configure(|ctx| {
+    // Inbound 10 Mbps, Outbound 20 Mbps
+    ctx.use_transfer_limit(10_000_000, 20_000_000);
+    ctx.use_handlers();
+});
+```
+
+- Inbound rate: limits request data reception speed
+- Outbound rate: limits response data transmission speed
+- Auto-delays transfer when rate limit exceeded

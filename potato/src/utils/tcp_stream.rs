@@ -1,9 +1,12 @@
 #![allow(async_fn_in_trait)]
 use async_trait::async_trait;
 use std::io::IoSlice;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 #[cfg(feature = "tls")]
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 #[cfg(feature = "tls")]
@@ -21,6 +24,8 @@ pub enum HttpStream {
         stream: Box<HttpStream>,
         pre_read_data: Vec<u8>,
     },
+    /// 速率限制的流
+    RateLimited(RateLimitedStream),
 }
 unsafe impl Send for HttpStream {}
 
@@ -81,9 +86,11 @@ impl HttpStream {
                             // 不应该发生，WithPreRead不应该嵌套
                             0
                         }
+                        HttpStream::RateLimited(s) => Box::pin(s.read(buf)).await?,
                     }
                 }
             }
+            HttpStream::RateLimited(s) => Box::pin(s.read(buf)).await?,
         })
     }
 
@@ -113,8 +120,31 @@ impl HttpStream {
                         HttpStream::ClientTls(s) => s.read_exact(buf).await?,
                         HttpStream::DuplexStream(s) => s.read_exact(buf).await?,
                         HttpStream::WithPreRead { .. } => 0,
+                        HttpStream::RateLimited(s) => {
+                            // RateLimitedStream 没有 read_exact，需要自己实现
+                            let mut read = 0;
+                            while read < buf.len() {
+                                let n = s.read(&mut buf[read..]).await?;
+                                if n == 0 {
+                                    return Err(anyhow::Error::msg("connection closed"));
+                                }
+                                read += n;
+                            }
+                            read
+                        }
                     }
                 }
+            }
+            HttpStream::RateLimited(s) => {
+                let mut read = 0;
+                while read < buf.len() {
+                    let n = s.read(&mut buf[read..]).await?;
+                    if n == 0 {
+                        return Err(anyhow::Error::msg("connection closed"));
+                    }
+                    read += n;
+                }
+                read
             }
         })
     }
@@ -135,7 +165,9 @@ impl HttpStream {
                 HttpStream::ClientTls(s) => s.write_all(buf).await?,
                 HttpStream::DuplexStream(s) => s.write_all(buf).await?,
                 HttpStream::WithPreRead { .. } => {}
+                HttpStream::RateLimited(s) => Box::pin(s.write_all(buf)).await?,
             },
+            HttpStream::RateLimited(s) => Box::pin(s.write_all(buf)).await?,
         }
         Ok(())
     }
@@ -159,7 +191,17 @@ impl HttpStream {
                 HttpStream::ClientTls(s) => write_all_vectored_inner(s, bufs).await?,
                 HttpStream::DuplexStream(s) => write_all_vectored_inner(s, bufs).await?,
                 HttpStream::WithPreRead { .. } => {}
+                HttpStream::RateLimited(s) => {
+                    for buf in bufs {
+                        s.write_all(buf).await?;
+                    }
+                }
             },
+            HttpStream::RateLimited(s) => {
+                for buf in bufs {
+                    s.write_all(buf).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -180,7 +222,15 @@ impl HttpStream {
                 HttpStream::ClientTls(s) => write_all_vectored2_inner(s, a, b).await?,
                 HttpStream::DuplexStream(s) => write_all_vectored2_inner(s, a, b).await?,
                 HttpStream::WithPreRead { .. } => {}
+                HttpStream::RateLimited(s) => {
+                    s.write_all(a).await?;
+                    s.write_all(b).await?;
+                }
             },
+            HttpStream::RateLimited(s) => {
+                s.write_all(a).await?;
+                s.write_all(b).await?;
+            }
         }
         Ok(())
     }
@@ -322,5 +372,199 @@ impl VecU8Ext for Vec<u8> {
         }
         self.extend(&tmp_buf[0..n]);
         Ok(n)
+    }
+}
+
+/// 速率限制器 - 使用令牌桶算法
+pub struct RateLimiter {
+    /// 最大速率 (bits/sec)
+    max_rate_bits_per_sec: u64,
+    /// 当前令牌数 (bits)
+    tokens: f64,
+    /// 上次更新时间
+    last_update: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(max_rate_bits_per_sec: u64) -> Self {
+        Self {
+            max_rate_bits_per_sec,
+            tokens: (max_rate_bits_per_sec as f64) / 10.0, // 初始令牌：1/10秒的量
+            last_update: Instant::now(),
+        }
+    }
+
+    /// 获取等待时间（如果需要限速）
+    pub fn acquire(&mut self, bits: u64) -> Option<Duration> {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update);
+        self.last_update = now;
+
+        // 补充令牌
+        let new_tokens = (self.max_rate_bits_per_sec as f64) * elapsed.as_secs_f64();
+        self.tokens = (self.tokens + new_tokens).min(self.max_rate_bits_per_sec as f64);
+
+        let bits_f64 = bits as f64;
+        if self.tokens >= bits_f64 {
+            self.tokens -= bits_f64;
+            None // 不需要等待
+        } else {
+            let deficit = bits_f64 - self.tokens;
+            let wait_secs = deficit / (self.max_rate_bits_per_sec as f64);
+            Some(Duration::from_secs_f64(wait_secs))
+        }
+    }
+}
+
+/// 速率限制的 HttpStream 包装器
+pub struct RateLimitedStream {
+    stream: Box<HttpStream>,
+    inbound_limiter: Arc<Mutex<RateLimiter>>,
+    outbound_limiter: Arc<Mutex<RateLimiter>>,
+}
+
+/// 统一的流类型，支持速率限制和普通流
+pub enum UnifiedStream {
+    Normal(HttpStream),
+    RateLimited(RateLimitedStream),
+}
+
+impl UnifiedStream {
+    pub async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
+        match self {
+            UnifiedStream::Normal(s) => s.read(buf).await,
+            UnifiedStream::RateLimited(s) => s.read(buf).await,
+        }
+    }
+
+    pub async fn write_all(&mut self, buf: &[u8]) -> anyhow::Result<()> {
+        match self {
+            UnifiedStream::Normal(s) => s.write_all(buf).await,
+            UnifiedStream::RateLimited(s) => s.write_all(buf).await,
+        }
+    }
+
+    pub async fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
+        match self {
+            UnifiedStream::Normal(s) => s.read_exact(buf).await,
+            UnifiedStream::RateLimited(s) => {
+                // RateLimitedStream 没有 read_exact，需要自己实现
+                let mut read = 0;
+                while read < buf.len() {
+                    let n = s.read(&mut buf[read..]).await?;
+                    if n == 0 {
+                        return Err(anyhow::Error::msg("connection closed"));
+                    }
+                    read += n;
+                }
+                Ok(read)
+            }
+        }
+    }
+
+    pub async fn write_all_vectored(&mut self, bufs: &[IoSlice<'_>]) -> anyhow::Result<()> {
+        match self {
+            UnifiedStream::Normal(s) => s.write_all_vectored(bufs).await,
+            UnifiedStream::RateLimited(s) => {
+                // 对于速率限制，我们简单地顺序写入
+                for buf in bufs {
+                    s.write_all(buf).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn write_all_vectored2(&mut self, a: &[u8], b: &[u8]) -> anyhow::Result<()> {
+        match self {
+            UnifiedStream::Normal(s) => s.write_all_vectored2(a, b).await,
+            UnifiedStream::RateLimited(s) => {
+                s.write_all(a).await?;
+                s.write_all(b).await
+            }
+        }
+    }
+
+    /// 转换为 HttpStream（用于兼容旧接口）
+    pub fn into_http_stream(self) -> HttpStream {
+        match self {
+            UnifiedStream::Normal(s) => s,
+            UnifiedStream::RateLimited(s) => s.into_inner(),
+        }
+    }
+
+    /// 从 HttpStream 创建
+    pub fn from_http_stream(stream: HttpStream) -> Self {
+        UnifiedStream::Normal(stream)
+    }
+}
+
+impl RateLimitedStream {
+    pub fn new(
+        stream: HttpStream,
+        inbound_rate_bits_per_sec: u64,
+        outbound_rate_bits_per_sec: u64,
+    ) -> Self {
+        Self {
+            stream: Box::new(stream),
+            inbound_limiter: Arc::new(Mutex::new(RateLimiter::new(inbound_rate_bits_per_sec))),
+            outbound_limiter: Arc::new(Mutex::new(RateLimiter::new(outbound_rate_bits_per_sec))),
+        }
+    }
+
+    pub fn into_inner(self) -> HttpStream {
+        *self.stream
+    }
+
+    /// 创建共享的速率限制器（用于双向限速）
+    pub fn new_shared(
+        stream: HttpStream,
+        inbound_rate_bits_per_sec: u64,
+        outbound_rate_bits_per_sec: u64,
+    ) -> (Self, Arc<Mutex<RateLimiter>>, Arc<Mutex<RateLimiter>>) {
+        let inbound_limiter = Arc::new(Mutex::new(RateLimiter::new(inbound_rate_bits_per_sec)));
+        let outbound_limiter = Arc::new(Mutex::new(RateLimiter::new(outbound_rate_bits_per_sec)));
+        let limited_stream = Self {
+            stream: Box::new(stream),
+            inbound_limiter: inbound_limiter.clone(),
+            outbound_limiter: outbound_limiter.clone(),
+        };
+        (limited_stream, inbound_limiter, outbound_limiter)
+    }
+
+    pub fn from_shared(
+        stream: HttpStream,
+        inbound_limiter: Arc<Mutex<RateLimiter>>,
+        outbound_limiter: Arc<Mutex<RateLimiter>>,
+    ) -> Self {
+        Self {
+            stream: Box::new(stream),
+            inbound_limiter,
+            outbound_limiter,
+        }
+    }
+
+    pub async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
+        let n = self.stream.read(buf).await?;
+        if n > 0 {
+            let bits = (n * 8) as u64;
+            let mut limiter = self.inbound_limiter.lock().await;
+            if let Some(wait_time) = limiter.acquire(bits) {
+                tokio::time::sleep(wait_time).await;
+            }
+        }
+        Ok(n)
+    }
+
+    pub async fn write_all(&mut self, buf: &[u8]) -> anyhow::Result<()> {
+        let bits = (buf.len() * 8) as u64;
+        let mut limiter = self.outbound_limiter.lock().await;
+        if let Some(wait_time) = limiter.acquire(bits) {
+            drop(limiter);
+            tokio::time::sleep(wait_time).await;
+        } else {
+            drop(limiter);
+        }
+        self.stream.write_all(buf).await
     }
 }

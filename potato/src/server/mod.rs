@@ -101,6 +101,7 @@ pub enum PipeContextItem {
     FinalRoute(HttpResponse),
     Custom(CustomHandler),
     LimitSize(usize, usize), // (max_header_bytes, max_body_bytes)
+    TransferRate(u64, u64),  // (入站速率限制 bits/sec, 出站速率限制 bits/sec)
     ReverseProxy(String, String, bool),
     #[cfg(feature = "jemalloc")]
     Jemalloc(String),
@@ -122,6 +123,7 @@ impl Clone for PipeContextItem {
             PipeContextItem::FinalRoute(v) => PipeContextItem::FinalRoute(v.clone()),
             PipeContextItem::Custom(v) => PipeContextItem::Custom(v.clone()),
             PipeContextItem::LimitSize(h, b) => PipeContextItem::LimitSize(*h, *b),
+            PipeContextItem::TransferRate(r1, r2) => PipeContextItem::TransferRate(*r1, *r2),
             PipeContextItem::ReverseProxy(v1, v2, v3) => {
                 PipeContextItem::ReverseProxy(v1.clone(), v2.clone(), *v3)
             }
@@ -507,6 +509,36 @@ impl PipeContext {
         self.items.push(PipeContextItem::LimitSize(
             max_header_bytes.max(1),
             max_body_bytes.max(1),
+        ));
+    }
+
+    /// 添加传输速率限制中间件
+    ///
+    /// # 参数
+    /// * `inbound_rate_bits_per_sec` - 入站最大传输速率（bits/sec），接收请求数据的速率限制
+    /// * `outbound_rate_bits_per_sec` - 出站最大传输速率（bits/sec），发送响应数据的速率限制
+    ///
+    /// # 示例
+    /// ```rust
+    /// server.configure(|ctx| {
+    ///     ctx.use_transfer_limit(10_000_000, 20_000_000); // 入站 10 Mbps，出站 20 Mbps
+    ///     ctx.use_handlers();
+    /// });
+    /// ```
+    pub fn use_transfer_limit(
+        &mut self,
+        inbound_rate_bits_per_sec: u64,
+        outbound_rate_bits_per_sec: u64,
+    ) {
+        if inbound_rate_bits_per_sec == 0 {
+            panic!("Inbound transfer rate limit must be greater than 0");
+        }
+        if outbound_rate_bits_per_sec == 0 {
+            panic!("Outbound transfer rate limit must be greater than 0");
+        }
+        self.items.push(PipeContextItem::TransferRate(
+            inbound_rate_bits_per_sec,
+            outbound_rate_bits_per_sec,
         ));
     }
 
@@ -1036,6 +1068,10 @@ impl PipeContext {
                     // Header 大小已在解析阶段检查，此处为双重保险
                     continue;
                 }
+                PipeContextItem::TransferRate(_inbound_rate, _outbound_rate) => {
+                    // 速率限制在连接层处理，此处不需要额外处理
+                    continue;
+                }
                 PipeContextItem::Custom(handler) => match handler {
                     CustomHandler::Sync(handler) => match handler.as_ref()(req) {
                         Some(res) => return res,
@@ -1386,6 +1422,26 @@ impl HttpServer {
         client_addr: SocketAddr,
         stream: HttpStream,
     ) {
+        // 检查是否有速率限制配置
+        let rate_limit = pipe_ctx.items.iter().find_map(|item| {
+            if let PipeContextItem::TransferRate(inbound, outbound) = item {
+                Some((*inbound, *outbound))
+            } else {
+                None
+            }
+        });
+
+        // 如果有速率限制，使用 RateLimitedStream 包装
+        let stream: HttpStream = if let Some((inbound_rate, outbound_rate)) = rate_limit {
+            HttpStream::RateLimited(crate::utils::tcp_stream::RateLimitedStream::new(
+                stream,
+                inbound_rate,
+                outbound_rate,
+            ))
+        } else {
+            stream
+        };
+
         let mut stream = Arc::new(Mutex::new(stream));
         _ = tokio::task::spawn(async move {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
