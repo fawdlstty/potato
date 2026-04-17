@@ -111,6 +111,41 @@ server.configure(|ctx| {
 
 如果返回 `Some(response)`，则直接返回该响应，不再执行后续的中间件或处理器；如果返回 `None`，则继续执行后续的中间件或处理器。对于 `use_custom_sync`，框架会按同步方式直接调用，不会通过异步包装来模拟同步。
 
+## 全局预处理和后处理
+
+首先使用宏标注预处理和后处理函数：
+
+```rust
+#[potato::preprocess]
+async fn my_preprocess(req: &mut HttpRequest) -> Option<HttpResponse> {
+    // 预处理逻辑：请求到达时执行
+    // 返回 Some(response) 可短路请求
+    None
+}
+
+#[potato::postprocess]
+async fn my_postprocess(req: &mut HttpRequest, res: &mut HttpResponse) {
+    // 后处理逻辑：handler完成后执行
+    res.add_header("X-Custom".into(), "value".into());
+}
+```
+
+然后在configure函数里注册：
+
+```rust
+server.configure(|ctx| {
+    // ...
+    ctx.use_preprocess(my_preprocess);
+    ctx.use_postprocess(my_postprocess);
+    // ...
+});
+```
+
+- `use_preprocess`：注册全局预处理函数，在所有路由处理之前执行。如果返回 `Some(response)`，则直接返回该响应，跳过后续所有处理。
+- `use_postprocess`：注册全局后处理函数，在 handler 生成响应后执行，可以修改响应内容（如添加响应头）。
+
+注意：预处理和后处理函数必须通过 `#[potato::preprocess]` 和 `#[potato::postprocess]` 宏标注。
+
 ## WebDAV 路由
 
 启用potato库的webdav特性：

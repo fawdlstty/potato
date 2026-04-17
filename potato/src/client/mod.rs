@@ -353,7 +353,7 @@ pub enum HttpVersion {
     /// HTTP/2
     #[cfg(feature = "http2")]
     Http2,
-    /// HTTP/3
+    /// HTTP/3 (根据URL scheme自动选择加密模式)
     #[cfg(feature = "http3")]
     Http3,
 }
@@ -381,7 +381,7 @@ pub fn http2(url: impl Into<String>) -> VersionedUrl {
     }
 }
 
-/// 创建 HTTP/3 URL
+/// 创建 HTTP/3 URL (根据URL scheme自动选择加密模式: https=加密, http=无加密)
 #[cfg(feature = "http3")]
 pub fn http3(url: impl Into<String>) -> VersionedUrl {
     VersionedUrl {

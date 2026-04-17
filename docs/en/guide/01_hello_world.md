@@ -48,7 +48,10 @@ async fn main() -> anyhow::Result<()> {
     // server.serve_http2("cert.pem", "key.pem").await
 
     // HTTP/3 (QUIC)
-    server.serve_http3("cert.pem", "key.pem").await
+    // server.serve_http3("cert.pem", "key.pem").await
+
+    // HTTP/3 without encryption (non-standard QUIC, dev/test only)
+    // server.serve_http3_without_encrypt().await
 }
 ```
 
@@ -65,4 +68,16 @@ async fn main() -> anyhow::Result<()> {
     println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
     Ok(())
 }
+```
+
+### Protocol Version Selection
+
+Use `http3()` wrapper to specify HTTP/3 protocol. The library auto-selects encryption mode based on URL scheme:
+
+```rust
+// HTTP/3 encrypted mode (https:// URL)
+let res = potato::get!(http3("https://127.0.0.1:8443/hello")).await?;
+
+// HTTP/3 without encryption (http:// URL)
+let res = potato::get!(http3("http://127.0.0.1:8443/hello")).await?;
 ```

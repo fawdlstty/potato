@@ -63,6 +63,12 @@ pub struct OnceCache {
     data: HashMap<(String, TypeId), Box<dyn Any + Send + Sync>>,
 }
 
+impl Default for OnceCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OnceCache {
     pub fn new() -> Self {
         Self {
@@ -166,28 +172,237 @@ impl std::fmt::Display for SessionCacheError {
 impl std::error::Error for SessionCacheError {}
 
 // SessionCache 的内部管理器(私有)
-static SESSION_JWT_SECRET: std::sync::LazyLock<RwLock<Vec<u8>>> = std::sync::LazyLock::new(|| {
-    // 使用密码学安全的随机数生成器生成密钥
-    use rand::RngCore;
-    let mut secret = vec![0u8; 64];
-    rand::rngs::OsRng.fill_bytes(&mut secret);
-    RwLock::new(secret)
-});
-
+// 注意：JWT 密钥现在统一使用 global_config 中的 SERVER_JWT_SECRET
 static SESSION_CACHE_MANAGER: std::sync::LazyLock<DashMap<i64, (SessionCache, Instant)>> =
-    std::sync::LazyLock::new(|| DashMap::new());
+    std::sync::LazyLock::new(DashMap::new);
+
+/// Cookie属性配置
+#[derive(Debug, Clone)]
+pub struct CookieBuilder {
+    /// Cookie名称
+    name: String,
+    /// Cookie值
+    value: String,
+    /// 路径（默认"/"）
+    path: Option<String>,
+    /// 域名
+    domain: Option<String>,
+    /// 过期时间（UTC时间戳，秒）
+    expires: Option<i64>,
+    /// 最大存活时间（秒）
+    max_age: Option<i64>,
+    /// 是否仅HTTPS传输
+    secure: bool,
+    /// 是否禁止JavaScript访问
+    http_only: bool,
+    /// SameSite策略: Strict, Lax, None
+    same_site: Option<String>,
+}
+
+impl CookieBuilder {
+    /// 创建新的Cookie
+    pub fn new(name: &str, value: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            value: value.to_string(),
+            path: Some("/".to_string()),
+            domain: None,
+            expires: None,
+            max_age: None,
+            secure: false,
+            http_only: false,
+            same_site: None,
+        }
+    }
+
+    /// 设置路径
+    pub fn path(mut self, path: &str) -> Self {
+        self.path = Some(path.to_string());
+        self
+    }
+
+    /// 设置域名
+    pub fn domain(mut self, domain: &str) -> Self {
+        self.domain = Some(domain.to_string());
+        self
+    }
+
+    /// 设置过期时间（Unix时间戳，秒）
+    pub fn expires(mut self, timestamp: i64) -> Self {
+        self.expires = Some(timestamp);
+        self
+    }
+
+    /// 设置最大存活时间（秒）
+    pub fn max_age(mut self, seconds: i64) -> Self {
+        self.max_age = Some(seconds);
+        self
+    }
+
+    /// 设置Secure标志（仅HTTPS传输）
+    pub fn secure(mut self, secure: bool) -> Self {
+        self.secure = secure;
+        self
+    }
+
+    /// 设置HttpOnly标志（禁止JavaScript访问）
+    pub fn http_only(mut self, http_only: bool) -> Self {
+        self.http_only = http_only;
+        self
+    }
+
+    /// 设置SameSite策略 ("Strict", "Lax", "None")
+    pub fn same_site(mut self, policy: &str) -> Self {
+        self.same_site = Some(policy.to_string());
+        self
+    }
+
+    /// 生成Set-Cookie header值
+    pub fn to_set_cookie_string(&self) -> String {
+        let mut parts = vec![format!("{}={}", self.name, self.value)];
+
+        if let Some(ref path) = self.path {
+            parts.push(format!("Path={}", path));
+        }
+
+        if let Some(ref domain) = self.domain {
+            parts.push(format!("Domain={}", domain));
+        }
+
+        if let Some(expires) = self.expires {
+            // 将Unix时间戳转换为HTTP日期格式
+            let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(expires, 0);
+            if let Some(dt) = datetime {
+                parts.push(format!(
+                    "Expires={}",
+                    dt.format("%a, %d %b %Y %H:%M:%S GMT")
+                ));
+            }
+        }
+
+        if let Some(max_age) = self.max_age {
+            parts.push(format!("Max-Age={}", max_age));
+        }
+
+        if self.secure {
+            parts.push("Secure".to_string());
+        }
+
+        if self.http_only {
+            parts.push("HttpOnly".to_string());
+        }
+
+        if let Some(ref same_site) = self.same_site {
+            parts.push(format!("SameSite={}", same_site));
+        }
+
+        parts.join("; ")
+    }
+
+    /// 生成删除cookie的Set-Cookie header值
+    pub fn to_delete_cookie_string(&self) -> String {
+        let mut parts = vec![
+            format!("{}=", self.name),
+            "Path=/".to_string(),
+            "Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+        ];
+
+        if let Some(ref domain) = self.domain {
+            parts.push(format!("Domain={}", domain));
+        }
+
+        parts.join("; ")
+    }
+}
+
+/// SessionCache数据类型别名
+type SessionCacheData = Arc<RwLock<HashMap<(String, TypeId), Box<dyn Any + Send + Sync>>>>;
 
 /// 会话级缓存,用于同一用户的不同请求间传递参数
 /// 基于Bearer token中的id区分不同Session
 #[derive(Debug, Clone)]
 pub struct SessionCache {
-    data: Arc<RwLock<HashMap<(String, TypeId), Box<dyn Any + Send + Sync>>>>,
+    data: SessionCacheData,
+    /// 存储从请求中读取的cookies
+    request_cookies: Arc<RwLock<HashMap<String, String>>>,
+    /// 存储需要设置到响应的cookies（包含完整属性）
+    response_cookies: Arc<RwLock<Vec<CookieBuilder>>>,
+}
+
+impl Default for SessionCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionCache {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
+            request_cookies: Arc::new(RwLock::new(HashMap::new())),
+            response_cookies: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// 从请求的Cookie header中解析cookies
+    pub fn parse_request_cookies(&mut self, cookie_header: &str) {
+        if let Ok(mut cookies) = self.request_cookies.write() {
+            for pair in cookie_header.split(';') {
+                let pair = pair.trim();
+                if let Some((key, value)) = pair.split_once('=') {
+                    cookies.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+        }
+    }
+
+    /// 获取请求中的cookie值
+    pub fn get_cookie(&self, name: &str) -> Option<String> {
+        let cookies = self.request_cookies.read().ok()?;
+        cookies.get(name).cloned()
+    }
+
+    /// 设置响应cookie（简单版本，仅设置名称和值）
+    pub fn set_cookie(&self, name: &str, value: &str) {
+        if let Ok(mut cookies) = self.response_cookies.write() {
+            cookies.push(CookieBuilder::new(name, value));
+        }
+    }
+
+    /// 设置响应cookie（完整配置版本）
+    pub fn set_cookie_with_builder(&self, cookie: CookieBuilder) {
+        if let Ok(mut cookies) = self.response_cookies.write() {
+            cookies.push(cookie);
+        }
+    }
+
+    /// 移除响应cookie（设置过期时间为过去）
+    pub fn remove_cookie(&self, name: &str) {
+        if let Ok(mut cookies) = self.response_cookies.write() {
+            cookies.push(CookieBuilder::new(name, ""));
+        }
+    }
+
+    /// 移除响应cookie（带域名配置）
+    pub fn remove_cookie_with_domain(&self, name: &str, domain: &str) {
+        if let Ok(mut cookies) = self.response_cookies.write() {
+            cookies.push(CookieBuilder::new(name, "").domain(domain));
+        }
+    }
+
+    /// 将所有待设置的cookies应用到HttpResponse
+    pub fn apply_cookies(&self, response: &mut HttpResponse) {
+        if let Ok(cookies) = self.response_cookies.read() {
+            for cookie in cookies.iter() {
+                let cookie_str = if cookie.value.is_empty() {
+                    // 移除cookie
+                    cookie.to_delete_cookie_string()
+                } else {
+                    // 设置cookie
+                    cookie.to_set_cookie_string()
+                };
+                response.add_header(Cow::Borrowed("Set-Cookie"), Cow::Owned(cookie_str));
+            }
         }
     }
 
@@ -242,32 +457,32 @@ impl SessionCache {
 
     // ==================== 静态方法：Session管理 ====================
 
-    /// 设置JWT签发秘钥
-    pub fn set_jwt_secret(secret: &[u8]) {
-        if let Ok(mut jwt_secret) = SESSION_JWT_SECRET.write() {
-            *jwt_secret = secret.to_vec();
-        }
+    /// 设置JWT签发秘钥（与ServerConfig共享同一个密钥）
+    pub async fn set_jwt_secret(secret: &[u8]) {
+        let secret_str = String::from_utf8_lossy(secret);
+        crate::ServerConfig::set_jwt_secret(secret_str).await;
     }
 
     /// 获取JWT签发秘钥
-    fn get_jwt_secret() -> Vec<u8> {
-        SESSION_JWT_SECRET
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+    async fn get_jwt_secret() -> Vec<u8> {
+        crate::ServerConfig::get_jwt_secret().await.into_bytes()
     }
 
     /// 签发JWT token
     /// 参数:
     /// - user_id: 用户ID
     /// - ttl: token有效期
+    ///
     /// 返回: JWT token字符串
-    pub fn generate_token(user_id: i64, ttl: std::time::Duration) -> Result<String, anyhow::Error> {
+    pub async fn generate_token(
+        user_id: i64,
+        ttl: std::time::Duration,
+    ) -> Result<String, anyhow::Error> {
         use jsonwebtoken::{encode, EncodingKey, Header};
         use serde::{Deserialize, Serialize};
 
         #[derive(Debug, Serialize, Deserialize)]
-        struct Claims {
+        struct SessionClaims {
             sub: i64,        // user_id
             exp: usize,      // token过期时间戳
             iat: usize,      // 签发时间戳
@@ -278,14 +493,14 @@ impl SessionCache {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as usize;
 
-        let claims = Claims {
+        let claims = SessionClaims {
             sub: user_id,
             exp: now + ttl.as_secs() as usize,
             iat: now,
             sess_exp: now + ttl.as_secs() as usize,
         };
 
-        let secret = Self::get_jwt_secret();
+        let secret = Self::get_jwt_secret().await;
         let token = encode(
             &Header::default(),
             &claims,
@@ -297,20 +512,20 @@ impl SessionCache {
 
     /// 解析JWT token
     /// 返回: (user_id, session_exp_duration)
-    pub fn parse_token(token: &str) -> Result<(i64, Duration), SessionCacheError> {
+    pub async fn parse_token(token: &str) -> Result<(i64, Duration), SessionCacheError> {
         use jsonwebtoken::{decode, DecodingKey, Validation};
         use serde::{Deserialize, Serialize};
 
         #[derive(Debug, Serialize, Deserialize)]
-        struct Claims {
+        struct SessionClaims {
             sub: i64,
             exp: usize,
             iat: usize,
             sess_exp: usize,
         }
 
-        let secret = Self::get_jwt_secret();
-        let token_data = decode::<Claims>(
+        let secret = Self::get_jwt_secret().await;
+        let token_data = decode::<SessionClaims>(
             token,
             &DecodingKey::from_secret(&secret),
             &Validation::default(),
@@ -347,9 +562,10 @@ impl SessionCache {
     /// 获取或创建Session缓存
     /// 参数:
     /// - token: JWT token
+    ///
     /// 返回: SessionCache实例
-    pub fn from_token(token: &str) -> Result<Self, SessionCacheError> {
-        let (user_id, ttl) = Self::parse_token(token)?;
+    pub async fn from_token(token: &str) -> Result<Self, SessionCacheError> {
+        let (user_id, ttl) = Self::parse_token(token).await?;
 
         let now = Instant::now();
         let expires_at = now + ttl;
@@ -626,6 +842,33 @@ impl RequestHandlerFlag {
 }
 
 inventory::collect!(RequestHandlerFlag);
+
+/// 异步错误处理器类型
+pub type AsyncErrorHandler =
+    fn(&mut HttpRequest, anyhow::Error) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>;
+
+/// 同步错误处理器类型
+pub type SyncErrorHandler = fn(&mut HttpRequest, anyhow::Error) -> HttpResponse;
+
+/// 错误处理器枚举，支持异步和同步
+#[derive(Clone)]
+pub enum ErrorHandler {
+    Async(AsyncErrorHandler),
+    Sync(SyncErrorHandler),
+}
+
+/// 错误处理器注册标志
+pub struct ErrorHandlerFlag {
+    pub handler: ErrorHandler,
+}
+
+impl ErrorHandlerFlag {
+    pub const fn new(handler: ErrorHandler) -> Self {
+        ErrorHandlerFlag { handler }
+    }
+}
+
+inventory::collect!(ErrorHandlerFlag);
 
 #[derive(Clone, Copy, Debug, Display, Eq, Hash, PartialEq)]
 pub enum HttpMethod {
@@ -1953,18 +2196,25 @@ pub struct HttpResponseBodyStream<'a> {
 
 impl HttpResponseBody {
     pub async fn data(&mut self) -> &[u8] {
-        if let HttpResponseBody::Stream(mut rx) =
-            std::mem::replace(self, HttpResponseBody::Data(vec![]))
-        {
-            let mut data = Vec::with_capacity(1024);
-            while let Some(chunk) = rx.recv().await {
-                data.extend_from_slice(&chunk);
+        // 先检查是否是 Stream 类型
+        let is_stream = matches!(self, HttpResponseBody::Stream(_));
+
+        if is_stream {
+            // 从 Stream 中替换出 rx，接收所有数据
+            if let HttpResponseBody::Stream(mut rx) =
+                std::mem::replace(self, HttpResponseBody::Data(vec![]))
+            {
+                let mut data = Vec::with_capacity(1024);
+                while let Some(chunk) = rx.recv().await {
+                    data.extend_from_slice(&chunk);
+                }
+                *self = HttpResponseBody::Data(data);
             }
-            *self = HttpResponseBody::Data(data);
         }
+
         match self {
             HttpResponseBody::Data(data) => data.as_slice(),
-            HttpResponseBody::Stream(_) => &[], // Return empty slice for stream body
+            HttpResponseBody::Stream(_) => &[], // Should not reach here
         }
     }
 

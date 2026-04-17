@@ -9,12 +9,63 @@ use h3_quinn::quinn;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_rustls::rustls;
+
+/// 不验证证书的验证器 (用于开发/测试环境)
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+        ]
+    }
+}
 
 pub struct H3SessionImpl {
     pub unique_host: (String, u16),
     pub endpoint: quinn::Endpoint,
     pub send_request: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
     pub driver_handle: tokio::task::JoinHandle<()>,
+    pub use_encrypt: bool,
 }
 
 impl H3SessionImpl {
@@ -55,6 +106,54 @@ impl H3SessionImpl {
             endpoint,
             send_request,
             driver_handle,
+            use_encrypt: true,
+        })
+    }
+
+    pub async fn new_without_encrypt(host: String, port: u16) -> anyhow::Result<Self> {
+        // 创建 TLS 配置，但不验证证书 (类似无加密效果)
+        let mut tls_config = tokio_rustls::rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+        // 创建 QUIC endpoint
+        let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
+        ));
+        endpoint.set_default_client_config(client_config);
+
+        // DNS 解析主机名
+        let addr = format!("{host}:{port}");
+        let socket_addr = tokio::net::lookup_host(&addr)
+            .await?
+            .next()
+            .ok_or_else(|| anyhow!("Failed to resolve host: {}", host))?;
+
+        // 连接到服务器
+        let quic_conn = endpoint
+            .connect(socket_addr, &host)?
+            .await
+            .map_err(|e| anyhow!("QUIC connection failed: {e}"))?;
+
+        // 初始化 HTTP/3 客户端
+        let (mut driver, send_request) = h3::client::new(h3_quinn::Connection::new(quic_conn))
+            .await
+            .map_err(|e| anyhow!("HTTP/3 client initialization failed: {e}"))?;
+
+        // 启动驱动任务
+        let driver_handle = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        Ok(H3SessionImpl {
+            unique_host: (host, port),
+            endpoint,
+            send_request,
+            driver_handle,
+            use_encrypt: false,
         })
     }
 }
@@ -126,15 +225,19 @@ impl H3Session {
         Self { sess_impl: None }
     }
 
+    /// 从URL判断是否使用加密 (https=加密, http=无加密)
+    fn is_encrypt_url(url: &str) -> bool {
+        url.starts_with("https://")
+    }
+
     async fn new_request(
         &mut self,
         method: HttpMethod,
         url: &str,
     ) -> anyhow::Result<(HttpRequest, &mut H3SessionImpl)> {
-        let (mut req, use_ssl, port) = HttpRequest::from_url(url, method)?;
-        if !use_ssl {
-            return Err(anyhow!("HTTP/3 requires TLS connection"));
-        }
+        let (mut req, _use_ssl, port) = HttpRequest::from_url(url, method)?;
+
+        let use_encrypt = Self::is_encrypt_url(url);
 
         let host = url
             .parse::<http::Uri>()?
@@ -145,7 +248,7 @@ impl H3Session {
         let mut is_same_host = false;
         if let Some(sess_impl) = &mut self.sess_impl {
             let (host1, port1) = &sess_impl.unique_host;
-            if (host1, port1) == (&host, &port) {
+            if (host1, port1) == (&host, &port) && sess_impl.use_encrypt == use_encrypt {
                 is_same_host = true;
             }
         }
@@ -156,7 +259,12 @@ impl H3Session {
                 old_impl.driver_handle.abort();
                 old_impl.endpoint.wait_idle().await;
             }
-            self.sess_impl = Some(H3SessionImpl::new(host, port).await?);
+            // 根据 URL scheme 自动选择加密模式
+            if use_encrypt {
+                self.sess_impl = Some(H3SessionImpl::new(host, port).await?);
+            } else {
+                self.sess_impl = Some(H3SessionImpl::new_without_encrypt(host, port).await?);
+            }
         }
 
         req.apply_header(Headers::User_Agent(SERVER_STR.clone()));
@@ -176,8 +284,14 @@ impl H3Session {
             .as_mut()
             .ok_or_else(|| anyhow!("session implementation not initialized"))?;
 
-        // 构建 HTTP/3 请求
-        let uri_str = format!("https://{}{}", sess_impl.unique_host.0, req.url_path);
+        // 构建 HTTP/3 请求 - HTTP/3 协议要求使用 https scheme
+        // 即使是"无加密"模式(自签名证书+跳过验证),URI 仍需使用 https
+        let host_with_port = if sess_impl.unique_host.1 == 443 {
+            sess_impl.unique_host.0.clone()
+        } else {
+            format!("{}:{}", sess_impl.unique_host.0, sess_impl.unique_host.1)
+        };
+        let uri_str = format!("https://{}{}", host_with_port, req.url_path);
         let uri: http::Uri = if !req.url_query.is_empty() {
             let query: Vec<String> = req
                 .url_query

@@ -40,6 +40,7 @@ cargo add potato --features tls,http2,http3
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut server = potato::HttpServer::new("0.0.0.0:8443");
+    server.serve_http().await
 
     // HTTPS（HTTP/1.1 over TLS）
     // server.serve_https("cert.pem", "key.pem").await
@@ -48,7 +49,10 @@ async fn main() -> anyhow::Result<()> {
     // server.serve_http2("cert.pem", "key.pem").await
 
     // HTTP/3（QUIC）
-    server.serve_http3("cert.pem", "key.pem").await
+    // server.serve_http3("cert.pem", "key.pem").await
+
+    // HTTP/3 无加密（非标准 QUIC，仅用于开发/测试）
+    // server.serve_http3_without_encrypt().await
 }
 ```
 
@@ -65,4 +69,16 @@ async fn main() -> anyhow::Result<()> {
     println!("{}", String::from_utf8(res.body.data().await.to_vec())?);
     Ok(())
 }
+```
+
+### 协议版本选择
+
+使用 `http3()` 包装器指定 HTTP/3 协议，库会根据 URL scheme 自动选择加密模式：
+
+```rust
+// HTTP/3 加密模式 (https:// URL)
+let res = potato::get!(http3("https://127.0.0.1:8443/hello")).await?;
+
+// HTTP/3 无加密模式 (http:// URL)
+let res = potato::get!(http3("http://127.0.0.1:8443/hello")).await?;
 ```

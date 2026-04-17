@@ -347,13 +347,17 @@ impl TcpStreamExt for ClientTlsStream<TcpStream> {}
 #[cfg(feature = "tls")]
 impl TcpStreamExt for ServerTlsStream<TcpStream> {}
 
-pub trait TcpStreamExt2 {
-    fn get_mut(self) -> &'static mut dyn TcpStreamExt;
+/// # Safety
+/// 此trait用于将裸指针转换为可变引用，调用者必须保证指针的有效性
+pub unsafe trait TcpStreamExt2 {
+    /// # Safety
+    /// 调用者必须保证指针指向有效的TcpStreamExt对象
+    unsafe fn get_mut(self) -> &'static mut dyn TcpStreamExt;
 }
 
-impl TcpStreamExt2 for *mut dyn TcpStreamExt {
-    fn get_mut(self) -> &'static mut dyn TcpStreamExt {
-        unsafe { &mut *self as &mut dyn TcpStreamExt }
+unsafe impl TcpStreamExt2 for *mut dyn TcpStreamExt {
+    unsafe fn get_mut(self) -> &'static mut dyn TcpStreamExt {
+        &mut *self as &mut dyn TcpStreamExt
     }
 }
 
@@ -425,7 +429,7 @@ pub struct RateLimitedStream {
 
 /// 统一的流类型，支持速率限制和普通流
 pub enum UnifiedStream {
-    Normal(HttpStream),
+    Normal(Box<HttpStream>),
     RateLimited(RateLimitedStream),
 }
 
@@ -488,14 +492,14 @@ impl UnifiedStream {
     /// 转换为 HttpStream（用于兼容旧接口）
     pub fn into_http_stream(self) -> HttpStream {
         match self {
-            UnifiedStream::Normal(s) => s,
+            UnifiedStream::Normal(s) => *s,
             UnifiedStream::RateLimited(s) => s.into_inner(),
         }
     }
 
     /// 从 HttpStream 创建
     pub fn from_http_stream(stream: HttpStream) -> Self {
-        UnifiedStream::Normal(stream)
+        UnifiedStream::Normal(Box::new(stream))
     }
 }
 

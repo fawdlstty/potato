@@ -20,7 +20,7 @@ async fn hello() -> HttpResponse {
 }
 ```
 
-如需用户会话管理，请使用 SessionCache（见下方 SessionCache 参数章节）。
+如需用户会话管理，请使用 SessionCache（详见 [09_cache.md](09_cache.md)）。
 
 ## 参数
 
@@ -69,73 +69,7 @@ async fn upload(file1: PostFile) -> HttpResponse {
 }
 ```
 
-### OnceCache 参数
 
-支持 `cache: &mut OnceCache` 参数,用于在单次请求的前处理、后处理及handler方法间传递参数。收到请求时创建,请求完成后自动释放。
-
-```rust
-#[potato::preprocess]
-async fn pre_handler(req: &mut HttpRequest, cache: &mut OnceCache) {
-    cache.set("user_id", 12345u32);
-}
-
-#[potato::http_get("/profile")]
-#[potato::preprocess(pre_handler)]
-async fn get_profile(cache: &mut OnceCache) -> HttpResponse {
-    let user_id: u32 = *cache.get::<u32>("user_id");
-    HttpResponse::text(format!("User: {}", user_id))
-}
-
-#[potato::postprocess]
-fn post_handler(_req: &mut HttpRequest, res: &mut HttpResponse, cache: &mut OnceCache) {
-    cache.set("processed", true);
-}
-```
-
-常用方法:
-- `cache.get::<T>(name)` - 获取不可变引用（返回Option<&T>）
-- `cache.get_or_default::<T>(name, default)` - 获取值或返回默认值（需Clone）
-- `cache.get_mut::<T>(name)` - 获取可变引用  
-- `cache.set::<T>(name, value)` - 设置值
-- `cache.remove::<T>(name)` - 移除并返回值
-
-### SessionCache 参数
-
-支持 `cache: &mut SessionCache` 参数,用于跨请求保持用户会话数据。只需声明此参数,宏会自动验证 Bearer token 并加载对应会话。
-
-```rust
-// 登录接口签发token
-#[potato::http_post("/login")]
-async fn login(req: &mut HttpRequest) -> HttpResponse {
-    let user_id = 12345i64; // 从请求获取
-    let token = SessionCache::generate_token(user_id, std::time::Duration::from_secs(3600)).unwrap();
-    HttpResponse::json(serde_json::json!({ "token": token }))
-}
-
-// 直接使用SessionCache,宏自动处理token验证
-#[potato::http_get("/profile")]
-async fn get_profile(cache: &mut SessionCache) -> HttpResponse {
-    let count: u32 = cache.get("visits").unwrap_or(0);
-    cache.set("visits", count + 1);
-    HttpResponse::text(format!("Visits: {}", count + 1))
-}
-
-// 与OnceCache同时使用
-#[potato::http_get("/data")]
-async fn get_data(once: &mut OnceCache, session: &mut SessionCache) -> HttpResponse {
-    once.set("req_id", "abc"); // 单次请求
-    session.set("user", "john"); // 跨请求保持
-    HttpResponse::text("ok")
-}
-```
-
-常用方法:
-- `SessionCache::set_jwt_secret(secret)` - 设置JWT密钥(全局)
-- `SessionCache::generate_token(user_id, duration)` - 签发token
-- `cache.get::<T>(key)` - 获取值(需Clone)
-- `cache.set::<T>(key, value)` - 设置值
-- `cache.with_get::<T>(key, |v| ...)` - 读取并处理
-- `cache.with_mut::<T>(key, |v| ...)` - 可变引用处理
 
 ## 返回类型
 
@@ -201,6 +135,22 @@ async fn multi_headers() -> String {
     "multiple headers".to_string()
 }
 ```
+
+## 错误处理
+
+通过 `#[potato::handle_error]` 定义全局错误处理函数，统一处理所有handler中的异常。
+
+```rust
+#[potato::handle_error]
+async fn handle_error(req: &mut HttpRequest, err: anyhow::Error) -> HttpResponse {
+    HttpResponse::text(format!("Error: {}", err))
+}
+```
+
+- 支持 `async fn` 和普通 `fn`
+- 参数固定为 `(req: &mut HttpRequest, err: anyhow::Error)`
+- 返回值必须为 `HttpResponse`
+- 未定义时使用默认处理器（返回500状态码和错误详情）
 
 ## 预处理与后处理
 

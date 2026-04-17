@@ -14,7 +14,7 @@ async fn login(req: &mut HttpRequest) -> HttpResponse {
         .unwrap_or(12345);
     
     // 签发token（有效期1小时）
-    match SessionCache::generate_token(user_id, std::time::Duration::from_secs(3600)) {
+    match SessionCache::generate_token(user_id, std::time::Duration::from_secs(3600)).await {
         Ok(token) => HttpResponse::json(serde_json::json!({
             "token": token,
             "expires_in": 3600
@@ -105,7 +105,7 @@ async fn logout(req: &mut HttpRequest, cache: &mut SessionCache) -> HttpResponse
     if let Some(auth_header) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
         let header_value = auth_header.to_str();
         if header_value.starts_with("Bearer ") {
-            if let Ok((user_id, _)) = SessionCache::parse_token(&header_value[7..]) {
+            if let Ok((user_id, _)) = SessionCache::parse_token(&header_value[7..]).await {
                 // 使session失效
                 SessionCache::invalidate(user_id);
             }
@@ -118,7 +118,7 @@ async fn logout(req: &mut HttpRequest, cache: &mut SessionCache) -> HttpResponse
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 设置JWT密钥（生产环境应该使用更安全的密钥）
-    SessionCache::set_jwt_secret(b"your-secret-key-change-in-production");
+    SessionCache::set_jwt_secret(b"your-secret-key-change-in-production").await;
     
     let server = HttpServer::new("127.0.0.1:8080");
     println!("Server starting on http://127.0.0.1:8080");

@@ -113,6 +113,41 @@ The `use_custom` function lets you insert async custom request handling logic, w
 
 If it returns `Some(response)`, the response is returned immediately and later middleware/handlers are skipped. If it returns `None`, processing continues. For `use_custom_sync`, the framework invokes it on a purely synchronous path (not by wrapping it into an async call).
 
+## Global Preprocess and Postprocess
+
+First, annotate preprocess and postprocess functions with macros:
+
+```rust
+#[potato::preprocess]
+async fn my_preprocess(req: &mut HttpRequest) -> Option<HttpResponse> {
+    // Preprocess logic: executed when request arrives
+    // Return Some(response) to short-circuit the request
+    None
+}
+
+#[potato::postprocess]
+async fn my_postprocess(req: &mut HttpRequest, res: &mut HttpResponse) {
+    // Postprocess logic: executed after handler completes
+    res.add_header("X-Custom".into(), "value".into());
+}
+```
+
+Then register them in the configure function:
+
+```rust
+server.configure(|ctx| {
+    // ...
+    ctx.use_preprocess(my_preprocess);
+    ctx.use_postprocess(my_postprocess);
+    // ...
+});
+```
+
+- `use_preprocess`: Register a global preprocess function, executed before all route handling. If it returns `Some(response)`, the response is returned immediately, skipping all subsequent processing.
+- `use_postprocess`: Register a global postprocess function, executed after the handler generates a response, allowing you to modify the response (e.g., adding response headers).
+
+Note: Preprocess and postprocess functions must be annotated with `#[potato::preprocess]` and `#[potato::postprocess]` macros.
+
 ## WebDAV Routing
 
 Enable the webdav feature of the potato library:
