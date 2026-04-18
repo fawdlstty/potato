@@ -897,12 +897,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
     });
 
-    // 如果有preprocess或postprocess，也可能需要缓存
-    // 由于无法在编译时确定，保守地创建缓存
-    let need_once_cache =
-        handler_has_once_cache || !preprocess_fns.is_empty() || !postprocess_fns.is_empty();
-    let need_session_cache =
-        handler_has_session_cache || !preprocess_fns.is_empty() || !postprocess_fns.is_empty();
+    // 修复：只有当 handler 本身需要缓存时，才设置 need_session_cache 和 need_once_cache
+    // preprocess/postprocess 钩子如果需要缓存，它们可以通过参数声明
+    // 但如果 handler 不需要缓存，我们不应该强制要求 Authorization header
+    // 这样可以避免给不需要认证的 handler 添加不必要的认证要求
+    let need_once_cache = handler_has_once_cache;
+    let need_session_cache = handler_has_session_cache;
 
     let preprocess_adapters: Vec<Ident> = preprocess_fns
         .iter()
@@ -2237,7 +2237,7 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                         let is_async = method.sig.asyncness.is_some();
 
                         // 检测方法是否有 receiver，以及是否是 mutable
-                        let (has_receiver, is_mut_receiver) = method
+                        let (has_receiver, _is_mut_receiver) = method
                             .sig
                             .inputs
                             .iter()
