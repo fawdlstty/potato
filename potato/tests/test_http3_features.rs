@@ -60,7 +60,8 @@ mod http3_tests {
         let server_handle = tokio::spawn(async move {
             let _ = server.serve_http3(&cert_file, &key_file).await;
         });
-        sleep(Duration::from_millis(350)).await;
+        // HTTP3服务器需要更长的启动时间
+        sleep(Duration::from_millis(2000)).await;
 
         let mut roots = tokio_rustls::rustls::RootCertStore::empty();
         roots.add(cert_der.clone())?;
@@ -75,10 +76,15 @@ mod http3_tests {
         ));
         endpoint.set_default_client_config(client_config);
 
-        let quic_conn = endpoint
-            .connect(addr.parse()?, "localhost")?
-            .await
+        // 添加连接超时
+        let connecting = endpoint
+            .connect(addr.parse()?, "localhost")
             .map_err(|e| anyhow::anyhow!("quic connect failed: {e}"))?;
+        let quic_conn = tokio::time::timeout(Duration::from_secs(10), connecting)
+            .await
+            .map_err(|e| anyhow::anyhow!("quic connect timeout: {e}"))?
+            .map_err(|e| anyhow::anyhow!("quic connect failed: {e}"))?;
+
         let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(quic_conn))
             .await
             .map_err(|e| anyhow::anyhow!("h3 client init failed: {e}"))?;

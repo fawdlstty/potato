@@ -486,7 +486,7 @@ fn postprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
                 req: &mut potato::HttpRequest,
                 res: &mut potato::HttpResponse,
                 once_cache: &mut potato::OnceCache,
-                session_cache: &potato::SessionCache,
+                session_cache: &mut potato::SessionCache,
             ) -> anyhow::Result<()>
         },
         (true, false) => quote! {
@@ -500,7 +500,7 @@ fn postprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
             async fn #wrap_name_inner(
                 req: &mut potato::HttpRequest,
                 res: &mut potato::HttpResponse,
-                session_cache: &potato::SessionCache,
+                session_cache: &mut potato::SessionCache,
             ) -> anyhow::Result<()>
         },
         (false, false) => quote! {
@@ -648,7 +648,7 @@ fn postprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
             req: &mut potato::HttpRequest,
             res: &mut potato::HttpResponse,
             once_cache: Option<&mut potato::OnceCache>,
-            session_cache: Option<&potato::SessionCache>,
+            session_cache: Option<&mut potato::SessionCache>,
         ) -> anyhow::Result<()> {
             #wrapper_body
         }
@@ -1467,7 +1467,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         req,
                         &mut __potato_response,
                         __potato_once_cache.as_mut(),
-                        __potato_session_cache.as_ref(),
+                        __potato_session_cache.as_mut(),
                     ).await {
                         drop(__potato_permit);
                         let handler = &__potato_error_handler;
@@ -1580,7 +1580,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         req,
                         &mut __potato_response,
                         __potato_once_cache.as_mut(),
-                        __potato_session_cache.as_ref(),
+                        __potato_session_cache.as_mut(),
                     ).await {
                         let handler = &__potato_error_handler;
                         return match handler {
@@ -1692,7 +1692,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         req,
                         &mut __potato_response,
                         __potato_once_cache.as_mut(),
-                        __potato_session_cache.as_ref(),
+                        __potato_session_cache.as_mut(),
                     ).await {
                         drop(__potato_permit);
                         let handler = &__potato_error_handler;
@@ -1805,7 +1805,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         req,
                         &mut __potato_response,
                         __potato_once_cache.as_mut(),
-                        __potato_session_cache.as_ref(),
+                        __potato_session_cache.as_mut(),
                     ).await {
                         let handler = &__potato_error_handler;
                         return match handler {
@@ -2024,6 +2024,19 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
             }
         }
         _ => quote! { #self_type },
+    };
+
+    // 提取不带生命周期参数的类型名称字符串（用于 Swagger tag）
+    let self_type_tag = match &*item_impl.self_ty {
+        syn::Type::Path(type_path) => {
+            // 获取路径的最后一段（类型名称），不包含泛型参数
+            if let Some(segment) = type_path.path.segments.last() {
+                segment.ident.to_string()
+            } else {
+                self_type.to_token_stream().to_string()
+            }
+        }
+        _ => self_type.to_token_stream().to_string(),
     };
 
     // 创建清理后的 impl 块（移除方法上的 http_* 标注）
@@ -2427,7 +2440,7 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                                     potato::HttpMethod::#http_method_ident,
                                     #final_path_lit,
                                     potato::HttpHandler::Async(#wrapper_fn_name),
-                                    potato::RequestHandlerFlagDoc::new(true, #doc_auth, "", "", "", stringify!(#self_type))
+                                    potato::RequestHandlerFlagDoc::new(true, #doc_auth, "", "", "", #self_type_tag)
                                 )
                             }
                         };

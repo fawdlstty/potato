@@ -30,7 +30,6 @@ mod http3_without_encrypt_tests {
 
     /// 测试 HTTP/3 无加密模式 (http:// URL)
     #[tokio::test]
-    #[ignore = "Flaky test: QUIC connection timeout in test environment"]
     async fn test_http3_without_encrypt_basic() -> anyhow::Result<()> {
         let port = get_test_port();
         let addr = format!("127.0.0.1:{port}");
@@ -40,8 +39,8 @@ mod http3_without_encrypt_tests {
             let _ = server.serve_http3_without_encrypt().await;
         });
 
-        // 等待服务器启动
-        sleep(Duration::from_millis(1000)).await;
+        // 等待服务器启动（HTTP3需要更长的启动时间）
+        sleep(Duration::from_millis(2000)).await;
 
         // 使用 http:// URL,自动使用无加密模式
         let url = format!("http://localhost:{}/http3_test", port);
@@ -57,7 +56,6 @@ mod http3_without_encrypt_tests {
 
     /// 测试 POST 请求 (无加密模式)
     #[tokio::test]
-    #[ignore = "Flaky test: QUIC connection timeout in test environment"]
     async fn test_http3_without_encrypt_post() -> anyhow::Result<()> {
         let port = get_test_port();
         let addr = format!("127.0.0.1:{port}");
@@ -67,7 +65,7 @@ mod http3_without_encrypt_tests {
             let _ = server.serve_http3_without_encrypt().await;
         });
 
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(2000)).await;
 
         // 使用 http:// URL 进行 POST
         let url = format!("http://localhost:{}/http3_post", port);
@@ -92,7 +90,8 @@ mod http3_without_encrypt_tests {
             let _ = server.serve_http3_without_encrypt().await;
         });
 
-        sleep(Duration::from_millis(500)).await;
+        // HTTP3服务器需要更长的启动时间
+        sleep(Duration::from_millis(2000)).await;
 
         // 创建不使用证书验证的客户端
         let mut tls_config = tokio_rustls::rustls::ClientConfig::builder()
@@ -107,10 +106,13 @@ mod http3_without_encrypt_tests {
         ));
         endpoint.set_default_client_config(client_config);
 
-        // 连接到服务器
-        let quic_conn = endpoint
-            .connect(addr.parse()?, "localhost")?
+        // 连接到服务器，添加超时
+        let connecting = endpoint
+            .connect(addr.parse()?, "localhost")
+            .map_err(|e| anyhow::anyhow!("quic connect failed: {e}"))?;
+        let quic_conn = tokio::time::timeout(Duration::from_secs(10), connecting)
             .await
+            .map_err(|e| anyhow::anyhow!("quic connect timeout: {e}"))?
             .map_err(|e| anyhow::anyhow!("quic connect failed: {e}"))?;
 
         // 初始化 HTTP/3 客户端
@@ -157,7 +159,6 @@ mod http3_without_encrypt_tests {
 
     /// 测试多个并发请求
     #[tokio::test]
-    #[ignore = "Flaky test: QUIC connection timeout in test environment"]
     async fn test_http3_without_encrypt_concurrent() -> anyhow::Result<()> {
         let port = get_test_port();
         let addr = format!("127.0.0.1:{port}");
@@ -167,7 +168,7 @@ mod http3_without_encrypt_tests {
             let _ = server.serve_http3_without_encrypt().await;
         });
 
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(2000)).await;
 
         // 并发发送多个请求
         let mut handles = vec![];
@@ -195,7 +196,6 @@ mod http3_without_encrypt_tests {
 
     /// 测试 Session 复用
     #[tokio::test]
-    #[ignore = "Flaky test: QUIC connection timeout in test environment"]
     async fn test_http3_without_encrypt_session_reuse() -> anyhow::Result<()> {
         let port = get_test_port();
         let addr = format!("127.0.0.1:{port}");
@@ -205,7 +205,7 @@ mod http3_without_encrypt_tests {
             let _ = server.serve_http3_without_encrypt().await;
         });
 
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(2000)).await;
 
         // 使用 Session 复用连接
         let mut session = potato::client::http3::H3Session::new();

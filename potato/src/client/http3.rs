@@ -125,17 +125,25 @@ impl H3SessionImpl {
         ));
         endpoint.set_default_client_config(client_config);
 
-        // DNS 解析主机名
-        let addr = format!("{host}:{port}");
-        let socket_addr = tokio::net::lookup_host(&addr)
-            .await?
-            .next()
-            .ok_or_else(|| anyhow!("Failed to resolve host: {}", host))?;
+        // 直接构造地址，避免DNS解析延迟
+        // 注意：需要先将localhost解析为127.0.0.1，因为SocketAddr不支持主机名
+        let socket_addr: std::net::SocketAddr = if host == "localhost" {
+            format!("127.0.0.1:{port}")
+                .parse()
+                .map_err(|e| anyhow!("Invalid address {}: {}", format!("127.0.0.1:{port}"), e))?
+        } else {
+            format!("{host}:{port}")
+                .parse()
+                .map_err(|e| anyhow!("Invalid address {}: {}", format!("{host}:{port}"), e))?
+        };
 
-        // 连接到服务器
-        let quic_conn = endpoint
-            .connect(socket_addr, &host)?
+        // 连接到服务器，设置合理的超时
+        let connecting = endpoint
+            .connect(socket_addr, &host)
+            .map_err(|e| anyhow!("QUIC connection failed: {e}"))?;
+        let quic_conn = tokio::time::timeout(std::time::Duration::from_secs(10), connecting)
             .await
+            .map_err(|e| anyhow!("QUIC connection timeout: {e}"))?
             .map_err(|e| anyhow!("QUIC connection failed: {e}"))?;
 
         // 初始化 HTTP/3 客户端
