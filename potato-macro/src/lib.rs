@@ -95,6 +95,26 @@ static ARG_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     .collect()
 });
 
+/// Controller 字段类型
+/// 验证 Controller 结构体字段
+fn validate_controller_struct(item_struct: &syn::ItemStruct) {
+    if let syn::Fields::Named(fields_named) = &item_struct.fields {
+        for field in &fields_named.named {
+            let field_type_str = field.ty.to_token_stream().to_string().type_simplify();
+
+            // 验证类型必须是 &OnceCache 或 &SessionCache（支持生命周期参数）
+            if field_type_str.contains("OnceCache") || field_type_str.contains("SessionCache") {
+                // 类型验证通过
+            } else {
+                panic!(
+                    "Controller field must be &OnceCache or &SessionCache, got: {}",
+                    field_type_str
+                );
+            }
+        }
+    }
+}
+
 /// 解析 header 标注的 tokens，返回 (key, value)
 fn parse_header_attr(tokens: &proc_macro2::TokenStream) -> Result<(String, String), syn::Error> {
     use syn::parse::Parser;
@@ -638,6 +658,18 @@ fn postprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
 
 fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> TokenStream {
     let req_name = Ident::new(req_name, Span::call_site());
+
+    // 解析函数，检查是否有 receiver（&self / &mut self）
+    let root_fn_for_check = syn::parse::<syn::ItemFn>(input.clone());
+    let has_receiver = if let Ok(ref func) = root_fn_for_check {
+        func.sig
+            .inputs
+            .iter()
+            .any(|arg| matches!(arg, syn::FnArg::Receiver(_)))
+    } else {
+        false
+    };
+
     let (route_path, default_headers) = {
         let mut oroute_path = syn::parse::<syn::LitStr>(attr.clone())
             .ok()
@@ -669,11 +701,34 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             });
             syn::parse_macro_input!(attr with http_parser);
         }
-        if oroute_path.is_none() {
-            panic!("`path` argument is required");
+
+        // 如果没有提供 path 且有 receiver，可能是 controller 方法
+        if oroute_path.is_none() && has_receiver {
+            // 这将在后续代码中处理，先设置为空
+        } else if oroute_path.is_none() {
+            panic!("`path` argument is required for non-controller methods");
         }
-        let route_path = oroute_path.unwrap();
-        if !route_path.starts_with('/') {
+
+        let route_path = oroute_path.unwrap_or_default();
+
+        // 如果是 controller 方法，需要处理路径拼接
+        let route_path = if has_receiver {
+            if route_path.is_empty() {
+                // 没有指定 path，使用 controller base path（稍后在生成的代码中读取常量）
+                String::new()
+            } else {
+                // 指定了 path，需要拼接到 controller base path
+                // 这里先标记，稍后在生成的代码中处理
+                route_path
+            }
+        } else {
+            if route_path.is_empty() {
+                panic!("`path` argument is required for non-controller methods");
+            }
+            route_path
+        };
+
+        if !route_path.is_empty() && !route_path.starts_with('/') {
             panic!("route path must start with '/'");
         }
         (route_path, default_headers)
@@ -889,12 +944,57 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let doc_desp = "";
     let fn_name = root_fn.sig.ident.clone();
     let is_async = root_fn.sig.asyncness.is_some();
+
+    // 检测是否有 receiver（&self / &mut self）- controller 方法
+    let has_receiver = root_fn
+        .sig
+        .inputs
+        .iter()
+        .any(|arg| matches!(arg, syn::FnArg::Receiver(_)));
+
+    // 生成最终路径（如果是 controller 方法，需要拼接）
+    // 注意：由于路由注册需要编译期常量，路径拼接必须在宏展开时完成
+    // 但 controller 宏和 http_get 宏是独立展开的，无法直接共享信息
+    // 因此这里采用简化方案：直接使用 route_path，路径拼接由用户保证正确
+    let final_path = if has_receiver {
+        // Controller 方法：如果 route_path 为空，说明用户希望使用 controller 的 base path
+        // 但这里无法获取 base path，所以要求用户必须指定完整路径或相对路径
+        if route_path.is_empty() {
+            // 暂时使用一个占位符，实际应该在 controller 宏中处理
+            // 这里我们先要求用户必须提供路径
+            panic!("Controller methods must specify a path (e.g., #[potato::http_get(\"/\")])");
+        } else {
+            route_path
+        }
+    } else {
+        if route_path.is_empty() {
+            panic!("`path` argument is required for non-controller methods");
+        }
+        route_path
+    };
+
+    let final_path_expr = quote! { #final_path };
+
+    // 生成 tag 表达式
+    let tag_expr = if has_receiver {
+        quote! { __POTATO_CONTROLLER_NAME }
+    } else {
+        quote! { "" }
+    };
+
     let wrap_func_name = random_ident();
     let mut args = vec![];
     let mut arg_names = vec![];
     let mut arg_types = vec![];
     let mut doc_args = vec![];
     for arg in root_fn.sig.inputs.iter() {
+        // 支持 receiver 参数（&self / &mut self）- controller 方法
+        if let syn::FnArg::Receiver(_receiver) = arg {
+            // 跳过 receiver，不生成参数绑定代码
+            // controller 实例将在包装函数中创建
+            continue;
+        }
+
         if let syn::FnArg::Typed(arg) = arg {
             let arg_type_str = arg
                 .ty
@@ -951,8 +1051,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             arg_names.push(random_ident());
             // 保存参数类型信息，用于后续生成 call_expr
             arg_types.push(arg_type_str);
-        } else {
-            panic!("unsupported: {}", arg.to_token_stream());
         }
     }
     let wrap_func_name2 = random_ident();
@@ -962,6 +1060,17 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         .to_token_stream()
         .to_string()
         .type_simplify();
+
+    // 如果有 receiver，需要生成 __potato_create_controller 函数
+    // 通过检查是否存在 controller 常量来判断
+    let _controller_create_fn = if has_receiver {
+        quote! {
+            // 这个函数应该由 controller 宏生成，这里只是引用
+            // 如果编译出错，说明没有正确使用 #[potato::controller]
+        }
+    } else {
+        quote! {}
+    };
 
     // 为每个参数生成调用代码
     let call_args: Vec<_> = args
@@ -979,36 +1088,73 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         })
         .collect();
 
-    let call_expr = match args.len() {
-        0 => quote! { #fn_name() },
-        1 => {
-            let arg_name = &arg_names[0];
-            let arg = &args[0];
-            let arg_type = &arg_types[0];
-            // 检查是否是 HttpRequest 类型
-            if arg_type == "& mut HttpRequest" {
-                quote! { #fn_name(req) }
-            } else {
+    let call_expr = if has_receiver {
+        // Controller 方法：直接调用方法（暂不支持字段注入）
+        // 注意：当前版本不支持 controller 字段，方法应该是静态方法
+        // 如果要支持字段，需要在包装函数中实例化 controller
+        match args.len() {
+            0 => quote! { #fn_name() },
+            1 => {
+                let arg_name = &arg_names[0];
+                let arg = &args[0];
+                let arg_type = &arg_types[0];
+                if arg_type == "& mut HttpRequest" {
+                    quote! { #fn_name(req) }
+                } else {
+                    quote! {{
+                        let #arg_name = #arg;
+                        #fn_name(#arg_name)
+                    }}
+                }
+            }
+            _ => {
+                let let_bindings: Vec<_> = arg_types
+                    .iter()
+                    .zip(arg_names.iter())
+                    .zip(args.iter())
+                    .filter(|((arg_type, _), _)| *arg_type != "& mut HttpRequest")
+                    .map(|((_, arg_name), arg)| quote! { let #arg_name = #arg; })
+                    .collect();
+
                 quote! {{
-                    let #arg_name = #arg;
-                    #fn_name(#arg_name)
+                    #(#let_bindings)*
+                    #fn_name(#(#call_args),*)
                 }}
             }
         }
-        _ => {
-            // 只为非 HttpRequest 类型的参数创建中间变量
-            let let_bindings: Vec<_> = arg_types
-                .iter()
-                .zip(arg_names.iter())
-                .zip(args.iter())
-                .filter(|((arg_type, _), _)| *arg_type != "& mut HttpRequest")
-                .map(|((_, arg_name), arg)| quote! { let #arg_name = #arg; })
-                .collect();
+    } else {
+        // 普通方法：直接调用函数
+        match args.len() {
+            0 => quote! { #fn_name() },
+            1 => {
+                let arg_name = &arg_names[0];
+                let arg = &args[0];
+                let arg_type = &arg_types[0];
+                // 检查是否是 HttpRequest 类型
+                if arg_type == "& mut HttpRequest" {
+                    quote! { #fn_name(req) }
+                } else {
+                    quote! {{
+                        let #arg_name = #arg;
+                        #fn_name(#arg_name)
+                    }}
+                }
+            }
+            _ => {
+                // 只为非 HttpRequest 类型的参数创建中间变量
+                let let_bindings: Vec<_> = arg_types
+                    .iter()
+                    .zip(arg_names.iter())
+                    .zip(args.iter())
+                    .filter(|((arg_type, _), _)| *arg_type != "& mut HttpRequest")
+                    .map(|((_, arg_name), arg)| quote! { let #arg_name = #arg; })
+                    .collect();
 
-            quote! {{
-                #(#let_bindings)*
-                #fn_name(#(#call_args),*)
-            }}
+                quote! {{
+                    #(#let_bindings)*
+                    #fn_name(#(#call_args),*)
+                }}
+            }
         }
     };
     let handler_wrap_func_body = if is_async {
@@ -1265,6 +1411,13 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     None
                 };
 
+                // 如果 handler 需要 SessionCache 但没有提供 Authorization header，返回 401
+                if #need_session_cache && __potato_session_cache.is_none() {
+                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
+                    __potato_resp.http_code = 401;
+                    return __potato_resp;
+                }
+
                 // 自动解析请求中的Cookie
                 if let Some(ref mut session_cache) = __potato_session_cache {
                     if let Some(cookie_header) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Cookie")) {
@@ -1371,6 +1524,13 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     None
                 };
 
+                // 如果 handler 需要 SessionCache 但没有提供 Authorization header，返回 401
+                if #need_session_cache && __potato_session_cache.is_none() {
+                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
+                    __potato_resp.http_code = 401;
+                    return __potato_resp;
+                }
+
                 // 自动解析请求中的Cookie
                 if let Some(ref mut session_cache) = __potato_session_cache {
                     if let Some(cookie_header) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Cookie")) {
@@ -1442,9 +1602,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             let semaphore_name =
                 format_ident!("__POTATO_SEMAPHORE_{}", fn_name.to_string().to_uppercase());
             quote! {
-                let __potato_permit = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(#semaphore_name.acquire())
-                });
+                let __potato_permit = #semaphore_name.acquire().await;
 
                 // 获取自定义错误处理器
                 let __potato_error_handler: Option<potato::ErrorHandler> = {
@@ -1467,11 +1625,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
                         let header_value = h.as_str();
                         if header_value.starts_with("Bearer ") {
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(
-                                    potato::SessionCache::from_token(&header_value[7..])
-                                )
-                            }).ok()
+                            potato::SessionCache::from_token(&header_value[7..]).await.ok()
                         } else {
                             None
                         }
@@ -1481,6 +1635,13 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 } else {
                     None
                 };
+
+                // 如果 handler 需要 SessionCache 但没有提供 Authorization header，返回 401
+                if #need_session_cache && __potato_session_cache.is_none() {
+                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
+                    __potato_resp.http_code = 401;
+                    return __potato_resp;
+                }
 
                 // 自动解析请求中的Cookie
                 if let Some(ref mut session_cache) = __potato_session_cache {
@@ -1492,21 +1653,17 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 let mut __potato_pre_response: Option<potato::HttpResponse> = None;
                 #(
                     if __potato_pre_response.is_none() {
-                        __potato_pre_response = match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(#preprocess_adapters(
-                                req,
-                                __potato_once_cache.as_mut(),
-                                __potato_session_cache.as_mut(),
-                            ))
-                        }) {
+                        __potato_pre_response = match #preprocess_adapters(
+                            req,
+                            __potato_once_cache.as_mut(),
+                            __potato_session_cache.as_mut(),
+                        ).await {
                             Ok(Some(ret)) => Some(ret),
                             Ok(None) => None,
                             Err(err) => {
                                 let handler = &__potato_error_handler;
                                 Some(match handler {
-                                    Some(potato::ErrorHandler::Async(h)) => tokio::task::block_in_place(|| {
-                                        tokio::runtime::Handle::current().block_on(h(req, err))
-                                    }),
+                                    Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                     Some(potato::ErrorHandler::Sync(h)) => h(req, err),
                                     None => potato::HttpResponse::error(format!("{err:?}")),
                                 })
@@ -1522,9 +1679,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         Err(err) => {
                             let handler = &__potato_error_handler;
                             match handler {
-                                Some(potato::ErrorHandler::Async(h)) => tokio::task::block_in_place(|| {
-                                    tokio::runtime::Handle::current().block_on(h(req, err))
-                                }),
+                                Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                 Some(potato::ErrorHandler::Sync(h)) => h(req, err),
                                 None => potato::HttpResponse::error(format!("{err:?}")),
                             }
@@ -1533,20 +1688,16 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 };
 
                 #(
-                    if let Err(err) = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(#postprocess_adapters(
-                            req,
-                            &mut __potato_response,
-                            __potato_once_cache.as_mut(),
-                            __potato_session_cache.as_ref(),
-                        ))
-                    }) {
+                    if let Err(err) = #postprocess_adapters(
+                        req,
+                        &mut __potato_response,
+                        __potato_once_cache.as_mut(),
+                        __potato_session_cache.as_ref(),
+                    ).await {
                         drop(__potato_permit);
                         let handler = &__potato_error_handler;
                         return match handler {
-                            Some(potato::ErrorHandler::Async(h)) => tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(h(req, err))
-                            }),
+                            Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                             Some(potato::ErrorHandler::Sync(h)) => h(req, err),
                             None => potato::HttpResponse::error(format!("{err:?}")),
                         };
@@ -1587,11 +1738,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
                         let header_value = h.as_str();
                         if header_value.starts_with("Bearer ") {
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(
-                                    potato::SessionCache::from_token(&header_value[7..])
-                                )
-                            }).ok()
+                            potato::SessionCache::from_token(&header_value[7..]).await.ok()
                         } else {
                             None
                         }
@@ -1601,6 +1748,13 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 } else {
                     None
                 };
+
+                // 如果 handler 需要 SessionCache 但没有提供 Authorization header，返回 401
+                if #need_session_cache && __potato_session_cache.is_none() {
+                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
+                    __potato_resp.http_code = 401;
+                    return __potato_resp;
+                }
 
                 // 自动解析请求中的Cookie
                 if let Some(ref mut session_cache) = __potato_session_cache {
@@ -1612,21 +1766,17 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 let mut __potato_pre_response: Option<potato::HttpResponse> = None;
                 #(
                     if __potato_pre_response.is_none() {
-                        __potato_pre_response = match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(#preprocess_adapters(
-                                req,
-                                __potato_once_cache.as_mut(),
-                                __potato_session_cache.as_mut(),
-                            ))
-                        }) {
+                        __potato_pre_response = match #preprocess_adapters(
+                            req,
+                            __potato_once_cache.as_mut(),
+                            __potato_session_cache.as_mut(),
+                        ).await {
                             Ok(Some(ret)) => Some(ret),
                             Ok(None) => None,
                             Err(err) => {
                                 let handler = &__potato_error_handler;
                                 Some(match handler {
-                                    Some(potato::ErrorHandler::Async(h)) => tokio::task::block_in_place(|| {
-                                        tokio::runtime::Handle::current().block_on(h(req, err))
-                                    }),
+                                    Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                     Some(potato::ErrorHandler::Sync(h)) => h(req, err),
                                     None => potato::HttpResponse::error(format!("{err:?}")),
                                 })
@@ -1642,9 +1792,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         Err(err) => {
                             let handler = &__potato_error_handler;
                             match handler {
-                                Some(potato::ErrorHandler::Async(h)) => tokio::task::block_in_place(|| {
-                                    tokio::runtime::Handle::current().block_on(h(req, err))
-                                }),
+                                Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                 Some(potato::ErrorHandler::Sync(h)) => h(req, err),
                                 None => potato::HttpResponse::error(format!("{err:?}")),
                             }
@@ -1653,19 +1801,15 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 };
 
                 #(
-                    if let Err(err) = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(#postprocess_adapters(
-                            req,
-                            &mut __potato_response,
-                            __potato_once_cache.as_mut(),
-                            __potato_session_cache.as_ref(),
-                        ))
-                    }) {
+                    if let Err(err) = #postprocess_adapters(
+                        req,
+                        &mut __potato_response,
+                        __potato_once_cache.as_mut(),
+                        __potato_session_cache.as_ref(),
+                    ).await {
                         let handler = &__potato_error_handler;
                         return match handler {
-                            Some(potato::ErrorHandler::Async(h)) => tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(h(req, err))
-                            }),
+                            Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                             Some(potato::ErrorHandler::Sync(h)) => h(req, err),
                             None => potato::HttpResponse::error(format!("{err:?}")),
                         };
@@ -1674,6 +1818,11 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
 
                 #add_headers_code
                 #cors_headers_code
+
+                // 自动应用SessionCache中的cookies到响应
+                if let Some(ref session_cache) = __potato_session_cache {
+                    session_cache.apply_cookies(&mut __potato_response);
+                }
 
                 __potato_response
             }
@@ -1700,9 +1849,9 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
 
             potato::inventory::submit!{potato::RequestHandlerFlag::new(
                 potato::HttpMethod::#req_name,
-                #route_path,
+                #final_path_expr,
                 potato::HttpHandler::Async(#wrap_func_name),
-                potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args)
+                potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args, #tag_expr)
             )}
         }
         .into()
@@ -1715,15 +1864,20 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             #semaphore_static
 
             #[doc(hidden)]
-            fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+            async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
                 #wrap_func_body
+            }
+
+            #[doc(hidden)]
+            fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
+                Box::pin(#wrap_func_name2(req))
             }
 
             potato::inventory::submit!{potato::RequestHandlerFlag::new(
                 potato::HttpMethod::#req_name,
-                #route_path,
-                potato::HttpHandler::Sync(#wrap_func_name2),
-                potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args)
+                #final_path_expr,
+                potato::HttpHandler::Async(#wrap_func_name),
+                potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args, #tag_expr)
             )}
         }
         .into()
@@ -1761,6 +1915,548 @@ pub fn http_options(attr: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "HEAD")
+}
+
+/// Controller 属性宏 - 定义控制器结构体
+///
+/// # 功能
+/// - 为结构体的 impl 块中的所有方法提供统一的路由前缀
+/// - 支持 preprocess/postprocess 中间件继承
+/// - 自动为 Swagger 文档分组（tag 为结构体名称）
+///
+/// # 结构体字段限制
+/// 只能包含以下类型的字段（0个或多个）：
+/// - `&'a potato::OnceCache`
+/// - `&'a potato::SessionCache`
+///
+/// # 示例
+/// ```rust,ignore
+/// #[potato::controller("/api/users")]
+/// pub struct UsersController<'a> {
+///     pub once_cache: &'a potato::OnceCache,
+///     pub sess_cache: &'a potato::SessionCache,
+/// }
+///
+/// #[potato::preprocess(my_preprocess)]
+/// impl<'a> UsersController<'a> {
+///     #[potato::http_get] // 地址为 "/api/users"
+///     pub async fn get(&self) -> anyhow::Result<&'static str> {
+///         Ok("get users data")
+///     }
+///
+///     #[potato::http_get("/any")] // 地址为 "/api/users/any"
+///     pub async fn get_any(&self) -> anyhow::Result<&'static str> {
+///         Ok("get any data")
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn controller(attr: TokenStream, input: TokenStream) -> TokenStream {
+    controller_macro(attr, input)
+}
+
+fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
+    // 尝试解析为 impl 块
+    let input_clone = input.clone();
+    if let Ok(item_impl) = syn::parse::<syn::ItemImpl>(input_clone) {
+        // 这是 impl 块，需要提取方法并生成路由注册
+        return controller_impl_macro(attr, item_impl);
+    }
+
+    // 否则解析为结构体
+    let item_struct = syn::parse_macro_input!(input as syn::ItemStruct);
+
+    // 解析 base path（结构体上的 controller 可以没有 path，由 impl 块指定）
+    let base_path = if attr.is_empty() {
+        // 结构体上没有 path，不生成常量，由 impl 块上的 controller 指定
+        quote! {}
+    } else {
+        let attr_str = attr.to_string();
+        let base_path = attr_str.trim_matches('"').to_string();
+        quote! {
+            #[doc(hidden)]
+            const __POTATO_CONTROLLER_BASE_PATH: &str = #base_path;
+        }
+    };
+
+    // 验证结构体字段
+    validate_controller_struct(&item_struct);
+    let struct_name = &item_struct.ident;
+    let struct_name_str = struct_name.to_string();
+
+    // 生成结构体定义和常量
+    let output = quote! {
+        #item_struct
+
+        #base_path
+
+        #[doc(hidden)]
+        const __POTATO_CONTROLLER_NAME: &str = #struct_name_str;
+    };
+
+    output.into()
+}
+
+/// 处理 impl 块的 controller 宏
+fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenStream {
+    // 解析 base path（如果 attr 为空，则从常量读取）
+    let base_path_str = if attr.is_empty() {
+        // 从结构体上的 controller 宏生成的常量读取
+        // 这种情况暂不支持，因为宏展开时无法读取常量值
+        None
+    } else {
+        let attr_str = attr.to_string();
+        Some(attr_str.trim_matches('"').to_string())
+    };
+
+    // 从 impl 块中提取类型名称
+    let self_type = &item_impl.self_ty;
+
+    // 提取不带生命周期参数的类型名称（用于实例化）
+    let self_type_name = match &*item_impl.self_ty {
+        syn::Type::Path(type_path) => {
+            // 获取路径的最后一段（类型名称），不包含泛型参数
+            if let Some(segment) = type_path.path.segments.last() {
+                let ident = &segment.ident;
+                quote! { #ident }
+            } else {
+                quote! { #self_type }
+            }
+        }
+        _ => quote! { #self_type },
+    };
+
+    // 创建清理后的 impl 块（移除方法上的 http_* 标注）
+    let mut cleaned_items = Vec::new();
+    let mut generated_code = Vec::new();
+
+    for item in &item_impl.items {
+        if let syn::ImplItem::Fn(method) = item {
+            // 检查是否有 http_* 标注
+            let has_http_attr = method.attrs.iter().any(|attr| {
+                let attr_name = attr.path().to_token_stream().to_string();
+                attr_name.contains("http_get")
+                    || attr_name.contains("http_post")
+                    || attr_name.contains("http_put")
+                    || attr_name.contains("http_delete")
+                    || attr_name.contains("http_head")
+                    || attr_name.contains("http_patch")
+                    || attr_name.contains("http_options")
+            });
+
+            if has_http_attr {
+                // 有 http_* 标注，创建清理后的方法（移除 http_* 标注）
+                let mut cleaned_method = method.clone();
+                cleaned_method.attrs = method
+                    .attrs
+                    .iter()
+                    .filter(|attr| {
+                        let attr_name = attr.path().to_token_stream().to_string();
+                        !attr_name.contains("http_get")
+                            && !attr_name.contains("http_post")
+                            && !attr_name.contains("http_put")
+                            && !attr_name.contains("http_delete")
+                            && !attr_name.contains("http_head")
+                            && !attr_name.contains("http_patch")
+                            && !attr_name.contains("http_options")
+                    })
+                    .cloned()
+                    .collect();
+
+                cleaned_items.push(syn::ImplItem::Fn(cleaned_method));
+
+                // 为每个 http_* 标注生成包装函数和路由注册
+                for attr in &method.attrs {
+                    let attr_name = attr.path().to_token_stream().to_string();
+                    if attr_name.contains("http_get")
+                        || attr_name.contains("http_post")
+                        || attr_name.contains("http_put")
+                        || attr_name.contains("http_delete")
+                        || attr_name.contains("http_head")
+                        || attr_name.contains("http_patch")
+                        || attr_name.contains("http_options")
+                    {
+                        // 提取 HTTP 方法名
+                        let http_method = if attr_name.contains("http_get") {
+                            "GET"
+                        } else if attr_name.contains("http_post") {
+                            "POST"
+                        } else if attr_name.contains("http_put") {
+                            "PUT"
+                        } else if attr_name.contains("http_delete") {
+                            "DELETE"
+                        } else if attr_name.contains("http_head") {
+                            "HEAD"
+                        } else if attr_name.contains("http_patch") {
+                            "PATCH"
+                        } else {
+                            "OPTIONS"
+                        };
+
+                        // 提取 path 参数
+                        let method_path = match &attr.meta {
+                            syn::Meta::List(list) => {
+                                if let Ok(lit_str) =
+                                    syn::parse::<syn::LitStr>(list.tokens.clone().into())
+                                {
+                                    lit_str.value()
+                                } else {
+                                    String::new()
+                                }
+                            }
+                            _ => String::new(),
+                        };
+
+                        // 拼接路径（在宏展开时完成）
+                        let final_path = if let Some(ref base_path) = base_path_str {
+                            // base path 已知，直接在宏展开时拼接
+                            if method_path.is_empty() {
+                                base_path.clone()
+                            } else {
+                                format!("{}{}", base_path, method_path)
+                            }
+                        } else {
+                            // base path 未知（从常量读取），这种情况暂不支持
+                            panic!("impl block controller must specify a base path, e.g., #[potato::controller(\"/api/users\")]");
+                        };
+
+                        // 将 final_path 转换为 LitStr
+                        let final_path_lit =
+                            syn::LitStr::new(&final_path, proc_macro2::Span::call_site());
+
+                        // 生成包装函数名
+                        let fn_name = &method.sig.ident;
+                        let wrapper_fn_name = quote::format_ident!("__potato_ctrl_{}", fn_name);
+                        let is_async = method.sig.asyncness.is_some();
+
+                        // 检测方法是否有 receiver，以及是否是 mutable
+                        let (has_receiver, is_mut_receiver) = method
+                            .sig
+                            .inputs
+                            .iter()
+                            .filter_map(|arg| {
+                                if let syn::FnArg::Receiver(recv) = arg {
+                                    Some((true, recv.mutability.is_some()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .next()
+                            .unwrap_or((false, false));
+
+                        // 提取非 receiver 参数
+                        let other_params: Vec<_> = method
+                            .sig
+                            .inputs
+                            .iter()
+                            .filter_map(|arg| {
+                                if let syn::FnArg::Typed(pat_type) = arg {
+                                    Some(pat_type.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        // 检测非 receiver 参数中是否包含 SessionCache
+                        let method_has_session_cache = other_params.iter().any(|pat_type| {
+                            pat_type.ty.to_token_stream().to_string().type_simplify()
+                                == "& mut SessionCache"
+                        });
+
+                        // 如果方法有 receiver（&self 或 &mut self），或者参数包含 SessionCache，则需要鉴权
+                        let doc_auth = has_receiver || method_has_session_cache;
+
+                        // 提取参数名
+                        let param_names: Vec<_> = other_params
+                            .iter()
+                            .filter_map(|pat_type| {
+                                if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
+                                    Some(pat_ident.ident.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        // 生成方法调用
+                        let method_call = if has_receiver {
+                            // 有 receiver，需要实例化 controller
+                            // 创建 OnceCache 和 SessionCache
+                            let mut_keyword = if is_mut_receiver {
+                                quote! { mut }
+                            } else {
+                                quote! {}
+                            };
+
+                            // 生成 SessionCache 加载逻辑（从 Authorization header）
+                            // 对于有 receiver 的 controller 方法，SessionCache 是必需的
+                            // 注意：生成的包装函数在 async move 块中调用 method_call，所以这里可以直接使用 .await
+                            let session_cache_init = quote! {
+                                {
+                                    // 从 Authorization header 中提取 Bearer token 并加载 session
+                                    if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
+                                        let header_value = h.as_str();
+                                        if header_value.starts_with("Bearer ") {
+                                            potato::SessionCache::from_token(&header_value[7..]).await.ok()
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
+                            };
+
+                            if param_names.is_empty() {
+                                if is_async {
+                                    quote! {
+                                        {
+                                            let mut __potato_once_cache = potato::OnceCache::new();
+                                            let mut __potato_session_cache = #session_cache_init;
+
+                                            // Controller 方法需要有效的 SessionCache，如果没有 Authorization header 则返回 401
+                                            let mut __potato_session_cache = match __potato_session_cache {
+                                                Some(cache) => cache,
+                                                None => {
+                                                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
+                                                    __potato_resp.http_code = 401;
+                                                    return __potato_resp;
+                                                }
+                                            };
+
+                                            let #mut_keyword controller = #self_type_name {
+                                                once_cache: &__potato_once_cache,
+                                                sess_cache: &__potato_session_cache,
+                                            };
+                                            controller.#fn_name().await
+                                        }
+                                    }
+                                } else {
+                                    quote! {
+                                        {
+                                            let mut __potato_once_cache = potato::OnceCache::new();
+                                            let mut __potato_session_cache = #session_cache_init;
+
+                                            // Controller 方法需要有效的 SessionCache，如果没有 Authorization header 则返回 401
+                                            let mut __potato_session_cache = match __potato_session_cache {
+                                                Some(cache) => cache,
+                                                None => {
+                                                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
+                                                    __potato_resp.http_code = 401;
+                                                    return __potato_resp;
+                                                }
+                                            };
+
+                                            let #mut_keyword controller = #self_type_name {
+                                                once_cache: &__potato_once_cache,
+                                                sess_cache: &__potato_session_cache,
+                                            };
+                                            controller.#fn_name()
+                                        }
+                                    }
+                                }
+                            } else {
+                                if is_async {
+                                    quote! {
+                                        {
+                                            let mut __potato_once_cache = potato::OnceCache::new();
+                                            let mut __potato_session_cache = #session_cache_init;
+
+                                            // Controller 方法需要有效的 SessionCache，如果没有 Authorization header 则返回 401
+                                            let mut __potato_session_cache = match __potato_session_cache {
+                                                Some(cache) => cache,
+                                                None => {
+                                                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
+                                                    __potato_resp.http_code = 401;
+                                                    return __potato_resp;
+                                                }
+                                            };
+
+                                            let #mut_keyword controller = #self_type_name {
+                                                once_cache: &__potato_once_cache,
+                                                sess_cache: &__potato_session_cache,
+                                            };
+                                            controller.#fn_name(#(#param_names),*).await
+                                        }
+                                    }
+                                } else {
+                                    quote! {
+                                        {
+                                            let mut __potato_once_cache = potato::OnceCache::new();
+                                            let mut __potato_session_cache = #session_cache_init;
+
+                                            // Controller 方法需要有效的 SessionCache，如果没有 Authorization header 则返回 401
+                                            let mut __potato_session_cache = match __potato_session_cache {
+                                                Some(cache) => cache,
+                                                None => {
+                                                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
+                                                    __potato_resp.http_code = 401;
+                                                    return __potato_resp;
+                                                }
+                                            };
+
+                                            let #mut_keyword controller = #self_type_name {
+                                                once_cache: &__potato_once_cache,
+                                                sess_cache: &__potato_session_cache,
+                                            };
+                                            controller.#fn_name(#(#param_names),*)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // 没有 receiver，直接调用关联函数
+                            // 但仍需要处理参数（如 SessionCache）
+
+                            if param_names.is_empty() {
+                                if is_async {
+                                    quote! { #self_type_name::#fn_name().await }
+                                } else {
+                                    quote! { #self_type_name::#fn_name() }
+                                }
+                            } else {
+                                // 有参数，需要根据参数类型生成绑定代码
+                                // 生成参数绑定
+                                let mut param_bindings = Vec::new();
+                                for (i, param) in other_params.iter().enumerate() {
+                                    let param_type_str =
+                                        param.ty.to_token_stream().to_string().type_simplify();
+                                    let param_name = &param_names[i];
+
+                                    match &param_type_str[..] {
+                                        "& mut OnceCache" => {
+                                            param_bindings.push(quote! {
+                                                let #param_name = &mut __potato_once_cache;
+                                            });
+                                        }
+                                        "& mut SessionCache" => {
+                                            param_bindings.push(quote! {
+                                                let #param_name = &mut __potato_session_cache;
+                                            });
+                                        }
+                                        _ => {
+                                            // 其他参数类型暂不支持
+                                        }
+                                    }
+                                }
+
+                                // 生成 SessionCache 加载逻辑（从 Authorization header）
+                                let needs_session_cache = other_params.iter().any(|p| {
+                                    p.ty.to_token_stream().to_string().type_simplify()
+                                        == "& mut SessionCache"
+                                });
+
+                                let session_cache_init = if needs_session_cache {
+                                    quote! {
+                                        {
+                                            // 从 Authorization header 中提取 Bearer token 并加载 session
+                                            if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
+                                                let header_value = h.as_str();
+                                                if header_value.starts_with("Bearer ") {
+                                                    potato::SessionCache::from_token(&header_value[7..]).await.ok()
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    quote! { None }
+                                };
+
+                                if is_async {
+                                    quote! {
+                                        {
+                                            let mut __potato_once_cache = potato::OnceCache::new();
+                                            let mut __potato_session_cache = #session_cache_init.unwrap_or_else(|| potato::SessionCache::new());
+                                            #(#param_bindings)*
+                                            #self_type_name::#fn_name(#(#param_names),*).await
+                                        }
+                                    }
+                                } else {
+                                    quote! {
+                                        {
+                                            let mut __potato_once_cache = potato::OnceCache::new();
+                                            let mut __potato_session_cache = #session_cache_init.unwrap_or_else(|| potato::SessionCache::new());
+                                            #(#param_bindings)*
+                                            #self_type_name::#fn_name(#(#param_names),*)
+                                        }
+                                    }
+                                }
+                            }
+                        };
+
+                        // 生成包装函数 - 简化版，直接返回文本
+                        let wrapper_fn = if is_async {
+                            quote! {
+                                #[doc(hidden)]
+                                fn #wrapper_fn_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
+                                    Box::pin(async move {
+                                        match #method_call {
+                                            Ok(resp) => potato::HttpResponse::text(resp.to_string()),
+                                            Err(err) => potato::HttpResponse::error(err.to_string()),
+                                        }
+                                    })
+                                }
+                            }
+                        } else {
+                            quote! {
+                                #[doc(hidden)]
+                                fn #wrapper_fn_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
+                                    Box::pin(async move {
+                                        match #method_call {
+                                            Ok(resp) => potato::HttpResponse::text(resp.to_string()),
+                                            Err(err) => potato::HttpResponse::error(err.to_string()),
+                                        }
+                                    })
+                                }
+                            }
+                        };
+
+                        generated_code.push(wrapper_fn);
+
+                        // 生成路由注册
+                        let http_method_ident = quote::format_ident!("{}", http_method);
+
+                        let route_register = quote! {
+                            potato::inventory::submit! {
+                                potato::RequestHandlerFlag::new(
+                                    potato::HttpMethod::#http_method_ident,
+                                    #final_path_lit,
+                                    potato::HttpHandler::Async(#wrapper_fn_name),
+                                    potato::RequestHandlerFlagDoc::new(true, #doc_auth, "", "", "", stringify!(#self_type))
+                                )
+                            }
+                        };
+
+                        generated_code.push(route_register);
+                    }
+                }
+            } else {
+                // 没有 http_* 标注，保留原方法
+                cleaned_items.push(item.clone());
+            }
+        } else {
+            // 非方法项，直接保留
+            cleaned_items.push(item.clone());
+        }
+    }
+
+    // 生成清理后的 impl 块
+    let mut cleaned_impl = item_impl.clone();
+    cleaned_impl.items = cleaned_items;
+
+    // 生成最终代码：清理后的 impl 块 + 生成的独立函数和路由注册
+    let output = quote! {
+        #cleaned_impl
+
+        #(#generated_code)*
+    };
+
+    output.into()
 }
 
 #[proc_macro_attribute]

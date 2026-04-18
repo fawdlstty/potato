@@ -798,6 +798,7 @@ pub struct RequestHandlerFlagDoc {
     pub summary: &'static str,
     pub desp: &'static str,
     pub args: &'static str,
+    pub tag: &'static str, // Controller 名称，用于 Swagger 分组
 }
 
 impl RequestHandlerFlagDoc {
@@ -807,6 +808,7 @@ impl RequestHandlerFlagDoc {
         summary: &'static str,
         desp: &'static str,
         args: &'static str,
+        tag: &'static str,
     ) -> Self {
         RequestHandlerFlagDoc {
             show,
@@ -814,6 +816,7 @@ impl RequestHandlerFlagDoc {
             summary,
             desp,
             args,
+            tag,
         }
     }
 }

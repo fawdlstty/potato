@@ -672,13 +672,19 @@ impl PipeContext {
                     "description": flag.doc.desp,
                 });
                 let otag = {
-                    let mut otag = None;
-                    if let Some(idx) = flag.path.rfind('/') {
-                        if idx > 0 {
-                            otag = Some(flag.path[1..idx].replace('/', "_"));
+                    // 优先使用 flag.doc.tag（controller 名称）
+                    if !flag.doc.tag.is_empty() {
+                        Some(flag.doc.tag.to_string())
+                    } else {
+                        // 回退到原有逻辑（基于路径）
+                        let mut otag = None;
+                        if let Some(idx) = flag.path.rfind('/') {
+                            if idx > 0 {
+                                otag = Some(flag.path[1..idx].replace('/', "_"));
+                            }
                         }
+                        otag
                     }
-                    otag
                 };
                 if let Some(tag) = otag {
                     tags.insert(tag.clone(), "");

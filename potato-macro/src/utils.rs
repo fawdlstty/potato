@@ -14,7 +14,9 @@ impl StringExt for String {
             .replace("->", "")
             .replace("anyhow::Result", "Result")
             .replace("potato::HttpRequest", "HttpRequest")
-            .replace("potato::HttpResponse", "HttpResponse");
+            .replace("potato::HttpResponse", "HttpResponse")
+            .replace("potato::SessionCache", "SessionCache")
+            .replace("potato::OnceCache", "OnceCache");
         match ret.is_empty() {
             true => "()".to_string(),
             false => ret,
