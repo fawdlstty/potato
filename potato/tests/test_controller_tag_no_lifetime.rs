@@ -82,16 +82,16 @@ mod tests {
                 let api_users = paths.get("/api/users").expect("No /api/users path");
                 let get_method = api_users.get("get").expect("No GET method");
                 let method_tags = get_method.get("tags").expect("No tags in GET method");
-                let method_tag_array =
-                    method_tags.as_array().expect("Method tags is not an array");
+                let method_tag_array = method_tags.as_array().expect("Method tags is not an array");
 
                 assert_eq!(
                     method_tag_array.len(),
                     1,
                     "Expected exactly 1 tag in method"
                 );
-                let method_tag =
-                    method_tag_array[0].as_str().expect("Method tag is not a string");
+                let method_tag = method_tag_array[0]
+                    .as_str()
+                    .expect("Method tag is not a string");
 
                 assert_eq!(
                     method_tag, "UsersController",

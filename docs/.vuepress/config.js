@@ -34,7 +34,8 @@ export default defineUserConfig({
         sidebar: {
           '/guide/': [
             "00_introduction", "01_hello_world", "02_method_annotation",
-            "03_server_route", "04_graceful_shutdown", "05_client", "06_sse", "07_acme", "08_webtransport"
+            "03_server_route", "04_graceful_shutdown", "05_client", "06_sse",
+            "07_acme", "08_webtransport", "09_cache", "10_controller"
           ]
         }
       },
@@ -54,7 +55,8 @@ export default defineUserConfig({
         sidebar: {
           '/en/guide/': [
             "00_introduction", "01_hello_world", "02_method_annotation",
-            "03_server_route", "04_graceful_shutdown", "05_client", "06_sse", "07_acme"
+            "03_server_route", "04_graceful_shutdown", "05_client", "06_sse",
+            "07_acme", "08_webtransport", "09_cache", "10_controller"
           ]
         }
       }

@@ -128,7 +128,7 @@ pub enum PipeContextItem {
     LimitSize(usize, usize), // (max_header_bytes, max_body_bytes)
     TransferRate(u64, u64),  // (入站速率限制 bits/sec, 出站速率限制 bits/sec)
     ReverseProxy(String, String, bool),
-    #[cfg(feature = "jemalloc")]
+    #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
     Jemalloc(String),
     #[cfg(feature = "webdav")]
     Webdav((String, dav_server::DavHandler)),
@@ -154,7 +154,7 @@ impl Clone for PipeContextItem {
             PipeContextItem::ReverseProxy(v1, v2, v3) => {
                 PipeContextItem::ReverseProxy(v1.clone(), v2.clone(), *v3)
             }
-            #[cfg(feature = "jemalloc")]
+            #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
             PipeContextItem::Jemalloc(v) => PipeContextItem::Jemalloc(v.clone()),
             #[cfg(feature = "webdav")]
             PipeContextItem::Webdav(v) => PipeContextItem::Webdav(v.clone()),
@@ -634,7 +634,7 @@ impl PipeContext {
         ));
     }
 
-    #[cfg(feature = "jemalloc")]
+    #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
     pub fn use_jemalloc(&mut self, url_path: impl Into<String>) {
         self.items.push(PipeContextItem::Jemalloc(url_path.into()));
     }
@@ -1301,7 +1301,7 @@ impl PipeContext {
                     }
                 }
 
-                #[cfg(feature = "jemalloc")]
+                #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
                 PipeContextItem::Jemalloc(path) => {
                     if path == &req.url_path[..] {
                         let mut res = match crate::dump_jemalloc_profile().await {
@@ -1310,6 +1310,7 @@ impl PipeContext {
                                 let etag = {
                                     use std::collections::hash_map::DefaultHasher;
                                     use std::hash::{Hash, Hasher};
+                                    let data: Vec<u8> = data;
                                     let mut hasher = DefaultHasher::new();
                                     data.hash(&mut hasher);
                                     let content_hash = hasher.finish();
@@ -1791,7 +1792,7 @@ impl HttpServer {
     }
 
     async fn serve_http_impl(&mut self) -> anyhow::Result<()> {
-        #[cfg(feature = "jemalloc")]
+        #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
         crate::init_jemalloc()?;
 
         // 启动后台SessionCache清理任务
@@ -1814,7 +1815,7 @@ impl HttpServer {
 
     #[cfg(feature = "tls")]
     async fn serve_https_impl(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
-        #[cfg(feature = "jemalloc")]
+        #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
         crate::init_jemalloc()?;
 
         let addr: SocketAddr = self.addr.parse()?;
@@ -1843,7 +1844,7 @@ impl HttpServer {
 
     #[cfg(feature = "acme")]
     async fn serve_acme_impl(&mut self) -> anyhow::Result<()> {
-        #[cfg(feature = "jemalloc")]
+        #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
         crate::init_jemalloc()?;
 
         let addr: SocketAddr = self.addr.parse()?;

@@ -97,14 +97,19 @@ static ARG_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 
 /// Controller 字段类型
 /// 验证 Controller 结构体字段
-fn validate_controller_struct(item_struct: &syn::ItemStruct) {
+fn validate_controller_struct(item_struct: &syn::ItemStruct) -> (bool, bool) {
+    let mut has_once_cache = false;
+    let mut has_session_cache = false;
+
     if let syn::Fields::Named(fields_named) = &item_struct.fields {
         for field in &fields_named.named {
             let field_type_str = field.ty.to_token_stream().to_string().type_simplify();
 
             // 验证类型必须是 &OnceCache 或 &SessionCache（支持生命周期参数）
-            if field_type_str.contains("OnceCache") || field_type_str.contains("SessionCache") {
-                // 类型验证通过
+            if field_type_str.contains("OnceCache") {
+                has_once_cache = true;
+            } else if field_type_str.contains("SessionCache") {
+                has_session_cache = true;
             } else {
                 panic!(
                     "Controller field must be &OnceCache or &SessionCache, got: {}",
@@ -113,6 +118,8 @@ fn validate_controller_struct(item_struct: &syn::ItemStruct) {
             }
         }
     }
+
+    (has_once_cache, has_session_cache)
 }
 
 /// 解析 header 标注的 tokens，返回 (key, value)
@@ -1979,12 +1986,83 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
 
-    // 验证结构体字段
-    validate_controller_struct(&item_struct);
+    // 验证结构体字段并获取字段信息
+    let (has_once_cache, has_session_cache) = validate_controller_struct(&item_struct);
     let struct_name = &item_struct.ident;
     let struct_name_str = struct_name.to_string();
 
-    // 生成结构体定义和常量
+    // 生成结构体定义、常量和 inventory 提交
+    // 同时生成隐藏的 controller 创建辅助函数
+    let controller_creation_fn = if has_session_cache {
+        // 结构体有 SessionCache 字段，生成包含鉴权的创建函数
+        // 直接创建并返回 Box<Self>
+        quote! {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            async fn __potato_create_controller(req: &potato::HttpRequest) -> Result<Box<Self>, potato::HttpResponse> {
+                // 在堆上分配缓存
+                let once_cache = Box::leak(Box::new(potato::OnceCache::new()));
+
+                // 从 Authorization header 中提取 Bearer token 并加载 session
+                let session_cache = {
+                    if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
+                        let header_value = h.as_str();
+                        if header_value.starts_with("Bearer ") {
+                            potato::SessionCache::from_token(&header_value[7..]).await.ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                let session_cache = match session_cache {
+                    Some(cache) => cache,
+                    None => {
+                        let mut resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
+                        resp.http_code = 401;
+                        return Err(resp);
+                    }
+                };
+                let session_cache = Box::leak(Box::new(session_cache));
+
+                // 创建 controller 实例
+                let controller = Self {
+                    once_cache,
+                    sess_cache: session_cache,
+                };
+
+                Ok(Box::new(controller))
+            }
+        }
+    } else {
+        // 结构体没有 SessionCache 字段，生成不包含鉴权的创建函数
+        // 创建临时的 SessionCache（但不使用），返回 Box<Self>
+        quote! {
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            async fn __potato_create_controller(_req: &potato::HttpRequest) -> Result<Box<Self>, potato::HttpResponse> {
+                // 在堆上分配缓存
+                let once_cache = Box::leak(Box::new(potato::OnceCache::new()));
+
+                // 创建临时的 SessionCache（不需要鉴权，也不使用）
+                let _temp_session_cache = Box::leak(Box::new(potato::SessionCache::new()));
+
+                // 创建 controller 实例（不包含 sess_cache 字段）
+                let controller = Self {
+                    once_cache,
+                };
+
+                Ok(Box::new(controller))
+            }
+        }
+    };
+
+    // 提取结构体的泛型参数（包括生命周期）
+    let struct_generics = &item_struct.generics;
+    let (impl_generics, type_generics, where_clause) = struct_generics.split_for_impl();
+
     let output = quote! {
         #item_struct
 
@@ -1992,6 +2070,22 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
 
         #[doc(hidden)]
         const __POTATO_CONTROLLER_NAME: &str = #struct_name_str;
+
+        // 提交 Controller 结构体字段信息到 inventory
+        potato::inventory::submit! {
+            potato::ControllerStructFlag::new(
+                #struct_name_str,
+                potato::ControllerStructFieldInfo {
+                    has_once_cache: #has_once_cache,
+                    has_session_cache: #has_session_cache,
+                }
+            )
+        }
+
+        // 生成隐藏的 controller 创建辅助函数
+        impl #impl_generics #struct_name #type_generics #where_clause {
+            #controller_creation_fn
+        }
     };
 
     output.into()
@@ -2195,52 +2289,16 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                         // 生成方法调用
                         let method_call = if has_receiver {
                             // 有 receiver，需要实例化 controller
-                            // 创建 OnceCache 和 SessionCache
-                            let mut_keyword = if is_mut_receiver {
-                                quote! { mut }
-                            } else {
-                                quote! {}
-                            };
-
-                            // 生成 SessionCache 加载逻辑（从 Authorization header）
-                            // 对于有 receiver 的 controller 方法，SessionCache 是必需的
-                            // 注意：生成的包装函数在 async move 块中调用 method_call，所以这里可以直接使用 .await
-                            let session_cache_init = quote! {
-                                {
-                                    // 从 Authorization header 中提取 Bearer token 并加载 session
-                                    if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
-                                        let header_value = h.as_str();
-                                        if header_value.starts_with("Bearer ") {
-                                            potato::SessionCache::from_token(&header_value[7..]).await.ok()
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }
-                            };
+                            // 使用结构体生成的 __potato_create_controller 函数
+                            // 返回 Box<Self>
 
                             if param_names.is_empty() {
                                 if is_async {
                                     quote! {
                                         {
-                                            let mut __potato_once_cache = potato::OnceCache::new();
-                                            let mut __potato_session_cache = #session_cache_init;
-
-                                            // Controller 方法需要有效的 SessionCache，如果没有 Authorization header 则返回 401
-                                            let mut __potato_session_cache = match __potato_session_cache {
-                                                Some(cache) => cache,
-                                                None => {
-                                                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
-                                                    __potato_resp.http_code = 401;
-                                                    return __potato_resp;
-                                                }
-                                            };
-
-                                            let #mut_keyword controller = #self_type_name {
-                                                once_cache: &__potato_once_cache,
-                                                sess_cache: &__potato_session_cache,
+                                            let mut controller = match #self_type_name::__potato_create_controller(req).await {
+                                                Ok(boxed) => boxed,
+                                                Err(resp) => return resp,
                                             };
                                             controller.#fn_name().await
                                         }
@@ -2248,22 +2306,9 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                                 } else {
                                     quote! {
                                         {
-                                            let mut __potato_once_cache = potato::OnceCache::new();
-                                            let mut __potato_session_cache = #session_cache_init;
-
-                                            // Controller 方法需要有效的 SessionCache，如果没有 Authorization header 则返回 401
-                                            let mut __potato_session_cache = match __potato_session_cache {
-                                                Some(cache) => cache,
-                                                None => {
-                                                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
-                                                    __potato_resp.http_code = 401;
-                                                    return __potato_resp;
-                                                }
-                                            };
-
-                                            let #mut_keyword controller = #self_type_name {
-                                                once_cache: &__potato_once_cache,
-                                                sess_cache: &__potato_session_cache,
+                                            let mut controller = match #self_type_name::__potato_create_controller(req).await {
+                                                Ok(boxed) => boxed,
+                                                Err(resp) => return resp,
                                             };
                                             controller.#fn_name()
                                         }
@@ -2273,22 +2318,9 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                                 if is_async {
                                     quote! {
                                         {
-                                            let mut __potato_once_cache = potato::OnceCache::new();
-                                            let mut __potato_session_cache = #session_cache_init;
-
-                                            // Controller 方法需要有效的 SessionCache，如果没有 Authorization header 则返回 401
-                                            let mut __potato_session_cache = match __potato_session_cache {
-                                                Some(cache) => cache,
-                                                None => {
-                                                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
-                                                    __potato_resp.http_code = 401;
-                                                    return __potato_resp;
-                                                }
-                                            };
-
-                                            let #mut_keyword controller = #self_type_name {
-                                                once_cache: &__potato_once_cache,
-                                                sess_cache: &__potato_session_cache,
+                                            let mut controller = match #self_type_name::__potato_create_controller(req).await {
+                                                Ok(boxed) => boxed,
+                                                Err(resp) => return resp,
                                             };
                                             controller.#fn_name(#(#param_names),*).await
                                         }
@@ -2296,22 +2328,9 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                                 } else {
                                     quote! {
                                         {
-                                            let mut __potato_once_cache = potato::OnceCache::new();
-                                            let mut __potato_session_cache = #session_cache_init;
-
-                                            // Controller 方法需要有效的 SessionCache，如果没有 Authorization header 则返回 401
-                                            let mut __potato_session_cache = match __potato_session_cache {
-                                                Some(cache) => cache,
-                                                None => {
-                                                    let mut __potato_resp = potato::HttpResponse::text("Unauthorized: Missing or invalid Authorization header");
-                                                    __potato_resp.http_code = 401;
-                                                    return __potato_resp;
-                                                }
-                                            };
-
-                                            let #mut_keyword controller = #self_type_name {
-                                                once_cache: &__potato_once_cache,
-                                                sess_cache: &__potato_session_cache,
+                                            let mut controller = match #self_type_name::__potato_create_controller(req).await {
+                                                Ok(boxed) => boxed,
+                                                Err(resp) => return resp,
                                             };
                                             controller.#fn_name(#(#param_names),*)
                                         }

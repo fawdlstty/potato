@@ -306,7 +306,7 @@ pub async fn serve_http3_impl(
     key_file: &str,
     pipe_ctx: Arc<PipeContext>,
 ) -> anyhow::Result<()> {
-    #[cfg(feature = "jemalloc")]
+    #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
     crate::init_jemalloc()?;
 
     let addr: SocketAddr = addr.parse()?;
@@ -535,7 +535,7 @@ pub async fn serve_http3_without_encrypt_impl(
     addr: &str,
     pipe_ctx: Arc<PipeContext>,
 ) -> anyhow::Result<()> {
-    #[cfg(feature = "jemalloc")]
+    #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
     crate::init_jemalloc()?;
 
     let addr: SocketAddr = addr.parse()?;

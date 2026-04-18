@@ -20,7 +20,7 @@ pub use server::*;
 pub use utils::ai::*;
 pub use utils::refstr::Headers;
 
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 pub use utils::jemalloc_helper::*;
 
 #[cfg(feature = "webrtc")]
@@ -872,6 +872,29 @@ impl ErrorHandlerFlag {
 }
 
 inventory::collect!(ErrorHandlerFlag);
+
+/// Controller 结构体字段信息
+pub struct ControllerStructFieldInfo {
+    pub has_once_cache: bool,
+    pub has_session_cache: bool,
+}
+
+/// Controller 结构体标志，用于在 impl 宏中传递字段信息
+pub struct ControllerStructFlag {
+    pub struct_name: &'static str,
+    pub field_info: ControllerStructFieldInfo,
+}
+
+impl ControllerStructFlag {
+    pub const fn new(struct_name: &'static str, field_info: ControllerStructFieldInfo) -> Self {
+        ControllerStructFlag {
+            struct_name,
+            field_info,
+        }
+    }
+}
+
+inventory::collect!(ControllerStructFlag);
 
 #[derive(Clone, Copy, Debug, Display, Eq, Hash, PartialEq)]
 pub enum HttpMethod {
