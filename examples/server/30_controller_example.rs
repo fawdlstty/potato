@@ -6,12 +6,13 @@ fn my_preprocess(_req: &mut potato::HttpRequest) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[potato::controller("/api/users")]
+#[potato::controller]
 pub struct UsersController<'a> {
     pub once_cache: &'a potato::OnceCache,
     pub sess_cache: &'a potato::SessionCache,
 }
 
+#[potato::controller("/api/users")]
 #[potato::preprocess(my_preprocess)]
 impl<'a> UsersController<'a> {
     #[potato::http_get("/")]  // 地址为 "/api/users/"
@@ -34,7 +35,7 @@ impl<'a> UsersController<'a> {
 async fn main() -> anyhow::Result<()> {
     let mut server = potato::HttpServer::new("0.0.0.0:8080");
     server.configure(|ctx| {
-        ctx.use_handlers(true);
+        ctx.use_handlers();
         ctx.use_openapi("/doc/");
     });
     println!("visit: http://127.0.0.1:8080/api/users/");

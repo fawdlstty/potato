@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
             }
             None
         });
-        ctx.use_handlers(false);
+        ctx.use_handlers();
     });
     println!("visit: http://127.0.0.1:8080/sync");
     println!("visit: http://127.0.0.1:8080/async");

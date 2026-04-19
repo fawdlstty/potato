@@ -64,7 +64,7 @@ async fn ollama_generate() -> anyhow::Result<potato::HttpResponse> {
 async fn main() -> anyhow::Result<()> {
     let mut server = potato::HttpServer::new("127.0.0.1:3000");
     server.configure(|ctx| {
-        ctx.use_handlers(true);
+        ctx.use_handlers();
     });
     
     println!("Ollama Chat API on http://127.0.0.1:3000/api/v1/chat");

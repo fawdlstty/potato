@@ -1190,6 +1190,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     Err(err) => Err(err),
                 }
             },
+            "Result<serde_json::Value>" | "anyhow::Result<serde_json::Value>" => quote! {
+                match #call_expr.await {
+                    Ok(ret) => Ok(potato::HttpResponse::json(serde_json::to_string(&ret).unwrap_or_else(|_| "{}".to_string()))),
+                    Err(err) => Err(err),
+                }
+            },
             "()" => quote! {
                 #call_expr.await;
                 Ok(potato::HttpResponse::text("ok"))
@@ -1202,6 +1208,9 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             },
             "& 'static str" => quote! {
                 Ok(potato::HttpResponse::html(#call_expr.await))
+            },
+            "serde_json::Value" => quote! {
+                Ok(potato::HttpResponse::json(serde_json::to_string(&#call_expr.await).unwrap_or_else(|_| "{}".to_string())))
             },
             _ => panic!("unsupported ret type: {ret_type}"),
         }
@@ -1231,6 +1240,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     Err(err) => Err(err),
                 }
             },
+            "Result<serde_json::Value>" | "anyhow::Result<serde_json::Value>" => quote! {
+                match #call_expr {
+                    Ok(ret) => Ok(potato::HttpResponse::json(serde_json::to_string(&ret).unwrap_or_else(|_| "{}".to_string()))),
+                    Err(err) => Err(err),
+                }
+            },
             "()" => quote! {
                 #call_expr;
                 Ok(potato::HttpResponse::text("ok"))
@@ -1243,6 +1258,9 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             },
             "& 'static str" => quote! {
                 Ok(potato::HttpResponse::html(#call_expr))
+            },
+            "serde_json::Value" => quote! {
+                Ok(potato::HttpResponse::json(serde_json::to_string(&#call_expr).unwrap_or_else(|_| "{}".to_string())))
             },
             _ => panic!("unsupported ret type: {ret_type}"),
         }

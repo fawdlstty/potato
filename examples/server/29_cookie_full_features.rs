@@ -112,7 +112,7 @@ async fn cookie_tracking(cache: &mut SessionCache) -> HttpResponse {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let server = HttpServer::new("127.0.0.1:8080");
+    let mut server = HttpServer::new("127.0.0.1:8080");
     println!("Server starting on http://127.0.0.1:8080");
     println!("\nCookie API Endpoints:");
     println!("  GET /cookie/simple   - Simple cookie example");

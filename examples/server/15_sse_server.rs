@@ -72,11 +72,10 @@ async fn ollama_chat() -> anyhow::Result<potato::HttpResponse> {
 async fn main() -> anyhow::Result<()> {
     let mut server = potato::HttpServer::new("127.0.0.1:3000");
     server.configure(|ctx| {
-        ctx.use_handlers(true);
+        ctx.use_handlers();
     });
-    println!("OpenAI SSE on http://127.0.0.1:3000/sse");
-    println!("OpenAI custom SSE on http://127.0.0.1:3000/sse-custom");
-    println!("Claude SSE on http://127.0.0.1:3000/claude-sse");
+    println!("OpenAI SSE on http://127.0.0.1:3000/api/v1/chat");
+    println!("Claude SSE on http://127.0.0.1:3000/api2/v1/chat");
     println!("Ollama SSE on http://127.0.0.1:3000/api3/v1/chat");
     server.serve_http().await
 }

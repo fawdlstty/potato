@@ -120,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
     // 设置JWT密钥（生产环境应该使用更安全的密钥）
     SessionCache::set_jwt_secret(b"your-secret-key-change-in-production").await;
     
-    let server = HttpServer::new("127.0.0.1:8080");
+    let mut server = HttpServer::new("127.0.0.1:8080");
     println!("Server starting on http://127.0.0.1:8080");
     println!("\nAPI Endpoints:");
     println!("  POST /api/login          - Login and get token");
