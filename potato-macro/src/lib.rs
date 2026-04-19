@@ -82,11 +82,7 @@ fn parse_cors_attr(tokens: &proc_macro2::TokenStream) -> CorsAttrConfig {
 
     match parse_inner.parse2(tokens.clone()) {
         Ok(cfg) => cfg,
-        Err(e) => panic!(
-            "Failed to parse CORS attributes: {}. \n\
-             Example usage: #[cors(origin = \"*\", methods = \"GET, POST\", headers = \"*\")]",
-            e
-        ),
+        Err(e) => panic!("Failed to parse cors attributes: {e}"),
     }
 }
 
@@ -116,13 +112,7 @@ fn validate_controller_struct(item_struct: &syn::ItemStruct) -> (bool, bool) {
                 has_session_cache = true;
             } else {
                 panic!(
-                    "Controller field must be &OnceCache or &SessionCache, got: {}.\n\
-                     Example:\n\
-                     #[controller(\"/api\")]\n\
-                     pub struct MyController {{\n\
-                         once_cache: &OnceCache,\n\
-                         session_cache: &SessionCache,\n\
-                     }}",
+                    "Controller field must be &OnceCache or &SessionCache, got: {}",
                     field_type_str
                 );
             }
@@ -181,16 +171,10 @@ fn attr_last_ident(attr: &syn::Attribute) -> Option<String> {
 fn parse_hook_attr_items(attr: &syn::Attribute, attr_name: &str) -> Vec<Ident> {
     let parser = syn::punctuated::Punctuated::<Ident, syn::Token![,]>::parse_terminated;
     let idents = attr.parse_args_with(parser).unwrap_or_else(|err| {
-        panic!(
-            "Invalid `{attr_name}` annotation: {err}.\n\
-             Example usage: #[{attr_name}(my_preprocess_fn)] or #[{attr_name}(fn1, fn2)]",
-        );
+        panic!("invalid `{attr_name}` annotation: {err}");
     });
     if idents.is_empty() {
-        panic!(
-            "`{attr_name}` annotation requires at least one function name.\n\
-             Example usage: #[{attr_name}(my_preprocess_fn)]",
-        );
+        panic!("`{attr_name}` annotation requires at least one function name");
     }
     idents.into_iter().collect()
 }
