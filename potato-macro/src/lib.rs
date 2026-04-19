@@ -82,7 +82,11 @@ fn parse_cors_attr(tokens: &proc_macro2::TokenStream) -> CorsAttrConfig {
 
     match parse_inner.parse2(tokens.clone()) {
         Ok(cfg) => cfg,
-        Err(e) => panic!("Failed to parse cors attributes: {e}"),
+        Err(e) => panic!(
+            "Failed to parse CORS attributes: {}. \n\
+             Example usage: #[cors(origin = \"*\", methods = \"GET, POST\", headers = \"*\")]",
+            e
+        ),
     }
 }
 
@@ -112,7 +116,13 @@ fn validate_controller_struct(item_struct: &syn::ItemStruct) -> (bool, bool) {
                 has_session_cache = true;
             } else {
                 panic!(
-                    "Controller field must be &OnceCache or &SessionCache, got: {}",
+                    "Controller field must be &OnceCache or &SessionCache, got: {}.\n\
+                     Example:\n\
+                     #[controller(\"/api\")]\n\
+                     pub struct MyController {{\n\
+                         once_cache: &OnceCache,\n\
+                         session_cache: &SessionCache,\n\
+                     }}",
                     field_type_str
                 );
             }
@@ -171,10 +181,16 @@ fn attr_last_ident(attr: &syn::Attribute) -> Option<String> {
 fn parse_hook_attr_items(attr: &syn::Attribute, attr_name: &str) -> Vec<Ident> {
     let parser = syn::punctuated::Punctuated::<Ident, syn::Token![,]>::parse_terminated;
     let idents = attr.parse_args_with(parser).unwrap_or_else(|err| {
-        panic!("invalid `{attr_name}` annotation: {err}");
+        panic!(
+            "Invalid `{attr_name}` annotation: {err}.\n\
+             Example usage: #[{attr_name}(my_preprocess_fn)] or #[{attr_name}(fn1, fn2)]",
+        );
     });
     if idents.is_empty() {
-        panic!("`{attr_name}` annotation requires at least one function name");
+        panic!(
+            "`{attr_name}` annotation requires at least one function name.\n\
+             Example usage: #[{attr_name}(my_preprocess_fn)]",
+        );
     }
     idents.into_iter().collect()
 }
@@ -984,7 +1000,9 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
 
     // 生成 tag 表达式
     let tag_expr = if has_receiver {
-        quote! { __POTATO_CONTROLLER_NAME }
+        // 使用类型名来生成唯一的常量名
+        // 这个将在 impl controller 宏中被替换为实际的常量引用
+        quote! { "" }
     } else {
         quote! { "" }
     };
@@ -1164,107 +1182,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             }
         }
     };
-    let handler_wrap_func_body = if is_async {
-        match &ret_type[..] {
-            "Result<()>" => quote! {
-                match #call_expr.await {
-                    Ok(_) => Ok(potato::HttpResponse::text("ok")),
-                    Err(err) => Err(err),
-                }
-            },
-            "Result<HttpResponse>" | "anyhow::Result<HttpResponse>" => quote! {
-                match #call_expr.await {
-                    Ok(ret) => Ok(ret),
-                    Err(err) => Err(err),
-                }
-            },
-            "Result<String>" | "anyhow::Result<String>" => quote! {
-                match #call_expr.await {
-                    Ok(ret) => Ok(potato::HttpResponse::html(ret)),
-                    Err(err) => Err(err),
-                }
-            },
-            "Result<& 'static str>" | "anyhow::Result<& 'static str>" => quote! {
-                match #call_expr.await {
-                    Ok(ret) => Ok(potato::HttpResponse::html(ret)),
-                    Err(err) => Err(err),
-                }
-            },
-            "Result<serde_json::Value>" | "anyhow::Result<serde_json::Value>" => quote! {
-                match #call_expr.await {
-                    Ok(ret) => Ok(potato::HttpResponse::json(serde_json::to_string(&ret).unwrap_or_else(|_| "{}".to_string()))),
-                    Err(err) => Err(err),
-                }
-            },
-            "()" => quote! {
-                #call_expr.await;
-                Ok(potato::HttpResponse::text("ok"))
-            },
-            "HttpResponse" => quote! {
-                Ok(#call_expr.await)
-            },
-            "String" => quote! {
-                Ok(potato::HttpResponse::html(#call_expr.await))
-            },
-            "& 'static str" => quote! {
-                Ok(potato::HttpResponse::html(#call_expr.await))
-            },
-            "serde_json::Value" => quote! {
-                Ok(potato::HttpResponse::json(serde_json::to_string(&#call_expr.await).unwrap_or_else(|_| "{}".to_string())))
-            },
-            _ => panic!("unsupported ret type: {ret_type}"),
-        }
-    } else {
-        match &ret_type[..] {
-            "Result<()>" => quote! {
-                match #call_expr {
-                    Ok(_) => Ok(potato::HttpResponse::text("ok")),
-                    Err(err) => Err(err),
-                }
-            },
-            "Result<HttpResponse>" | "anyhow::Result<HttpResponse>" => quote! {
-                match #call_expr {
-                    Ok(ret) => Ok(ret),
-                    Err(err) => Err(err),
-                }
-            },
-            "Result<String>" | "anyhow::Result<String>" => quote! {
-                match #call_expr {
-                    Ok(ret) => Ok(potato::HttpResponse::html(ret)),
-                    Err(err) => Err(err),
-                }
-            },
-            "Result<& 'static str>" | "anyhow::Result<& 'static str>" => quote! {
-                match #call_expr {
-                    Ok(ret) => Ok(potato::HttpResponse::html(ret)),
-                    Err(err) => Err(err),
-                }
-            },
-            "Result<serde_json::Value>" | "anyhow::Result<serde_json::Value>" => quote! {
-                match #call_expr {
-                    Ok(ret) => Ok(potato::HttpResponse::json(serde_json::to_string(&ret).unwrap_or_else(|_| "{}".to_string()))),
-                    Err(err) => Err(err),
-                }
-            },
-            "()" => quote! {
-                #call_expr;
-                Ok(potato::HttpResponse::text("ok"))
-            },
-            "HttpResponse" => quote! {
-                Ok(#call_expr)
-            },
-            "String" => quote! {
-                Ok(potato::HttpResponse::html(#call_expr))
-            },
-            "& 'static str" => quote! {
-                Ok(potato::HttpResponse::html(#call_expr))
-            },
-            "serde_json::Value" => quote! {
-                Ok(potato::HttpResponse::json(serde_json::to_string(&#call_expr).unwrap_or_else(|_| "{}".to_string())))
-            },
-            _ => panic!("unsupported ret type: {ret_type}"),
-        }
-    };
+    let handler_wrap_func_body = generate_response_handler(call_expr, &ret_type, is_async);
     let doc_args = serde_json::to_string(&doc_args).unwrap();
 
     // 生成添加headers的代码
@@ -1912,6 +1830,79 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     //todo!()
 }
 
+/// 生成返回值处理代码（统一用于全局 handler 和 controller）
+///
+/// # 参数
+/// - `call_expr`: 调用表达式（函数调用）
+/// - `ret_type`: 返回值类型字符串
+/// - `is_async`: 是否是异步函数（true 时会自动添加 .await）
+fn generate_response_handler(
+    call_expr: proc_macro2::TokenStream,
+    ret_type: &str,
+    is_async: bool,
+) -> proc_macro2::TokenStream {
+    let call_with_await = if is_async {
+        quote! { #call_expr.await }
+    } else {
+        quote! { #call_expr }
+    };
+
+    match ret_type {
+        // Result 类型
+        "Result<()>" | "anyhow::Result<()>" => quote! {
+            match #call_with_await {
+                Ok(_) => Ok::<potato::HttpResponse, anyhow::Error>(potato::HttpResponse::text("ok")),
+                Err(err) => Err(err),
+            }
+        },
+        "Result<HttpResponse>" | "anyhow::Result<HttpResponse>" => quote! {
+            match #call_with_await {
+                Ok(ret) => Ok(ret),
+                Err(err) => Err(err),
+            }
+        },
+        "Result<String>" | "anyhow::Result<String>" => quote! {
+            match #call_with_await {
+                Ok(ret) => Ok::<potato::HttpResponse, anyhow::Error>(potato::HttpResponse::html(ret)),
+                Err(err) => Err(err),
+            }
+        },
+        "Result<& 'static str>" | "anyhow::Result<& 'static str>" => quote! {
+            match #call_with_await {
+                Ok(ret) => Ok::<potato::HttpResponse, anyhow::Error>(potato::HttpResponse::html(ret)),
+                Err(err) => Err(err),
+            }
+        },
+        "Result<serde_json::Value>" | "anyhow::Result<serde_json::Value>" => quote! {
+            match #call_with_await {
+                Ok(ret) => Ok::<potato::HttpResponse, anyhow::Error>(potato::HttpResponse::json(serde_json::to_string(&ret).unwrap_or_else(|_| "{}".to_string()))),
+                Err(err) => Err(err),
+            }
+        },
+        // 非 Result 类型
+        "()" => quote! {
+            {
+                #call_with_await;
+                Ok::<potato::HttpResponse, anyhow::Error>(potato::HttpResponse::text("ok"))
+            }
+        },
+        "HttpResponse" => quote! {
+            Ok::<potato::HttpResponse, anyhow::Error>(#call_with_await)
+        },
+        "String" => quote! {
+            Ok::<potato::HttpResponse, anyhow::Error>(potato::HttpResponse::html(#call_with_await))
+        },
+        "& 'static str" => quote! {
+            Ok::<potato::HttpResponse, anyhow::Error>(potato::HttpResponse::html(#call_with_await))
+        },
+        "serde_json::Value" => quote! {
+            Ok::<potato::HttpResponse, anyhow::Error>(potato::HttpResponse::json(serde_json::to_string(&#call_with_await).unwrap_or_else(|_| "{}".to_string())))
+        },
+        // 不支持的类型
+        _ => panic!("unsupported ret type: {}", ret_type),
+    }
+}
+
 #[proc_macro_attribute]
 pub fn http_get(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "GET")
@@ -2081,13 +2072,17 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
     let struct_generics = &item_struct.generics;
     let (impl_generics, type_generics, where_clause) = struct_generics.split_for_impl();
 
+    // 生成唯一的常量名
+    let controller_name_const =
+        quote::format_ident!("__POTATO_CONTROLLER_NAME_{}", struct_name_str);
+
     let output = quote! {
         #item_struct
 
         #base_path
 
         #[doc(hidden)]
-        const __POTATO_CONTROLLER_NAME: &str = #struct_name_str;
+        const #controller_name_const: &str = #struct_name_str;
 
         // 提交 Controller 结构体字段信息到 inventory
         potato::inventory::submit! {
@@ -2439,14 +2434,26 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                             }
                         };
 
-                        // 生成包装函数 - 简化版，直接返回文本
+                        // 检测返回类型
+                        let ret_type_str = method
+                            .sig
+                            .output
+                            .to_token_stream()
+                            .to_string()
+                            .type_simplify();
+
+                        // 使用统一的返回值处理函数（method_call 已经包含了 .await，所以传入 false）
+                        let resp_handler =
+                            generate_response_handler(method_call.clone(), &ret_type_str, false);
+
+                        // 生成包装函数
                         let wrapper_fn = if is_async {
                             quote! {
                                 #[doc(hidden)]
                                 fn #wrapper_fn_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
                                     Box::pin(async move {
-                                        match #method_call {
-                                            Ok(resp) => potato::HttpResponse::text(resp.to_string()),
+                                        match #resp_handler {
+                                            Ok(resp) => resp,
                                             Err(err) => potato::HttpResponse::error(err.to_string()),
                                         }
                                     })
@@ -2457,8 +2464,8 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                                 #[doc(hidden)]
                                 fn #wrapper_fn_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
                                     Box::pin(async move {
-                                        match #method_call {
-                                            Ok(resp) => potato::HttpResponse::text(resp.to_string()),
+                                        match #resp_handler {
+                                            Ok(resp) => resp,
                                             Err(err) => potato::HttpResponse::error(err.to_string()),
                                         }
                                     })

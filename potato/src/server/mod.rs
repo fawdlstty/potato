@@ -159,7 +159,12 @@ impl Clone for PipeContextItem {
             #[cfg(feature = "webdav")]
             PipeContextItem::Webdav(v) => PipeContextItem::Webdav(v.clone()),
             #[cfg(feature = "http3")]
-            PipeContextItem::WebTransport(_) => panic!("WebTransport handler cannot be cloned"),
+            PipeContextItem::WebTransport(_) => {
+                // WebTransport handler cannot be cloned by design
+                // This should never happen in normal usage as WebTransport
+                // handlers are not meant to be cloned
+                unreachable!("WebTransport handler cannot be cloned. This is a programming error.")
+            }
             #[cfg(feature = "webrtc")]
             PipeContextItem::WebRTC(v) => PipeContextItem::WebRTC(v.clone()),
         }
@@ -602,6 +607,19 @@ impl PipeContext {
     /// server.configure(|ctx| {
     ///     ctx.use_transfer_limit(10_000_000, 20_000_000); // 入站 10 Mbps，出站 20 Mbps
     ///     ctx.use_handlers();
+    /// Sets transfer rate limits for inbound and outbound traffic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either rate limit is zero. Use `try_use_transfer_limit` for a non-panicking version.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let mut server = potato::HttpServer::new("127.0.0.1:8080");
+    /// server.configure(|ctx| {
+    ///     ctx.use_transfer_limit(10_000_000, 20_000_000); // 入站 10 Mbps，出站 20 Mbps
+    ///     ctx.use_handlers();
     /// });
     /// ```
     pub fn use_transfer_limit(
@@ -619,6 +637,41 @@ impl PipeContext {
             inbound_rate_bits_per_sec,
             outbound_rate_bits_per_sec,
         ));
+    }
+
+    /// Sets transfer rate limits for inbound and outbound traffic with error handling.
+    ///
+    /// # Returns
+    ///
+    /// Returns an error if either rate limit is zero.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let mut server = potato::HttpServer::new("127.0.0.1:8080");
+    /// server.configure(|ctx| {
+    ///     if let Err(e) = ctx.try_use_transfer_limit(10_000_000, 20_000_000) {
+    ///         eprintln!("Failed to set transfer limit: {}", e);
+    ///     }
+    ///     ctx.use_handlers();
+    /// });
+    /// ```
+    pub fn try_use_transfer_limit(
+        &mut self,
+        inbound_rate_bits_per_sec: u64,
+        outbound_rate_bits_per_sec: u64,
+    ) -> Result<(), String> {
+        if inbound_rate_bits_per_sec == 0 {
+            return Err("Inbound transfer rate limit must be greater than 0".to_string());
+        }
+        if outbound_rate_bits_per_sec == 0 {
+            return Err("Outbound transfer rate limit must be greater than 0".to_string());
+        }
+        self.items.push(PipeContextItem::TransferRate(
+            inbound_rate_bits_per_sec,
+            outbound_rate_bits_per_sec,
+        ));
+        Ok(())
     }
 
     pub fn use_reverse_proxy(
