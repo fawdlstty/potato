@@ -677,39 +677,59 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         false
     };
 
-    let (route_path, default_headers) = {
-        let mut oroute_path = syn::parse::<syn::LitStr>(attr.clone())
-            .ok()
-            .map(|path| path.value());
+    let (route_path, default_headers, is_send) = {
+        let mut oroute_path: Option<String> = None;
         let mut default_headers: Vec<(String, String)> = Vec::new();
-        //
-        if oroute_path.is_none() {
-            let http_parser = syn::meta::parser(|meta| {
-                if meta.path.is_ident("path") {
-                    if let Ok(arg) = meta.value() {
-                        if let Ok(route_path) = arg.parse::<syn::LitStr>() {
-                            let route_path = route_path.value();
-                            oroute_path = Some(route_path);
+        let mut is_send = false;
+
+        // 首先尝试解析为逗号分隔的列表：path_str, Send 或 path_str
+        let attr_stream: proc_macro2::TokenStream = attr.into();
+        let tokens: Vec<_> = attr_stream.into_iter().collect();
+        let mut found_path = false;
+        let mut i = 0;
+        while i < tokens.len() {
+            let token = &tokens[i];
+            // 尝试解析为字符串字面量（路径）
+            if let proc_macro2::TokenTree::Literal(lit) = token {
+                let lit_str = lit.to_string();
+                // 移除引号
+                if lit_str.starts_with('"') && lit_str.ends_with('"') {
+                    let path = &lit_str[1..lit_str.len() - 1];
+                    oroute_path = Some(path.to_string());
+                    found_path = true;
+                }
+                i += 1;
+            } else if let proc_macro2::TokenTree::Ident(ident) = token {
+                if ident.to_string() == "Send" {
+                    is_send = true;
+                    i += 1;
+                } else if ident.to_string() == "path" {
+                    // 处理 path = "/api/path" 格式
+                    if i + 2 < tokens.len() {
+                        if let proc_macro2::TokenTree::Punct(punct) = &tokens[i + 1] {
+                            if punct.as_char() == '=' {
+                                if let proc_macro2::TokenTree::Literal(lit) = &tokens[i + 2] {
+                                    let lit_str = lit.to_string();
+                                    if lit_str.starts_with('"') && lit_str.ends_with('"') {
+                                        let path = &lit_str[1..lit_str.len() - 1];
+                                        oroute_path = Some(path.to_string());
+                                    }
+                                    i += 3;
+                                    continue;
+                                }
+                            }
                         }
                     }
-                    Ok(())
-                } else if meta.path.is_ident("header") {
-                    // 解析 header(key = value) 格式
-                    let content;
-                    syn::parenthesized!(content in meta.input);
-                    let key: Ident = content.parse()?;
-                    let _: syn::Token![=] = content.parse()?;
-                    let value: syn::LitStr = content.parse()?;
-                    default_headers.push((key.to_string(), value.value()));
-                    Ok(())
+                    i += 1;
                 } else {
-                    Err(meta.error("unsupported annotation property"))
+                    i += 1;
                 }
-            });
-            syn::parse_macro_input!(attr with http_parser);
+            } else {
+                i += 1;
+            }
         }
 
-        // 如果没有提供 path 且有 receiver，可能是 controller 方法
+        // 如果没有找到路径且有 receiver，可能是 controller 方法
         if oroute_path.is_none() && has_receiver {
             // 这将在后续代码中处理，先设置为空
         } else if oroute_path.is_none() {
@@ -738,7 +758,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         if !route_path.is_empty() && !route_path.starts_with('/') {
             panic!("route path must start with '/'");
         }
-        (route_path, default_headers)
+        (route_path, default_headers, is_send)
     };
 
     // 解析函数上的 #[potato::header(...)] 标注
@@ -1757,6 +1777,17 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     };
 
     if is_async {
+        let (wrapper_sig, handler_variant) = if is_send {
+            (
+                quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> },
+                quote! { potato::HttpHandler::Async },
+            )
+        } else {
+            (
+                quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + '_>> },
+                quote! { potato::HttpHandler::AsyncNoSend },
+            )
+        };
         quote! {
             #root_fn
 
@@ -1770,19 +1801,30 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             }
 
             #[doc(hidden)]
-            fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
+            #wrapper_sig {
                 Box::pin(#wrap_func_name2(req))
             }
 
             potato::inventory::submit!{potato::RequestHandlerFlag::new(
                 potato::HttpMethod::#req_name,
                 #final_path_expr,
-                potato::HttpHandler::Async(#wrap_func_name),
+                #handler_variant(#wrap_func_name),
                 potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args, #tag_expr)
             )}
         }
         .into()
     } else {
+        let (wrapper_sig, handler_variant) = if is_send {
+            (
+                quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> },
+                quote! { potato::HttpHandler::Async },
+            )
+        } else {
+            (
+                quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + '_>> },
+                quote! { potato::HttpHandler::AsyncNoSend },
+            )
+        };
         quote! {
             #root_fn
 
@@ -1796,14 +1838,14 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             }
 
             #[doc(hidden)]
-            fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
+            #wrapper_sig {
                 Box::pin(#wrap_func_name2(req))
             }
 
             potato::inventory::submit!{potato::RequestHandlerFlag::new(
                 potato::HttpMethod::#req_name,
                 #final_path_expr,
-                potato::HttpHandler::Async(#wrap_func_name),
+                #handler_variant(#wrap_func_name),
                 potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args, #tag_expr)
             )}
         }

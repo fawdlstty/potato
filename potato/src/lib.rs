@@ -784,11 +784,14 @@ static SERVER_STR: LazyLock<String> =
 
 type AsyncHttpHandler =
     fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + Send + '_>>;
+type AsyncNoSendHttpHandler =
+    fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = HttpResponse> + '_>>;
 type SyncHttpHandler = fn(&mut HttpRequest) -> HttpResponse;
 
 #[derive(Clone, Copy)]
 pub enum HttpHandler {
     Async(AsyncHttpHandler),
+    AsyncNoSend(AsyncNoSendHttpHandler),
     Sync(SyncHttpHandler),
 }
 

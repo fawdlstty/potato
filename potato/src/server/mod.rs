@@ -1014,6 +1014,9 @@ impl PipeContext {
                         let mut res = match handler_ref {
                             HttpHandler::Async(handler) => handler(req).await,
                             HttpHandler::Sync(handler) => handler(req),
+                            HttpHandler::AsyncNoSend(_) => {
+                                unreachable!("AsyncNoSend handlers are not supported - all handlers must use Send")
+                            }
                         };
                         execute_postprocess(&postprocess_handlers, req, &mut res).await;
                         return res;
@@ -1027,6 +1030,9 @@ impl PipeContext {
                                 let mut res = match get_handler_ref {
                                     HttpHandler::Async(handler) => handler(req).await,
                                     HttpHandler::Sync(handler) => handler(req),
+                                    HttpHandler::AsyncNoSend(_) => {
+                                        unreachable!("AsyncNoSend handlers are not supported")
+                                    }
                                 };
                                 req.method = HttpMethod::HEAD;
                                 res.body = crate::HttpResponseBody::Data(vec![]);
