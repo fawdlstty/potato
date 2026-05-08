@@ -14,7 +14,7 @@ High-performance, concise HTTP framework with HTTP/1.1, HTTP/2, and HTTP/3 suppo
 Add the library reference:
 
 ```sh
-cargo add potato
+cargo add potato --features full
 cargo add tokio --features full
 ```
 

@@ -14,7 +14,7 @@
 加入库的引用：
 
 ```sh
-cargo add potato
+cargo add potato --features full
 cargo add tokio --features full
 ```
 

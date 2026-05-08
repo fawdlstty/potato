@@ -464,12 +464,14 @@ fn preprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
         }
 
         #[doc(hidden)]
-        pub async fn #wrap_name(
-            req: &mut potato::HttpRequest,
-            once_cache: Option<&mut potato::OnceCache>,
-            session_cache: Option<&mut potato::SessionCache>,
-        ) -> anyhow::Result<Option<potato::HttpResponse>> {
-            #wrapper_body
+        pub fn #wrap_name<'a>(
+            req: &'a mut potato::HttpRequest,
+            once_cache: Option<&'a mut potato::OnceCache>,
+            session_cache: Option<&'a mut potato::SessionCache>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Option<potato::HttpResponse>>> + Send + 'a>> {
+            Box::pin(async move {
+                #wrapper_body
+            })
         }
     }
     .into()
@@ -651,13 +653,15 @@ fn postprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
         }
 
         #[doc(hidden)]
-        pub async fn #wrap_name(
-            req: &mut potato::HttpRequest,
-            res: &mut potato::HttpResponse,
-            once_cache: Option<&mut potato::OnceCache>,
-            session_cache: Option<&mut potato::SessionCache>,
-        ) -> anyhow::Result<()> {
-            #wrapper_body
+        pub fn #wrap_name<'a>(
+            req: &'a mut potato::HttpRequest,
+            res: &'a mut potato::HttpResponse,
+            once_cache: Option<&'a mut potato::OnceCache>,
+            session_cache: Option<&'a mut potato::SessionCache>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                #wrapper_body
+            })
         }
     }
     .into()
@@ -680,7 +684,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     let (route_path, default_headers, is_send) = {
         let mut oroute_path: Option<String> = None;
         let mut default_headers: Vec<(String, String)> = Vec::new();
-        let mut is_send = false;
+        let mut is_send = true; // 默认使用Send
 
         // 首先尝试解析为逗号分隔的列表：path_str, Send 或 path_str
         let attr_stream: proc_macro2::TokenStream = attr.into();
@@ -2239,18 +2243,35 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                             "OPTIONS"
                         };
 
-                        // 提取 path 参数
-                        let method_path = match &attr.meta {
+                        // 提取 path 参数和 Send 标志
+                        let (method_path, is_send) = match &attr.meta {
                             syn::Meta::List(list) => {
-                                if let Ok(lit_str) =
-                                    syn::parse::<syn::LitStr>(list.tokens.clone().into())
-                                {
-                                    lit_str.value()
-                                } else {
-                                    String::new()
+                                let tokens: Vec<_> = list.tokens.clone().into_iter().collect();
+                                let mut path = String::new();
+                                let mut send = true; // 默认使用Send
+
+                                let mut i = 0;
+                                while i < tokens.len() {
+                                    if let proc_macro2::TokenTree::Literal(lit) = &tokens[i] {
+                                        let lit_str = lit.to_string();
+                                        if lit_str.starts_with('"') && lit_str.ends_with('"') {
+                                            path = lit_str[1..lit_str.len() - 1].to_string();
+                                        }
+                                        i += 1;
+                                    } else if let proc_macro2::TokenTree::Ident(ident) = &tokens[i]
+                                    {
+                                        if ident.to_string() == "Send" {
+                                            send = true;
+                                        }
+                                        i += 1;
+                                    } else {
+                                        i += 1;
+                                    }
                                 }
+
+                                (path, send)
                             }
-                            _ => String::new(),
+                            _ => (String::new(), true),
                         };
 
                         // 拼接路径（在宏展开时完成）
@@ -2501,17 +2522,30 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
 
                         generated_code.push(wrapper_fn);
 
-                        // 生成路由注册
+                        // 生成路由注册（根据 is_send 标志选择 Async 或 AsyncNoSend）
                         let http_method_ident = quote::format_ident!("{}", http_method);
 
-                        let route_register = quote! {
-                            potato::inventory::submit! {
-                                potato::RequestHandlerFlag::new(
-                                    potato::HttpMethod::#http_method_ident,
-                                    #final_path_lit,
-                                    potato::HttpHandler::Async(#wrapper_fn_name),
-                                    potato::RequestHandlerFlagDoc::new(true, #doc_auth, "", "", "", #self_type_tag)
-                                )
+                        let route_register = if is_send {
+                            quote! {
+                                potato::inventory::submit! {
+                                    potato::RequestHandlerFlag::new(
+                                        potato::HttpMethod::#http_method_ident,
+                                        #final_path_lit,
+                                        potato::HttpHandler::Async(#wrapper_fn_name),
+                                        potato::RequestHandlerFlagDoc::new(true, #doc_auth, "", "", "", #self_type_tag)
+                                    )
+                                }
+                            }
+                        } else {
+                            quote! {
+                                potato::inventory::submit! {
+                                    potato::RequestHandlerFlag::new(
+                                        potato::HttpMethod::#http_method_ident,
+                                        #final_path_lit,
+                                        potato::HttpHandler::AsyncNoSend(#wrapper_fn_name),
+                                        potato::RequestHandlerFlagDoc::new(true, #doc_auth, "", "", "", #self_type_tag)
+                                    )
+                                }
                             }
                         };
 

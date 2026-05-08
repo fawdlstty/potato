@@ -601,14 +601,6 @@ impl PipeContext {
     /// * `inbound_rate_bits_per_sec` - 入站最大传输速率（bits/sec），接收请求数据的速率限制
     /// * `outbound_rate_bits_per_sec` - 出站最大传输速率（bits/sec），发送响应数据的速率限制
     ///
-    /// # 示例
-    /// ```rust
-    /// let mut server = potato::HttpServer::new("127.0.0.1:8080");
-    /// server.configure(|ctx| {
-    ///     ctx.use_transfer_limit(10_000_000, 20_000_000); // 入站 10 Mbps，出站 20 Mbps
-    ///     ctx.use_handlers();
-    /// Sets transfer rate limits for inbound and outbound traffic.
-    ///
     /// # Panics
     ///
     /// Panics if either rate limit is zero. Use `try_use_transfer_limit` for a non-panicking version.
