@@ -681,15 +681,13 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         false
     };
 
-    let (route_path, default_headers, is_send) = {
+    let (route_path, is_send) = {
         let mut oroute_path: Option<String> = None;
-        let mut default_headers: Vec<(String, String)> = Vec::new();
         let mut is_send = true; // 默认使用Send
 
         // 首先尝试解析为逗号分隔的列表：path_str, Send 或 path_str
         let attr_stream: proc_macro2::TokenStream = attr.into();
         let tokens: Vec<_> = attr_stream.into_iter().collect();
-        let mut found_path = false;
         let mut i = 0;
         while i < tokens.len() {
             let token = &tokens[i];
@@ -700,7 +698,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 if lit_str.starts_with('"') && lit_str.ends_with('"') {
                     let path = &lit_str[1..lit_str.len() - 1];
                     oroute_path = Some(path.to_string());
-                    found_path = true;
                 }
                 i += 1;
             } else if let proc_macro2::TokenTree::Ident(ident) = token {
@@ -762,7 +759,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         if !route_path.is_empty() && !route_path.starts_with('/') {
             panic!("route path must start with '/'");
         }
-        (route_path, default_headers, is_send)
+        (route_path, is_send)
     };
 
     // 解析函数上的 #[potato::header(...)] 标注
@@ -898,9 +895,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         remaining_attrs.push(attr.clone());
     }
 
-    // 合并默认headers和函数headers
-    let mut all_headers = default_headers;
-    all_headers.extend(fn_headers);
+    let all_headers = fn_headers;
 
     root_fn.attrs = remaining_attrs;
     let (preprocess_fns, postprocess_fns) = collect_handler_hooks(&mut root_fn);

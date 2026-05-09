@@ -30,8 +30,8 @@ use anyhow::anyhow;
 use chrono::Utc;
 use core::str;
 use hipstr::{LocalHipByt, LocalHipStr};
-use http::uri::Scheme;
 use http::Uri;
+use http::uri::Scheme;
 use rust_embed::Embed;
 use sha1::{Digest, Sha1};
 use std::any::{Any, TypeId};
@@ -48,8 +48,8 @@ use std::time::UNIX_EPOCH;
 use std::{collections::HashMap, collections::HashSet, future::Future, pin::Pin};
 use strum::Display;
 use thread_local::ThreadLocal;
-use tokio::sync::mpsc::Receiver;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::Receiver;
 use utils::bytes::CompressExt;
 use utils::enums::{HttpConnection, HttpContentType};
 use utils::number::HttpCodeExt;
@@ -478,7 +478,7 @@ impl SessionCache {
         user_id: i64,
         ttl: std::time::Duration,
     ) -> Result<String, anyhow::Error> {
-        use jsonwebtoken::{encode, EncodingKey, Header};
+        use jsonwebtoken::{EncodingKey, Header, encode};
         use serde::{Deserialize, Serialize};
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -513,7 +513,7 @@ impl SessionCache {
     /// 解析JWT token
     /// 返回: (user_id, session_exp_duration)
     pub async fn parse_token(token: &str) -> Result<(i64, Duration), SessionCacheError> {
-        use jsonwebtoken::{decode, DecodingKey, Validation};
+        use jsonwebtoken::{DecodingKey, Validation, decode};
         use serde::{Deserialize, Serialize};
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -2826,6 +2826,9 @@ impl HttpResponse {
                         continue;
                     }
                     ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
+                }
+                if !suppress_body {
+                    ret.push_str("Transfer-Encoding: chunked\r\n");
                 }
                 if declared_trailer_names.is_empty() && !outbound_stream_trailers.is_empty() {
                     let trailer_names = outbound_stream_trailers

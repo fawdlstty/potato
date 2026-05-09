@@ -102,6 +102,89 @@ async fn stream_chunked_body_to_channel(
     }
 }
 
+/// 通用流式 body 读取函数，支持 chunked 和非 chunked 模式
+/// 将读取到的原始数据（chunked 会解码）发送到 channel
+async fn stream_body_to_channel(
+    mut stream: HttpStream,
+    mut buf: Vec<u8>,
+    tx: Sender<Vec<u8>>,
+    is_chunked: bool,
+) -> anyhow::Result<()> {
+    if is_chunked {
+        // chunked 模式：解析 chunk 并发送解码后的原始数据
+        let mut cursor = 0usize;
+        let mut tmp_buf = [0u8; 8192];
+        loop {
+            let line_end = loop {
+                if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n") {
+                    break cursor + pos;
+                }
+                let n = stream.read(&mut tmp_buf).await?;
+                if n == 0 {
+                    return Ok(());
+                }
+                buf.extend_from_slice(&tmp_buf[..n]);
+            };
+
+            let size_line = std::str::from_utf8(&buf[cursor..line_end])?;
+            let size_token = size_line
+                .split_once(';')
+                .map_or(size_line, |(size, _)| size)
+                .trim();
+            if size_token.is_empty() {
+                return Err(anyhow!("invalid chunk size"));
+            }
+            let chunk_size = usize::from_str_radix(size_token, 16)?;
+            cursor = line_end + 2;
+
+            if chunk_size == 0 {
+                return Ok(());
+            }
+
+            while buf.len() < cursor + chunk_size + 2 {
+                let n = stream.read(&mut tmp_buf).await?;
+                if n == 0 {
+                    return Ok(());
+                }
+                buf.extend_from_slice(&tmp_buf[..n]);
+            }
+
+            if &buf[cursor + chunk_size..cursor + chunk_size + 2] != b"\r\n" {
+                return Err(anyhow!("invalid chunk terminator"));
+            }
+
+            let chunk_data = buf[cursor..cursor + chunk_size].to_vec();
+            if tx.send(chunk_data).await.is_err() {
+                return Ok(());
+            }
+
+            cursor += chunk_size + 2;
+            if cursor > 8192 {
+                buf.drain(..cursor);
+                cursor = 0;
+            }
+        }
+    } else {
+        // 非 chunked 模式：直接转发已有数据和后续读取的数据
+        if !buf.is_empty() {
+            if tx.send(buf).await.is_err() {
+                return Ok(());
+            }
+        }
+        let mut tmp_buf = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut tmp_buf).await?;
+            if n == 0 {
+                break;
+            }
+            if tx.send(tmp_buf[..n].to_vec()).await.is_err() {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 macro_rules! define_session_method {
     ($fn_name:ident, $method:ident) => {
         pub async fn $fn_name(
@@ -166,8 +249,8 @@ impl SessionImpl {
             true => {
                 use rustls_pki_types::ServerName;
                 use std::sync::Arc;
-                use tokio_rustls::rustls::{ClientConfig, RootCertStore};
                 use tokio_rustls::TlsConnector;
+                use tokio_rustls::rustls::{ClientConfig, RootCertStore};
                 let mut root_cert = RootCertStore::empty();
                 root_cert.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 let config = ClientConfig::builder()
@@ -945,96 +1028,90 @@ impl TransferSession {
         };
 
         let conn_key = (dest_host.clone(), dest_use_ssl, dest_port);
-        let stream = match self.conns.get_mut(&conn_key) {
-            Some(stream) => stream,
-            None => {
-                #[cfg(not(feature = "ssh"))]
-                let new_stream = None;
-                #[cfg(feature = "ssh")]
-                let mut new_stream = None;
-                #[cfg(feature = "ssh")]
-                if let Some(jumpbox_srv) = &self.jumpbox_srv {
-                    let mut channel = jumpbox_srv
-                        .channel_open_direct_tcpip(&dest_host, dest_port as u32, "127.0.0.1", 0)
-                        .await
-                        .map_err(|p| anyhow!("Failed to connect {dest_host} over ssh: {p}"))?;
+        let mut stream = if let Some(stream) = self.conns.remove(&conn_key) {
+            stream
+        } else {
+            #[cfg(not(feature = "ssh"))]
+            let new_stream = None;
+            #[cfg(feature = "ssh")]
+            let mut new_stream = None;
+            #[cfg(feature = "ssh")]
+            if let Some(jumpbox_srv) = &self.jumpbox_srv {
+                let mut channel = jumpbox_srv
+                    .channel_open_direct_tcpip(&dest_host, dest_port as u32, "127.0.0.1", 0)
+                    .await
+                    .map_err(|p| anyhow!("Failed to connect {dest_host} over ssh: {p}"))?;
 
-                    let (stream1, stream2) = tokio::io::duplex(65536);
+                let (stream1, stream2) = tokio::io::duplex(65536);
 
-                    let (mut reader, mut writer) = tokio::io::split(stream2);
+                let (mut reader, mut writer) = tokio::io::split(stream2);
 
-                    tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buffer = vec![0u8; 8192];
-                        loop {
-                            tokio::select! {
-                                msg = channel.wait() => {
-                                    match msg {
-                                        Some(russh::ChannelMsg::Data { data }) => {
-                                            if writer.write_all(&data).await.is_err() {
-                                                break;
-                                            }
-                                            if writer.flush().await.is_err() {
-                                                break;
-                                            }
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buffer = vec![0u8; 8192];
+                    loop {
+                        tokio::select! {
+                            msg = channel.wait() => {
+                                match msg {
+                                    Some(russh::ChannelMsg::Data { data }) => {
+                                        if writer.write_all(&data).await.is_err() {
+                                            break;
                                         }
-                                        Some(_) => continue,
-                                        None => break,
-                                    }
-                                },
-                                result = reader.read(&mut buffer) => {
-                                    match result {
-                                        Ok(0) => break,
-                                        Ok(n) => {
-                                            if channel.data(&buffer[..n]).await.is_err() {
-                                                break;
-                                            }
+                                        if writer.flush().await.is_err() {
+                                            break;
                                         }
-                                        Err(_) => break,
                                     }
-                                },
-                            }
+                                    Some(_) => continue,
+                                    None => break,
+                                }
+                            },
+                            result = reader.read(&mut buffer) => {
+                                match result {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if channel.data(&buffer[..n]).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            },
                         }
-                    });
+                    }
+                });
 
-                    new_stream = Some(HttpStream::from_duplex_stream(stream1));
-                }
-                let new_stream = match new_stream {
-                    Some(new_stream) => new_stream,
-                    None => match dest_use_ssl {
-                        #[cfg(feature = "tls")]
-                        true => {
-                            use rustls_pki_types::ServerName;
-                            use std::sync::Arc;
-                            use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-                            use tokio_rustls::TlsConnector;
+                new_stream = Some(HttpStream::from_duplex_stream(stream1));
+            }
+            match new_stream {
+                Some(new_stream) => new_stream,
+                None => match dest_use_ssl {
+                    #[cfg(feature = "tls")]
+                    true => {
+                        use rustls_pki_types::ServerName;
+                        use std::sync::Arc;
+                        use tokio_rustls::TlsConnector;
+                        use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-                            let mut root_cert = RootCertStore::empty();
-                            root_cert.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                            let config = ClientConfig::builder()
-                                .with_root_certificates(root_cert)
-                                .with_no_client_auth();
-                            let connector = TlsConnector::from(Arc::new(config));
-                            let dnsname = ServerName::try_from(dest_host.clone())?;
-                            let tcp_stream =
-                                TcpStream::connect((dest_host.as_str(), dest_port)).await?;
-                            let tls_stream = connector.connect(dnsname, tcp_stream).await?;
-                            HttpStream::from_client_tls(tls_stream)
-                        }
-                        #[cfg(not(feature = "tls"))]
-                        true => Err(anyhow!("unsupported tls during non-tls build"))?,
-                        false => {
-                            let tcp_stream =
-                                TcpStream::connect((dest_host.as_str(), dest_port)).await?;
-                            HttpStream::from_tcp(tcp_stream)
-                        }
-                    },
-                };
-
-                self.conns.insert(conn_key.clone(), new_stream);
-                self.conns
-                    .get_mut(&conn_key)
-                    .ok_or_else(|| anyhow!("Failed to get connection after insert"))?
+                        let mut root_cert = RootCertStore::empty();
+                        root_cert.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                        let config = ClientConfig::builder()
+                            .with_root_certificates(root_cert)
+                            .with_no_client_auth();
+                        let connector = TlsConnector::from(Arc::new(config));
+                        let dnsname = ServerName::try_from(dest_host.clone())?;
+                        let tcp_stream =
+                            TcpStream::connect((dest_host.as_str(), dest_port)).await?;
+                        let tls_stream = connector.connect(dnsname, tcp_stream).await?;
+                        HttpStream::from_client_tls(tls_stream)
+                    }
+                    #[cfg(not(feature = "tls"))]
+                    true => Err(anyhow!("unsupported tls during non-tls build"))?,
+                    false => {
+                        let tcp_stream =
+                            TcpStream::connect((dest_host.as_str(), dest_port)).await?;
+                        HttpStream::from_tcp(tcp_stream)
+                    }
+                },
             }
         };
 
@@ -1046,10 +1123,55 @@ impl TransferSession {
         );
         let request_method = req.method;
         stream.write_all(&req.as_bytes()).await?;
+
+        // 读取响应头，判断是否为流式响应
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
-        let (mut res, _) =
-            HttpResponse::from_stream_with_request_method(&mut buf, stream, Some(request_method))
-                .await?;
+        let (mut res, hdr_len) = loop {
+            if let Some((res, hdr_len)) = HttpResponse::from_headers_part(&buf[..])? {
+                break (res, hdr_len);
+            }
+            let mut tmp_buf = [0u8; 4096];
+            let n = stream.read(&mut tmp_buf).await?;
+            if n == 0 {
+                return Err(anyhow!("connection closed"));
+            }
+            buf.extend_from_slice(&tmp_buf[..n]);
+        };
+
+        let skip_body =
+            request_method == HttpMethod::HEAD || response_disallows_body(res.http_code);
+        let is_chunked = res
+            .get_header("Transfer-Encoding")
+            .map(transfer_encoding_has_chunked)
+            .unwrap_or(false);
+        let has_content_encoding = res.get_header("Content-Encoding").is_some();
+        let is_streaming = !skip_body
+            && !has_content_encoding
+            && (is_chunked || !res.headers.contains_key("Content-Length"));
+
+        if is_streaming {
+            // 流式转发：将后续 body 数据通过后台任务写入 channel
+            let body_buf = buf[hdr_len..].to_vec();
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+            tokio::spawn(async move {
+                _ = stream_body_to_channel(stream, body_buf, tx, is_chunked).await;
+            });
+
+            res.body = HttpResponseBody::Stream(rx);
+        } else {
+            // 非流式：使用原有逻辑完整读取响应
+            let (res_complete, _) = HttpResponse::from_stream_with_request_method(
+                &mut buf,
+                &mut stream,
+                Some(request_method),
+            )
+            .await?;
+            res = res_complete;
+            // 将连接放回连接池以便复用
+            self.conns.insert(conn_key, stream);
+        }
+
         strip_hop_by_hop_response_headers(&mut res);
 
         if modify_content {

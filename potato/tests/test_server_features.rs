@@ -728,7 +728,9 @@ mod tests {
         stream.read_to_end(&mut response).await?;
         let response_text = String::from_utf8_lossy(&response);
         assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(response_text.contains("conflicting headers: Transfer-Encoding and Content-Length"));
+        assert!(
+            response_text.contains("conflicting headers: Transfer-Encoding and Content-Length")
+        );
 
         server_handle.abort();
         Ok(())
@@ -1872,6 +1874,110 @@ mod tests {
         assert_eq!(res.get_header("Content-Range"), Some("bytes */5"));
 
         server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reverse_proxy_streaming_chunked_response() -> anyhow::Result<()> {
+        // 启动一个原始 TCP 后端，返回 chunked 编码的流式响应
+        let backend_port = get_test_port();
+        let backend_addr = format!("127.0.0.1:{backend_port}");
+        let listener = TcpListener::bind(&backend_addr).await?;
+
+        let backend_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            if request.starts_with("GET") {
+                // 发送 chunked 响应
+                let response = concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/plain\r\n",
+                    "Transfer-Encoding: chunked\r\n",
+                    "\r\n",
+                    "5\r\n",
+                    "hello\r\n",
+                    "6\r\n",
+                    " world\r\n",
+                    "0\r\n",
+                    "\r\n"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        sleep(Duration::from_millis(100)).await;
+
+        // 直接测试 TransferSession::transfer 对流式响应的处理
+        let mut req = HttpRequest::new();
+        req.method = HttpMethod::GET;
+        req.url_path = "/".into();
+        req.headers
+            .insert("Host".into(), backend_addr.clone().into());
+
+        let mut sess =
+            potato::TransferSession::from_reverse_proxy("/", format!("http://{backend_addr}"));
+        let res = sess.transfer(&mut req, false).await?;
+
+        // 验证响应状态
+        assert_eq!(res.http_code, 200);
+        // 验证 body 是 Stream 类型（流式转发）
+        assert!(
+            matches!(res.body, potato::HttpResponseBody::Stream(_)),
+            "chunked response should be returned as Stream body"
+        );
+
+        backend_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reverse_proxy_non_streaming_response() -> anyhow::Result<()> {
+        // 启动一个原始 TCP 后端，返回 Content-Length 响应（非流式）
+        let backend_port = get_test_port();
+        let backend_addr = format!("127.0.0.1:{backend_port}");
+        let listener = TcpListener::bind(&backend_addr).await?;
+
+        let backend_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            if request.starts_with("GET") {
+                let body = b"hello world";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    String::from_utf8_lossy(body)
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        sleep(Duration::from_millis(100)).await;
+
+        let mut req = HttpRequest::new();
+        req.method = HttpMethod::GET;
+        req.url_path = "/".into();
+        req.headers
+            .insert("Host".into(), backend_addr.clone().into());
+
+        let mut sess =
+            potato::TransferSession::from_reverse_proxy("/", format!("http://{backend_addr}"));
+        let res = sess.transfer(&mut req, false).await?;
+
+        assert_eq!(res.http_code, 200);
+        // 验证 body 是 Data 类型（完整读取）
+        assert!(
+            matches!(res.body, potato::HttpResponseBody::Data(_)),
+            "Content-Length response should be returned as Data body"
+        );
+        if let potato::HttpResponseBody::Data(data) = res.body {
+            assert_eq!(data, b"hello world");
+        }
+
+        backend_handle.abort();
         Ok(())
     }
 }
