@@ -22,7 +22,7 @@ features:
   - title: Built-in Auth and Processing Pipeline
     details: Includes built-in JWT auth with request pre-processing and response post-processing stages
   - title: AI Streaming Protocol Support
-    details: Supports OpenAI and Claude streaming protocols with chunked response handling
+    details: Supports OpenAI and Anthropic streaming protocols with chunked response handling
 
 footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---

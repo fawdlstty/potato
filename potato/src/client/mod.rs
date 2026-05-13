@@ -1,4 +1,5 @@
 #![allow(non_camel_case_types)]
+pub mod agent_session;
 #[cfg(feature = "http2")]
 pub mod http2;
 #[cfg(feature = "http3")]
@@ -237,6 +238,58 @@ macro_rules! define_session_method {
     };
 }
 
+macro_rules! define_isolated_session_method {
+    ($fn_name:ident, $method:ident) => {
+        pub async fn $fn_name(
+            &mut self,
+            url: &str,
+            args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            let mut req = self.new_request(HttpMethod::$method, url).await?;
+            for arg in args.into_iter() {
+                req.apply_header(arg);
+            }
+            self.do_request_isolated(req).await
+        }
+    };
+
+    ($fn_name:ident, $fn_name2:ident, $fn_name3:ident, $method:ident) => {
+        pub async fn $fn_name(
+            &mut self,
+            url: &str,
+            body: Vec<u8>,
+            args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            let mut req = self.new_request(HttpMethod::$method, url).await?;
+            req.body = body.into();
+            for arg in args.into_iter() {
+                req.apply_header(arg);
+            }
+            self.do_request_isolated(req).await
+        }
+
+        pub async fn $fn_name2(
+            &mut self,
+            url: &str,
+            body: serde_json::Value,
+            mut args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            args.push(Headers::Content_Type("application/json".into()));
+            self.$fn_name(url, serde_json::to_vec(&body)?, args).await
+        }
+
+        pub async fn $fn_name3(
+            &mut self,
+            url: &str,
+            body: String,
+            mut args: Vec<Headers>,
+        ) -> anyhow::Result<HttpResponse> {
+            args.push(Headers::Content_Type("application/json".into()));
+            self.$fn_name(url, body.into_bytes(), args).await
+        }
+    };
+}
+
 pub struct SessionImpl {
     pub unique_host: (String, bool, u16),
     pub stream: HttpStream,
@@ -249,8 +302,8 @@ impl SessionImpl {
             true => {
                 use rustls_pki_types::ServerName;
                 use std::sync::Arc;
-                use tokio_rustls::TlsConnector;
                 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+                use tokio_rustls::TlsConnector;
                 let mut root_cert = RootCertStore::empty();
                 root_cert.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 let config = ClientConfig::builder()
@@ -316,6 +369,11 @@ impl Session {
         Ok(req)
     }
 
+    /// 强制关闭当前连接，下次请求会重新建立连接
+    pub fn force_reconnect(&mut self) {
+        self.sess_impl = None;
+    }
+
     pub async fn do_request(&mut self, req: HttpRequest) -> anyhow::Result<HttpResponse> {
         let request_method = req.method;
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -360,12 +418,76 @@ impl Session {
             return Ok(res);
         }
         let sess_impl = self.session_impl()?;
-        let (res, _) = HttpResponse::from_stream_with_request_method(
+        let (res, consumed) = HttpResponse::from_stream_with_request_method(
             &mut buf,
             &mut sess_impl.stream,
             Some(request_method),
         )
         .await?;
+        // 丢弃已消费的数据，避免影响后续请求解析
+        if consumed > 0 && consumed <= buf.len() {
+            buf.drain(..consumed);
+        }
+        // 如果响应头中包含 Connection: close，关闭连接避免复用已断开的连接
+        if let Some(conn) = res.get_header("Connection") {
+            if conn.eq_ignore_ascii_case("close") {
+                self.sess_impl = None;
+            }
+        }
+        Ok(res)
+    }
+
+    /// 发送请求并返回完整响应（自动处理连接建立和响应读取）
+    pub async fn do_request_isolated(&mut self, req: HttpRequest) -> anyhow::Result<HttpResponse> {
+        let request_method = req.method;
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        {
+            let sess_impl = self.session_impl()?;
+            sess_impl.stream.write_all(&req.as_bytes()).await?;
+            loop {
+                if let Some((res, hdr_len)) = HttpResponse::from_headers_part(&buf[..])? {
+                    if request_method != HttpMethod::HEAD
+                        && !response_disallows_body(res.http_code)
+                        && is_sse_response(&res)
+                    {
+                        let (tx, rx) = tokio::sync::mpsc::channel(64);
+                        let body_buf = buf[hdr_len..].to_vec();
+                        let mut res = res;
+                        res.body = HttpResponseBody::Stream(rx);
+
+                        let (duplex_stream, _) = tokio::io::duplex(1);
+                        let stream = std::mem::replace(
+                            &mut sess_impl.stream,
+                            HttpStream::from_duplex_stream(duplex_stream),
+                        );
+                        tokio::spawn(async move {
+                            _ = stream_chunked_body_to_channel(stream, body_buf, tx).await;
+                        });
+                        self.sess_impl = None;
+                        return Ok(res);
+                    }
+                    break;
+                }
+                let mut tmp_buf = [0u8; 4096];
+                let n = sess_impl.stream.read(&mut tmp_buf).await?;
+                if n == 0 {
+                    return Err(anyhow!("connection closed"));
+                }
+                buf.extend_from_slice(&tmp_buf[..n]);
+            }
+        }
+        // 在独立的代码块中读取响应体，避免借用冲突
+        let (res, _consumed) = {
+            let sess_impl = self.session_impl()?;
+            HttpResponse::from_stream_with_request_method(
+                &mut buf,
+                &mut sess_impl.stream,
+                Some(request_method),
+            )
+            .await?
+        };
+        // 独立请求模式：总是关闭连接
+        self.sess_impl = None;
         Ok(res)
     }
 
@@ -384,6 +506,21 @@ impl Session {
     define_session_method!(connect, CONNECT);
     define_session_method!(patch, PATCH);
     define_session_method!(trace, TRACE);
+
+    define_isolated_session_method!(get_isolated, GET);
+    define_isolated_session_method!(
+        post_isolated,
+        post_json_isolated,
+        post_json_str_isolated,
+        POST
+    );
+    define_isolated_session_method!(put_isolated, put_json_isolated, put_json_str_isolated, PUT);
+    define_isolated_session_method!(delete_isolated, DELETE);
+    define_isolated_session_method!(head_isolated, HEAD);
+    define_isolated_session_method!(options_isolated, OPTIONS);
+    define_isolated_session_method!(connect_isolated, CONNECT);
+    define_isolated_session_method!(patch_isolated, PATCH);
+    define_isolated_session_method!(trace_isolated, TRACE);
 }
 
 macro_rules! define_client_method {
@@ -1089,8 +1226,8 @@ impl TransferSession {
                     true => {
                         use rustls_pki_types::ServerName;
                         use std::sync::Arc;
-                        use tokio_rustls::TlsConnector;
                         use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+                        use tokio_rustls::TlsConnector;
 
                         let mut root_cert = RootCertStore::empty();
                         root_cert.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());

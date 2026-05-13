@@ -22,7 +22,7 @@ features:
   - title: 内置认证与处理链路
     details: 内置 JWT 鉴权能力，并支持请求预处理与响应后处理链路
   - title: AI 流式协议支持
-    details: 支持 OpenAI 与 Claude 的流式传输协议与分块响应处理
+    details: 支持 OpenAI 与 Anthropic 的流式传输协议与分块响应处理
 
 footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---

@@ -27,12 +27,12 @@ async fn openai_chat() -> anyhow::Result<potato::HttpResponse> {
 }
 
 #[potato::http_get("/api2/v1/chat")]
-async fn claude_chat() -> anyhow::Result<potato::HttpResponse> {
+async fn anthropic_chat() -> anyhow::Result<potato::HttpResponse> {
     let (sender, rx) =
-        potato::ClaudeSender::new("chatclaude", "claude-3-sonnet-20240229", "assistant", 100)
+        potato::AnthropicSender::new("chatanthropic", "anthropic-3-sonnet-20240229", "assistant", 100)
             .await?;
     tokio::spawn(async move {
-        async fn claude_chat_inner(sender: potato::ClaudeSender) -> anyhow::Result<()> {
+        async fn anthropic_chat_inner(sender: potato::AnthropicSender) -> anyhow::Result<()> {
             sender.send("Hello,").await?;
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             sender.send("World!").await?;
@@ -41,8 +41,8 @@ async fn claude_chat() -> anyhow::Result<potato::HttpResponse> {
             sender.send_finish().await?;
             Ok(())
         }
-        if let Err(e) = claude_chat_inner(sender).await {
-            eprintln!("Claude chat error: {e}");
+        if let Err(e) = anthropic_chat_inner(sender).await {
+            eprintln!("Anthropic chat error: {e}");
         }
     });
     Ok(rx)
@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
         ctx.use_handlers();
     });
     println!("OpenAI SSE on http://127.0.0.1:3000/api/v1/chat");
-    println!("Claude SSE on http://127.0.0.1:3000/api2/v1/chat");
+    println!("Anthropic SSE on http://127.0.0.1:3000/api2/v1/chat");
     println!("Ollama SSE on http://127.0.0.1:3000/api3/v1/chat");
     server.serve_http().await
 }

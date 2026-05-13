@@ -7,6 +7,7 @@ pub mod utils;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
 
+pub use client::agent_session::*;
 pub use client::*;
 pub use global_config::*;
 pub use hipstr;
@@ -30,8 +31,8 @@ use anyhow::anyhow;
 use chrono::Utc;
 use core::str;
 use hipstr::{LocalHipByt, LocalHipStr};
-use http::Uri;
 use http::uri::Scheme;
+use http::Uri;
 use rust_embed::Embed;
 use sha1::{Digest, Sha1};
 use std::any::{Any, TypeId};
@@ -48,8 +49,8 @@ use std::time::UNIX_EPOCH;
 use std::{collections::HashMap, collections::HashSet, future::Future, pin::Pin};
 use strum::Display;
 use thread_local::ThreadLocal;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::Mutex;
 use utils::bytes::CompressExt;
 use utils::enums::{HttpConnection, HttpContentType};
 use utils::number::HttpCodeExt;
@@ -478,7 +479,7 @@ impl SessionCache {
         user_id: i64,
         ttl: std::time::Duration,
     ) -> Result<String, anyhow::Error> {
-        use jsonwebtoken::{EncodingKey, Header, encode};
+        use jsonwebtoken::{encode, EncodingKey, Header};
         use serde::{Deserialize, Serialize};
 
         #[derive(Debug, Serialize, Deserialize)]
@@ -513,7 +514,7 @@ impl SessionCache {
     /// 解析JWT token
     /// 返回: (user_id, session_exp_duration)
     pub async fn parse_token(token: &str) -> Result<(i64, Duration), SessionCacheError> {
-        use jsonwebtoken::{DecodingKey, Validation, decode};
+        use jsonwebtoken::{decode, DecodingKey, Validation};
         use serde::{Deserialize, Serialize};
 
         #[derive(Debug, Serialize, Deserialize)]

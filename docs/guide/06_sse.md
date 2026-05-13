@@ -2,7 +2,7 @@
 
 ## 概述
 
-Potato 框架支持使用 SSE（Server-Sent Events）实现流式传输，特别适用于 AI 聊天等需要逐步返回内容的场景。框架提供了对 OpenAI、Claude 和 Ollama 三种主流 AI 协议的标准支持。
+Potato 框架支持使用 SSE（Server-Sent Events）实现流式传输，特别适用于 AI 聊天等需要逐步返回内容的场景。框架提供了对 OpenAI、Anthropic 和 Ollama 三种主流 AI 协议的标准支持。
 
 ## OpenAI 风格流式传输
 
@@ -58,28 +58,28 @@ async fn main() -> anyhow::Result<()> {
 
 4. **响应类型**: Handler 返回 `anyhow::Result<HttpResponse>`，响应会自动配置 SSE 相关的头部。
 
-## Claude 风格流式传输
+## Anthropic 风格流式传输
 
 ### 基本用法
 
 ```rust
 #[potato::http_get("/api/v1/chat")]
-async fn claude_chat() -> anyhow::Result<potato::HttpResponse> {
+async fn anthropic_chat() -> anyhow::Result<potato::HttpResponse> {
     let (sender, rx) =
-        potato::ClaudeSender::new("msg_claude_123456", "claude-3-sonnet-20240229", "assistant", 100).await?;
+        potato::AnthropicSender::new("msg_anthropic_123456", "anthropic-3-sonnet-20240229", "assistant", 100).await?;
     
     tokio::spawn(async move {
-        async fn claude_chat_inner(sender: potato::ClaudeSender) -> anyhow::Result<()> {
+        async fn anthropic_chat_inner(sender: potato::AnthropicSender) -> anyhow::Result<()> {
             // 发送内容片段
             sender.send("你好！").await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            sender.send("我是 Claude AI 助手。").await?;
+            sender.send("我是 Anthropic AI 助手。").await?;
             // 发送结束事件（包含 content_block_stop, message_delta, message_stop）
             sender.send_finish().await?;
             Ok(())
         }
-        if let Err(e) = claude_chat_inner(sender).await {
-            eprintln!("Claude chat error: {e}");
+        if let Err(e) = anthropic_chat_inner(sender).await {
+            eprintln!("Anthropic chat error: {e}");
         }
     });
     
@@ -95,9 +95,9 @@ async fn main() -> anyhow::Result<()> {
 
 ### 说明
 
-1. **创建 ClaudeSender**: 使用 `ClaudeSender::new()` 创建发送器和响应对象，参数包括：
-   - `id`: 消息 ID（如 "msg_claude_123456"）
-   - `model`: 模型名称（如 "claude-3-sonnet-20240229"）
+1. **创建 AnthropicSender**: 使用 `AnthropicSender::new()` 创建发送器和响应对象，参数包括：
+   - `id`: 消息 ID（如 "msg_anthropic_123456"）
+   - `model`: 模型名称（如 "anthropic-3-sonnet-20240229"）
    - `role`: 助手角色（通常为 "assistant"）
    - `buffer_size`: 通道缓冲区大小（如 100）
 
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
    - `message_delta`: 包含停止原因和使用统计
    - `message_stop`: 表示消息完成
 
-4. **响应类型**: Handler 返回 `anyhow::Result<HttpResponse>`，自动为 Claude 协议配置适当的 SSE 头部。
+4. **响应类型**: Handler 返回 `anyhow::Result<HttpResponse>`，自动为 Anthropic 协议配置适当的 SSE 头部。
 
 ## Ollama 风格流式传输
 
@@ -158,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
 
 4. **响应类型**: Handler 返回 `anyhow::Result<HttpResponse>`，自动为 Ollama 协议配置适当的 SSE 头部。
 
-5. **数据格式**: Ollama 使用 NDJSON（newline-delimited JSON）格式，与 OpenAI/Claude 的 SSE 格式不同，但 Potato 内部统一使用 SSE 通道传输。
+5. **数据格式**: Ollama 使用 NDJSON（newline-delimited JSON）格式，与 OpenAI/Anthropic 的 SSE 格式不同，但 Potato 内部统一使用 SSE 通道传输。
 
 ## 通用 SSE 传输
 

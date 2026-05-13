@@ -2,7 +2,7 @@
 
 ## Overview
 
-Potato framework supports SSE (Server-Sent Events) for streaming, particularly suitable for scenarios like AI chat that require progressive content delivery. The framework provides standard support for three mainstream AI protocols: OpenAI, Claude, and Ollama.
+Potato framework supports SSE (Server-Sent Events) for streaming, particularly suitable for scenarios like AI chat that require progressive content delivery. The framework provides standard support for three mainstream AI protocols: OpenAI, Anthropic, and Ollama.
 
 ## OpenAI Style Streaming
 
@@ -58,28 +58,28 @@ async fn main() -> anyhow::Result<()> {
 
 4. **Response Type**: Handler returns `anyhow::Result<HttpResponse>`, where the response is automatically configured with SSE headers.
 
-## Claude Style Streaming
+## Anthropic Style Streaming
 
 ### Basic Usage
 
 ```rust
 #[potato::http_get("/api/v1/chat")]
-async fn claude_chat() -> anyhow::Result<potato::HttpResponse> {
+async fn anthropic_chat() -> anyhow::Result<potato::HttpResponse> {
     let (sender, rx) =
-        potato::ClaudeSender::new("msg_claude_123456", "claude-3-sonnet-20240229", "assistant", 100).await?;
+        potato::AnthropicSender::new("msg_anthropic_123456", "anthropic-3-sonnet-20240229", "assistant", 100).await?;
     
     tokio::spawn(async move {
-        async fn claude_chat_inner(sender: potato::ClaudeSender) -> anyhow::Result<()> {
+        async fn anthropic_chat_inner(sender: potato::AnthropicSender) -> anyhow::Result<()> {
             // Send content chunks
             sender.send("Hello!").await?;
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            sender.send("I am Claude AI assistant.").await?;
+            sender.send("I am Anthropic AI assistant.").await?;
             // Send finish event (includes content_block_stop, message_delta, message_stop)
             sender.send_finish().await?;
             Ok(())
         }
-        if let Err(e) = claude_chat_inner(sender).await {
-            eprintln!("Claude chat error: {e}");
+        if let Err(e) = anthropic_chat_inner(sender).await {
+            eprintln!("Anthropic chat error: {e}");
         }
     });
     
@@ -95,9 +95,9 @@ async fn main() -> anyhow::Result<()> {
 
 ### Explanation
 
-1. **Create ClaudeSender**: Use `ClaudeSender::new()` to create a sender and response object. Parameters include:
-   - `id`: Message ID (e.g., "msg_claude_123456")
-   - `model`: Model name (e.g., "claude-3-sonnet-20240229")
+1. **Create AnthropicSender**: Use `AnthropicSender::new()` to create a sender and response object. Parameters include:
+   - `id`: Message ID (e.g., "msg_anthropic_123456")
+   - `model`: Model name (e.g., "anthropic-3-sonnet-20240229")
    - `role`: Assistant role (typically "assistant")
    - `buffer_size`: Channel buffer size (e.g., 100)
 
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
    - `message_delta`: Contains stop reason and usage statistics
    - `message_stop`: Indicates message completion
 
-4. **Response Type**: Handler returns `anyhow::Result<HttpResponse>`, automatically configured with appropriate SSE headers for Claude protocol.
+4. **Response Type**: Handler returns `anyhow::Result<HttpResponse>`, automatically configured with appropriate SSE headers for Anthropic protocol.
 
 ## Ollama Style Streaming
 
@@ -158,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
 
 4. **Response Type**: Handler returns `anyhow::Result<HttpResponse>`, automatically configured with appropriate SSE headers for Ollama protocol.
 
-5. **Data Format**: Ollama uses NDJSON (newline-delimited JSON) format, which differs from OpenAI/Claude's SSE format, but Potato internally uses a unified SSE channel for transmission.
+5. **Data Format**: Ollama uses NDJSON (newline-delimited JSON) format, which differs from OpenAI/Anthropic's SSE format, but Potato internally uses a unified SSE channel for transmission.
 
 ## Generic SSE Transmission
 

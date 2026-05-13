@@ -80,11 +80,11 @@ impl OpenAISender {
     }
 }
 
-pub struct ClaudeSender {
+pub struct AnthropicSender {
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
-impl ClaudeSender {
+impl AnthropicSender {
     pub async fn new(
         id: impl Into<String>,
         model: impl Into<String>,
