@@ -84,6 +84,7 @@ pub enum LlmProvider {
     Anthropic,
     Ollama,
     OpenCode,
+    Codex,
 }
 
 /// 流式响应的单个数据块
@@ -115,7 +116,13 @@ pub struct AgentClientSession {
     opencode_session_id: Option<String>,
     /// OpenCode serve 的上一条消息 ID（用于构建消息链）
     opencode_parent_id: Option<String>,
-    /// 思考强度模式
+    /// Codex app-server 的 WebSocket 连接（仅 Codex provider 使用）
+    codex_ws: Option<crate::Websocket>,
+    /// Codex app-server 的 thread ID（仅 Codex provider 使用）
+    codex_thread_id: Option<String>,
+    /// Codex app-server 的 JSON-RPC 请求 ID 计数器
+    codex_request_id: i64,
+    /// 思考等级（推理强度），仅部分提供商的推理模型支持
     thinking_mode: ThinkingMode,
 }
 
@@ -140,7 +147,10 @@ impl AgentClientSession {
             messages: Vec::new(),
             opencode_session_id: None,
             opencode_parent_id: None,
-            thinking_mode: ThinkingMode::High, // 默认高强度思考
+            codex_ws: None,
+            codex_thread_id: None,
+            codex_request_id: 0,
+            thinking_mode: ThinkingMode::Medium,
         }
     }
 
@@ -172,19 +182,89 @@ impl AgentClientSession {
         self.model.as_deref()
     }
 
+    /// 设置思考等级（推理强度）
+    ///
+    /// 仅部分提供商的推理模型支持此参数，如 OpenAI 的 o1/o3 系列模型。
+    /// 如果传入的等级不被当前模型支持，API 调用可能会报错。
+    ///
+    /// # 参数
+    /// - `effort`: 思考等级
+    pub fn set_thinking_mode(&mut self, effort: ThinkingMode) {
+        self.thinking_mode = effort;
+    }
+
+    /// 获取当前设置的思考等级
+    pub fn thinking_mode(&self) -> &ThinkingMode {
+        &self.thinking_mode
+    }
+
+    /// 获取当前模型支持的所有思考等级
+    ///
+    /// 通过查询模型详情 API 来获取支持的思考等级列表。
+    /// 如果当前模型不支持思考等级或无法获取信息，则返回空列表。
+    pub async fn list_reasoning_efforts(&mut self) -> anyhow::Result<Vec<String>> {
+        let model = self.ensure_model()?.to_string();
+        match self.provider {
+            LlmProvider::OpenAI => self.list_reasoning_efforts_openai(&model).await,
+            // Anthropic、Ollama、OpenCode、Codex 目前不通过此参数控制推理强度
+            _ => Ok(vec![]),
+        }
+    }
+
+    async fn list_reasoning_efforts_openai(&mut self, model: &str) -> anyhow::Result<Vec<String>> {
+        let url = format!("{}/v1/models/{}", self.base_url, model);
+        let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        if let Some(ref key) = self.api_key {
+            headers.push(("Authorization".to_string(), format!("Bearer {key}")));
+        }
+        let mut args = Vec::new();
+        for (k, v) in headers {
+            args.push(crate::Headers::Custom((k, v)));
+        }
+        let mut res = self.session.get(&url, args).await?;
+        let body_data = res.body.data().await;
+        let response_text = String::from_utf8_lossy(body_data).to_string();
+        if res.http_code != 200 {
+            return Err(anyhow::anyhow!(
+                "Failed to get model info: HTTP {}",
+                res.http_code
+            ));
+        }
+        let json: serde_json::Value = serde_json::from_str(&response_text)?;
+
+        // 尝试从模型详情中提取支持的思考等级
+        // 如果 API 返回了 reasoning_effort 相关字段则使用，否则返回默认值
+        let mut efforts = Vec::new();
+        if let Some(capabilities) = json.get("capabilities") {
+            if let Some(reasoning) = capabilities.get("reasoning") {
+                if let Some(effort_levels) =
+                    reasoning.get("effort_levels").and_then(|v| v.as_array())
+                {
+                    for level in effort_levels {
+                        if let Some(s) = level.as_str() {
+                            efforts.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(efforts)
+    }
+
     /// 获取可用模型列表
     pub async fn list_models(&mut self) -> anyhow::Result<Vec<ModelInfo>> {
         match self.provider {
-            LlmProvider::OpenCode => {
-                Self::list_models_opencode(&self.base_url, &mut self.session).await
-            }
             LlmProvider::OpenAI => {
                 Self::list_models_openai(&self.base_url, &self.api_key, &mut self.session).await
             }
+            LlmProvider::Anthropic => Ok(vec![]), // Anthropic 没有标准模型列表 API
             LlmProvider::Ollama => {
                 Self::list_models_ollama(&self.base_url, &mut self.session).await
             }
-            LlmProvider::Anthropic => Ok(vec![]), // Anthropic 没有标准模型列表 API
+            LlmProvider::OpenCode => {
+                Self::list_models_opencode(&self.base_url, &mut self.session).await
+            }
+            LlmProvider::Codex => self.list_models_codex().await,
         }
     }
 
@@ -325,6 +405,11 @@ impl AgentClientSession {
             return self.chat_opencode(false).await;
         }
 
+        // Codex provider 使用 WebSocket JSON-RPC 协议
+        if self.provider == LlmProvider::Codex {
+            return self.chat_codex().await;
+        }
+
         let (url, body, headers) = self.build_request(false)?;
         let mut args = Vec::new();
         for (k, v) in headers {
@@ -352,16 +437,6 @@ impl AgentClientSession {
     /// 获取底层 Session 的可变引用，用于高级操作（如强制重连）
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
-    }
-
-    /// 设置思考强度
-    pub fn set_thinking_mode(&mut self, mode: ThinkingMode) {
-        self.thinking_mode = mode;
-    }
-
-    /// 获取当前思考强度
-    pub fn thinking_mode(&self) -> &ThinkingMode {
-        &self.thinking_mode
     }
 
     /// OpenCode serve 专用：创建 session 并发送消息
@@ -487,6 +562,341 @@ impl AgentClientSession {
         Ok(result)
     }
 
+    // ==================== Codex app-server WebSocket 协议支持 ====================
+
+    /// 获取下一个 JSON-RPC 请求 ID
+    fn next_codex_request_id(&mut self) -> i64 {
+        self.codex_request_id += 1;
+        self.codex_request_id
+    }
+
+    /// 确保 Codex WebSocket 连接已建立并完成初始化
+    async fn ensure_codex_connected(&mut self) -> anyhow::Result<()> {
+        if self.codex_ws.is_some() {
+            return Ok(());
+        }
+
+        // 将 http:// 或 https:// 转换为 ws:// 或 wss://
+        let ws_url = self
+            .base_url
+            .replacen("http://", "ws://", 1)
+            .replacen("https://", "wss://", 1);
+
+        let mut ws = crate::Websocket::connect(&ws_url, vec![]).await?;
+
+        // 1. 发送 initialize 请求
+        let init_id = self.next_codex_request_id();
+        let init_req = serde_json::json!({
+            "method": "initialize",
+            "id": init_id,
+            "params": {
+                "clientInfo": {
+                    "name": "potato_agent",
+                    "title": "Potato Agent Client",
+                    "version": "0.1.0"
+                },
+                "capabilities": {
+                    "experimentalApi": true
+                }
+            }
+        });
+        ws.send_text(&init_req.to_string()).await?;
+
+        // 等待 initialize 响应
+        let init_res = Self::recv_codex_jsonrpc_response(&mut ws).await?;
+        if init_res.get("error").is_some() {
+            return Err(anyhow::anyhow!(
+                "Codex initialize failed: {}",
+                init_res["error"]
+            ));
+        }
+
+        // 2. 发送 initialized 通知
+        let init_notify = serde_json::json!({
+            "method": "initialized",
+            "params": {}
+        });
+        ws.send_text(&init_notify.to_string()).await?;
+
+        self.codex_ws = Some(ws);
+
+        // 3. 如果有保存的 thread_id，尝试恢复线程
+        if let Some(thread_id) = self.codex_thread_id.clone() {
+            let req_id = self.next_codex_request_id();
+            {
+                let ws = self.codex_ws.as_mut().unwrap();
+                let req = serde_json::json!({
+                    "method": "thread/resume",
+                    "id": req_id,
+                    "params": {
+                        "threadId": thread_id
+                    }
+                });
+                if let Err(e) = ws.send_text(&req.to_string()).await {
+                    eprintln!("WARN: Failed to send thread/resume: {}", e);
+                    self.codex_thread_id = None;
+                }
+            }
+            if self.codex_thread_id.is_some() {
+                let res = {
+                    let ws = self.codex_ws.as_mut().unwrap();
+                    match Self::recv_codex_jsonrpc_response(ws).await {
+                        Ok(res) => res,
+                        Err(e) => {
+                            eprintln!("WARN: Failed to receive thread/resume response: {}", e);
+                            self.codex_thread_id = None;
+                            return Ok(());
+                        }
+                    }
+                };
+                if res.get("error").is_some() {
+                    eprintln!(
+                        "WARN: Codex thread/resume failed: {}, will create new thread",
+                        res["error"]
+                    );
+                    self.codex_thread_id = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 接收 Codex WebSocket 上的 JSON-RPC 响应（静态方法，避免借用冲突）
+    async fn recv_codex_jsonrpc_response(
+        ws: &mut crate::Websocket,
+    ) -> anyhow::Result<serde_json::Value> {
+        loop {
+            match ws.recv().await? {
+                crate::WsFrame::Text(text) => {
+                    let val: serde_json::Value = serde_json::from_str(&text)?;
+                    // 忽略通知，只返回响应（有 id 字段的）
+                    if val.get("id").is_some() {
+                        return Ok(val);
+                    }
+                }
+                crate::WsFrame::Binary(_) => {}
+            }
+        }
+    }
+
+    /// 接收 Codex WebSocket 上的 JSON-RPC 通知（静态方法，避免借用冲突）
+    async fn recv_codex_notification(
+        ws: &mut crate::Websocket,
+    ) -> anyhow::Result<serde_json::Value> {
+        loop {
+            match ws.recv().await? {
+                crate::WsFrame::Text(text) => {
+                    let val: serde_json::Value = serde_json::from_str(&text)?;
+                    // 通知没有 id 字段，或者 method 字段存在
+                    if val.get("method").is_some() {
+                        return Ok(val);
+                    }
+                }
+                crate::WsFrame::Binary(_) => {}
+            }
+        }
+    }
+
+    /// Codex provider: 获取可用模型列表
+    async fn list_models_codex(&mut self) -> anyhow::Result<Vec<ModelInfo>> {
+        self.ensure_codex_connected().await?;
+
+        let req_id = self.next_codex_request_id();
+        {
+            let ws = self.codex_ws.as_mut().unwrap();
+            let req = serde_json::json!({
+                "method": "model/list",
+                "id": req_id,
+                "params": {}
+            });
+            ws.send_text(&req.to_string()).await?;
+        }
+
+        let res = {
+            let ws = self.codex_ws.as_mut().unwrap();
+            Self::recv_codex_jsonrpc_response(ws).await?
+        };
+        if let Some(error) = res.get("error") {
+            return Err(anyhow::anyhow!("Codex model/list failed: {}", error));
+        }
+
+        let mut models = Vec::new();
+        if let Some(data) = res["result"]["data"].as_array() {
+            for item in data {
+                let id = item["id"].as_str().unwrap_or("").to_string();
+                let display_name = item["displayName"].as_str().unwrap_or(&id).to_string();
+                if !id.is_empty() {
+                    models.push(ModelInfo {
+                        id: id.clone(),
+                        name: display_name,
+                        provider_id: "codex".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(models)
+    }
+
+    /// Codex provider: 发送消息并获取完整响应
+    async fn chat_codex(&mut self) -> anyhow::Result<String> {
+        self.ensure_codex_connected().await?;
+
+        // 如果没有 thread，先创建一个
+        if self.codex_thread_id.is_none() {
+            let (model, model_provider) = self.parse_codex_model();
+            let req_id = self.next_codex_request_id();
+
+            let mut thread_params = serde_json::json!({
+                "ephemeral": true
+            });
+            if let Some(model) = model {
+                thread_params["model"] = serde_json::Value::String(model);
+            }
+            if let Some(model_provider) = model_provider {
+                thread_params["modelProvider"] = serde_json::Value::String(model_provider);
+            }
+
+            {
+                let ws = self.codex_ws.as_mut().unwrap();
+                let req = serde_json::json!({
+                    "method": "thread/start",
+                    "id": req_id,
+                    "params": thread_params
+                });
+                ws.send_text(&req.to_string()).await?;
+            }
+
+            let res = {
+                let ws = self.codex_ws.as_mut().unwrap();
+                Self::recv_codex_jsonrpc_response(ws).await?
+            };
+            if let Some(error) = res.get("error") {
+                return Err(anyhow::anyhow!("Codex thread/start failed: {}", error));
+            }
+
+            self.codex_thread_id = Some(
+                res["result"]["thread"]["id"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Codex thread/start response missing thread.id")
+                    })?
+                    .to_string(),
+            );
+        }
+
+        let thread_id = self.codex_thread_id.as_ref().unwrap().clone();
+
+        // 构建输入：如果有历史消息（除了最后一条），将历史作为上下文附加
+        let input_text = if self.messages.len() > 1 {
+            let mut context = String::new();
+            for msg in &self.messages[..self.messages.len() - 1] {
+                match msg.role {
+                    MessageRole::System => {
+                        context.push_str(&format!("[系统提示]\n{}\n\n", msg.content));
+                    }
+                    MessageRole::User => {
+                        context.push_str(&format!("[用户]\n{}\n\n", msg.content));
+                    }
+                    MessageRole::Assistant => {
+                        context.push_str(&format!("[助手]\n{}\n\n", msg.content));
+                    }
+                }
+            }
+            let last_msg = self.messages.last().unwrap();
+            context.push_str(&format!("[用户]\n{}\n", last_msg.content));
+            context
+        } else {
+            self.messages.last().unwrap().content.clone()
+        };
+
+        let req_id = self.next_codex_request_id();
+        {
+            let ws = self.codex_ws.as_mut().unwrap();
+            let req = serde_json::json!({
+                "method": "turn/start",
+                "id": req_id,
+                "params": {
+                    "threadId": thread_id,
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": input_text
+                        }
+                    ]
+                }
+            });
+            ws.send_text(&req.to_string()).await?;
+        }
+
+        // 等待 turn/start 响应
+        let turn_res = {
+            let ws = self.codex_ws.as_mut().unwrap();
+            Self::recv_codex_jsonrpc_response(ws).await?
+        };
+        if let Some(error) = turn_res.get("error") {
+            return Err(anyhow::anyhow!("Codex turn/start failed: {}", error));
+        }
+
+        // 收集流式响应
+        let mut agent_text = String::new();
+        let mut turn_completed = false;
+
+        while !turn_completed {
+            let notification = {
+                let ws = self.codex_ws.as_mut().unwrap();
+                Self::recv_codex_notification(ws).await?
+            };
+            let method = notification["method"].as_str().unwrap_or("");
+
+            match method {
+                "item/agentMessage/delta" => {
+                    if let Some(delta) = notification["params"]["delta"].as_str() {
+                        agent_text.push_str(delta);
+                    }
+                }
+                "turn/completed" => {
+                    turn_completed = true;
+                }
+                "item/completed" => {
+                    // 可以在这里处理完成的 item
+                }
+                "turn/started" | "item/started" | "thread/started" => {
+                    // 忽略这些通知
+                }
+                "error" => {
+                    return Err(anyhow::anyhow!(
+                        "Codex error notification: {}",
+                        notification["params"]
+                    ));
+                }
+                _ => {
+                    // 忽略其他通知
+                }
+            }
+        }
+
+        self.messages
+            .push(ChatMessage::new(MessageRole::Assistant, agent_text.clone()));
+        Ok(agent_text)
+    }
+
+    /// 解析 Codex 的 model 配置字符串
+    /// 格式: "providerID:modelID" 或纯 "modelID"
+    /// 返回 (model, model_provider)
+    fn parse_codex_model(&self) -> (Option<String>, Option<String>) {
+        let model = match self.model.as_deref() {
+            Some(m) => m,
+            None => return (None, None),
+        };
+        if let Some(pos) = model.find(':') {
+            let provider_id = model[..pos].to_string();
+            let model_id = model[pos + 1..].to_string();
+            (Some(model_id), Some(provider_id))
+        } else {
+            (Some(model.to_string()), None)
+        }
+    }
+
     /// 发送消息并获取流式响应
     pub async fn chat_stream(
         &mut self,
@@ -586,6 +996,9 @@ impl AgentClientSession {
                     LlmProvider::OpenCode => {
                         // 不会走到这里，已在前面处理
                     }
+                    LlmProvider::Codex => {
+                        // 不会走到这里，Codex 使用 WebSocket 协议
+                    }
                 }
             }
             let _ = tx.send(StreamChunk::Done).await;
@@ -602,7 +1015,7 @@ impl AgentClientSession {
 
     /// 将会话状态序列化为 JSON 字符串
     ///
-    /// 序列化内容包括：provider、base_url、api_key、model、messages、opencode_session_id、opencode_parent_id、thinking_mode
+    /// 序列化内容包括：provider、base_url、api_key、model、messages、opencode_session_id、opencode_parent_id
     /// 注意：Session（HTTP 连接）不会被序列化，反序列化后会重新创建
     pub fn serialize(&self) -> anyhow::Result<String> {
         let state = serde_json::json!({
@@ -613,6 +1026,7 @@ impl AgentClientSession {
             "messages": self.messages,
             "opencode_session_id": self.opencode_session_id,
             "opencode_parent_id": self.opencode_parent_id,
+            "codex_thread_id": self.codex_thread_id,
             "thinking_mode": self.thinking_mode,
         });
         Ok(state.to_string())
@@ -661,11 +1075,14 @@ impl AgentClientSession {
             .get("opencode_parent_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-
-        let thinking_mode: ThinkingMode = state
+        let codex_thread_id = state
+            .get("codex_thread_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let thinking_mode = state
             .get("thinking_mode")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or(ThinkingMode::High); // 默认为高强度
+            .unwrap_or(ThinkingMode::Medium);
 
         Ok(Self {
             provider,
@@ -676,6 +1093,9 @@ impl AgentClientSession {
             messages,
             opencode_session_id,
             opencode_parent_id,
+            codex_ws: None,
+            codex_thread_id,
+            codex_request_id: 0,
             thinking_mode,
         })
     }
@@ -707,21 +1127,12 @@ impl AgentClientSession {
                     "messages": messages,
                     "stream": stream,
                 });
-
-                // OpenAI 兼容 API 使用 reasoning_effort 控制思考强度
-                match &self.thinking_mode {
-                    ThinkingMode::Disabled => {
-                        // 禁用思考模式
-                        body["thinking"] = serde_json::json!({"type": "disabled"});
-                    }
-                    m => {
-                        body["reasoning_effort"] =
-                            serde_json::Value::String(m.as_str().to_string());
-                        // 启用思考模式
-                        body["thinking"] = serde_json::json!({"type": "enabled"});
-                    }
+                if self.thinking_mode == ThinkingMode::Disabled {
+                    body["thinking"] = serde_json::json!({"type": "disabled"});
+                } else {
+                    body["thinking"] = serde_json::json!({"type": "enabled"});
+                    body["reasoning_effort"] = self.thinking_mode.as_str().into();
                 }
-
                 Ok((url, body, headers))
             }
             LlmProvider::Anthropic => {
@@ -748,20 +1159,6 @@ impl AgentClientSession {
                     "max_tokens": 4096,
                     "stream": stream,
                 });
-
-                // Anthropic 使用 output_config 控制思考强度
-                match &self.thinking_mode {
-                    ThinkingMode::Disabled => {
-                        // 禁用思考模式
-                        body["thinking"] = serde_json::json!({"type": "disabled"});
-                    }
-                    m => {
-                        body["output_config"] = serde_json::json!({"effort": m.as_str()});
-                        // 启用思考模式
-                        body["thinking"] = serde_json::json!({"type": "enabled"});
-                    }
-                }
-
                 if let Some(system) = system_msg {
                     body["system"] = serde_json::Value::String(system);
                 }
@@ -770,6 +1167,13 @@ impl AgentClientSession {
                     self.api_key.clone().unwrap_or_default(),
                 ));
                 headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
+                if self.thinking_mode == ThinkingMode::Disabled {
+                    body["thinking"] = serde_json::json!({"type": "disabled"});
+                } else {
+                    body["thinking"] = serde_json::json!({"type": "enabled"});
+                    body["output_config"] =
+                        serde_json::json!({ "effort": self.thinking_mode.as_str() })
+                }
                 Ok((url, body, headers))
             }
             LlmProvider::Ollama => {
@@ -784,23 +1188,22 @@ impl AgentClientSession {
                         })
                     })
                     .collect();
-                let mut body = serde_json::json!({
+                let body = serde_json::json!({
                     "model": self.model,
                     "messages": messages,
                     "stream": stream,
                 });
-
-                // Ollama 使用 think 参数控制思考强度
-                body["think"] = match &self.thinking_mode {
-                    ThinkingMode::Disabled => serde_json::Value::Bool(false),
-                    m => serde_json::Value::String(m.as_str().to_string()),
-                };
-
                 Ok((url, body, headers))
             }
             LlmProvider::OpenCode => {
                 // OpenCode 使用独立的 chat_opencode 方法处理，这里保留兼容逻辑
                 let url = format!("{}/session/message", self.base_url);
+                let body = serde_json::json!({});
+                Ok((url, body, headers))
+            }
+            LlmProvider::Codex => {
+                // Codex 使用 WebSocket JSON-RPC 协议，不通过 HTTP 发送
+                let url = self.base_url.clone();
                 let body = serde_json::json!({});
                 Ok((url, body, headers))
             }
@@ -835,6 +1238,10 @@ impl AgentClientSession {
                 let json: serde_json::Value = serde_json::from_str(text)?;
                 let content = json["message"]["content"].as_str().unwrap_or("");
                 Ok(content.to_string())
+            }
+            LlmProvider::Codex => {
+                // Codex 使用 WebSocket 协议，响应通过通知接收
+                Ok(String::new())
             }
         }
     }

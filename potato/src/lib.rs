@@ -1053,18 +1053,26 @@ impl Websocket {
         let payload_len = payload.len();
         let mut buf = vec![];
         buf.push((fin as u8) << 7 | opcode);
+        // Client-to-server frames must be masked per RFC 6455
+        let mask_key: [u8; 4] = rand::random();
         if payload_len < 126 {
-            buf.push(payload_len as u8);
+            buf.push((payload_len as u8) | 0x80);
         } else if payload_len < 65536 {
-            buf.push(126);
+            buf.push(126 | 0x80);
             buf.extend((payload_len as u16).to_be_bytes().iter());
         } else {
-            buf.push(127);
+            buf.push(127 | 0x80);
             buf.extend((payload_len as u64).to_be_bytes().iter());
+        }
+        buf.extend_from_slice(&mask_key);
+        // Mask the payload
+        let mut masked_payload = payload.clone();
+        for i in 0..masked_payload.len() {
+            masked_payload[i] ^= mask_key[i % 4];
         }
         let mut stream = self.stream.lock().await;
         stream.write_all(&buf).await?;
-        stream.write_all(&payload).await?;
+        stream.write_all(&masked_payload).await?;
         Ok(())
     }
 
