@@ -105,3 +105,41 @@ let mut session = potato::client::TransferSession::from_forward_proxy();
 
 // 使用: session.transfer(&mut request, modify_content).await?
 ```
+
+## Agent 客户端会话
+
+多轮对话 LLM 客户端，支持 OpenAI、Anthropic、Ollama、OpenCode、Codex 等提供商：
+
+```rust
+// 创建会话
+let mut agent = potato::AgentClientSession::new(
+    potato::LlmProvider::OpenAI,
+    "https://api.openai.com",
+    Some("sk-your-api-key".to_string()),
+);
+
+// 设置系统提示词与模型
+agent.set_system_prompt("You are a helpful assistant.");
+agent.set_model("gpt-4o-mini").await?;
+
+// 非流式对话
+let reply = agent.chat("Hello!").await?;
+
+// 流式对话
+let mut stream = agent.chat_stream("Tell me a story.").await?;
+while let Some(chunk) = stream.recv().await {
+    match chunk {
+        potato::StreamChunk::Content(text) => print!("{}", text),
+        potato::StreamChunk::Done => break,
+    }
+}
+
+// 获取模型列表
+let models = agent.list_models().await?;
+
+// 序列化与恢复会话状态
+let state = agent.serialize()?;
+let mut restored = potato::AgentClientSession::deserialize(&state)?;
+```
+
+完整示例：`examples/client/09_agent_session.rs`

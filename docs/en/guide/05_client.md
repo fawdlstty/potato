@@ -105,3 +105,41 @@ let mut session = potato::client::TransferSession::from_forward_proxy();
 
 // Usage: session.transfer(&mut request, modify_content).await?
 ```
+
+## Agent Client Session
+
+Multi-turn LLM client supporting OpenAI, Anthropic, Ollama, OpenCode, Codex:
+
+```rust
+// Create session
+let mut agent = potato::AgentClientSession::new(
+    potato::LlmProvider::OpenAI,
+    "https://api.openai.com",
+    Some("sk-your-api-key".to_string()),
+);
+
+// Set system prompt and model
+agent.set_system_prompt("You are a helpful assistant.");
+agent.set_model("gpt-4o-mini").await?;
+
+// Non-streaming chat
+let reply = agent.chat("Hello!").await?;
+
+// Streaming chat
+let mut stream = agent.chat_stream("Tell me a story.").await?;
+while let Some(chunk) = stream.recv().await {
+    match chunk {
+        potato::StreamChunk::Content(text) => print!("{}", text),
+        potato::StreamChunk::Done => break,
+    }
+}
+
+// List available models
+let models = agent.list_models().await?;
+
+// Serialize and restore session state
+let state = agent.serialize()?;
+let mut restored = potato::AgentClientSession::deserialize(&state)?;
+```
+
+Full example: `examples/client/09_agent_session.rs`
