@@ -1,6 +1,32 @@
 use crate::Session;
 use serde::{Deserialize, Serialize};
 
+/// 简单的 URL 编码，用于编码文件路径中的特殊字符
+fn url_encode_path(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'/'
+            | b':'
+            | b'\\' => {
+                result.push(byte as char);
+            }
+            b' ' => result.push_str("%20"),
+            _ => {
+                result.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    result
+}
+
 /// 统一的思考强度级别
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ThinkingMode {
@@ -87,6 +113,103 @@ pub enum LlmProvider {
     Codex,
 }
 
+/// OpenCode 会话状态
+#[derive(Clone, Debug)]
+pub struct OpenCodeSession {
+    /// OpenCode serve 的 session ID
+    pub session_id: Option<String>,
+    /// OpenCode serve 的上一条消息 ID（用于构建消息链）
+    pub parent_id: Option<String>,
+}
+
+impl OpenCodeSession {
+    pub fn new() -> Self {
+        Self {
+            session_id: None,
+            parent_id: None,
+        }
+    }
+}
+
+/// Codex 会话状态
+pub struct CodexSession {
+    /// Codex app-server 的 WebSocket 连接
+    pub ws: Option<crate::Websocket>,
+    /// Codex app-server 的 thread ID
+    pub thread_id: Option<String>,
+    /// Codex app-server 的 JSON-RPC 请求 ID 计数器
+    pub request_id: i64,
+}
+
+impl CodexSession {
+    pub fn new() -> Self {
+        Self {
+            ws: None,
+            thread_id: None,
+            request_id: 0,
+        }
+    }
+
+    /// 获取下一个 JSON-RPC 请求 ID
+    pub fn next_request_id(&mut self) -> i64 {
+        self.request_id += 1;
+        self.request_id
+    }
+}
+
+/// 提供商特定的会话状态
+pub enum ProviderSession {
+    /// OpenCode 会话状态
+    OpenCode(OpenCodeSession),
+    /// Codex 会话状态
+    Codex(CodexSession),
+    /// 其他提供商无需特殊状态
+    Other,
+}
+
+impl ProviderSession {
+    /// 根据提供商类型创建对应的会话状态
+    pub fn from_provider(provider: &LlmProvider) -> Self {
+        match provider {
+            LlmProvider::OpenCode => ProviderSession::OpenCode(OpenCodeSession::new()),
+            LlmProvider::Codex => ProviderSession::Codex(CodexSession::new()),
+            _ => ProviderSession::Other,
+        }
+    }
+
+    /// 获取 OpenCode 会话状态的可变引用
+    pub fn as_opencode_mut(&mut self) -> Option<&mut OpenCodeSession> {
+        match self {
+            ProviderSession::OpenCode(ref mut s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// 获取 Codex 会话状态的可变引用
+    pub fn as_codex_mut(&mut self) -> Option<&mut CodexSession> {
+        match self {
+            ProviderSession::Codex(ref mut s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// 获取 OpenCode 会话状态的不可变引用
+    pub fn as_opencode(&self) -> Option<&OpenCodeSession> {
+        match self {
+            ProviderSession::OpenCode(ref s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// 获取 Codex 会话状态的不可变引用
+    pub fn as_codex(&self) -> Option<&CodexSession> {
+        match self {
+            ProviderSession::Codex(ref s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
 /// 流式响应的单个数据块
 #[derive(Clone, Debug)]
 pub enum StreamChunk {
@@ -112,18 +235,14 @@ pub struct AgentClientSession {
     model: Option<String>,
     session: Session,
     messages: Vec<ChatMessage>,
-    /// OpenCode serve 的 session ID（仅 OpenCode provider 使用）
-    opencode_session_id: Option<String>,
-    /// OpenCode serve 的上一条消息 ID（用于构建消息链）
-    opencode_parent_id: Option<String>,
-    /// Codex app-server 的 WebSocket 连接（仅 Codex provider 使用）
-    codex_ws: Option<crate::Websocket>,
-    /// Codex app-server 的 thread ID（仅 Codex provider 使用）
-    codex_thread_id: Option<String>,
-    /// Codex app-server 的 JSON-RPC 请求 ID 计数器
-    codex_request_id: i64,
     /// 思考等级（推理强度），仅部分提供商的推理模型支持
     thinking_mode: ThinkingMode,
+    /// 工作目录路径（源代码路径），仅 OpenCode 和 Codex provider 使用
+    /// OpenCode: 作为 POST /session?directory= 查询参数传递
+    /// Codex: 作为 thread/start 和 turn/start 的 cwd 参数传递
+    working_directory: Option<String>,
+    /// 提供商特定的会话状态
+    provider_session: ProviderSession,
 }
 
 impl AgentClientSession {
@@ -138,6 +257,7 @@ impl AgentClientSession {
         base_url: impl Into<String>,
         api_key: Option<String>,
     ) -> Self {
+        let provider_session = ProviderSession::from_provider(&provider);
         Self {
             provider,
             base_url: base_url.into(),
@@ -145,12 +265,9 @@ impl AgentClientSession {
             model: None,
             session: Session::new(),
             messages: Vec::new(),
-            opencode_session_id: None,
-            opencode_parent_id: None,
-            codex_ws: None,
-            codex_thread_id: None,
-            codex_request_id: 0,
             thinking_mode: ThinkingMode::Medium,
+            working_directory: None,
+            provider_session,
         }
     }
 
@@ -196,6 +313,23 @@ impl AgentClientSession {
     /// 获取当前设置的思考等级
     pub fn thinking_mode(&self) -> &ThinkingMode {
         &self.thinking_mode
+    }
+
+    /// 设置工作目录（源代码路径）
+    ///
+    /// 仅 OpenCode 和 Codex provider 使用：
+    /// - OpenCode: 创建 session 时作为 `?directory=` 查询参数传递
+    /// - Codex: 启动 thread 时作为 `cwd` 参数传递
+    ///
+    /// # 参数
+    /// - `path`: 工作目录的绝对路径
+    pub fn set_working_directory(&mut self, path: Option<String>) {
+        self.working_directory = path;
+    }
+
+    /// 获取当前设置的工作目录
+    pub fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
     }
 
     /// 获取当前模型支持的所有思考等级
@@ -442,43 +576,64 @@ impl AgentClientSession {
     /// OpenCode serve 专用：创建 session 并发送消息
     async fn chat_opencode(&mut self, _stream: bool) -> anyhow::Result<String> {
         // 如果还没有 opencode session，先创建一个
-        if self.opencode_session_id.is_none() {
-            let create_url = format!("{}/session", self.base_url);
-            let create_body = serde_json::json!({"title": "potato-agent-session"});
-            let mut create_res = self
-                .session
-                .post_json(&create_url, create_body, vec![])
-                .await?;
-            let create_data = create_res.body.data().await;
-            let create_text = String::from_utf8_lossy(create_data).to_string();
-            if create_res.http_code != 200 {
-                return Err(anyhow::anyhow!(
-                    "OpenCode create session failed {}: {}",
-                    create_res.http_code,
-                    create_text
-                ));
+        {
+            let opencode = self
+                .provider_session
+                .as_opencode_mut()
+                .ok_or_else(|| anyhow::anyhow!("Expected OpenCode provider session"))?;
+            if opencode.session_id.is_none() {
+                let mut create_url = format!("{}/session", self.base_url);
+                // 如果设置了工作目录，作为 query 参数传递
+                if let Some(ref dir) = self.working_directory {
+                    create_url = format!("{}?directory={}", create_url, url_encode_path(dir));
+                }
+                let create_body = serde_json::json!({"title": "potato-agent-session"});
+                let mut create_res = self
+                    .session
+                    .post_json(&create_url, create_body, vec![])
+                    .await?;
+                let create_data = create_res.body.data().await;
+                let create_text = String::from_utf8_lossy(create_data).to_string();
+                if create_res.http_code != 200 {
+                    return Err(anyhow::anyhow!(
+                        "OpenCode create session failed {}: {}",
+                        create_res.http_code,
+                        create_text
+                    ));
+                }
+                let create_json: serde_json::Value = serde_json::from_str(&create_text)?;
+                opencode.session_id = Some(
+                    create_json["id"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("OpenCode session response missing id"))?
+                        .to_string(),
+                );
             }
-            let create_json: serde_json::Value = serde_json::from_str(&create_text)?;
-            self.opencode_session_id = Some(
-                create_json["id"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("OpenCode session response missing id"))?
-                    .to_string(),
-            );
         }
 
-        let session_id = self.opencode_session_id.as_ref().unwrap();
+        let session_id = {
+            let opencode = self.provider_session.as_opencode().unwrap();
+            opencode.session_id.as_ref().unwrap().clone()
+        };
         let url = format!("{}/session/{}/message", self.base_url, session_id);
 
         // 构建 parts：当前用户消息
-        let last_msg = self
-            .messages
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("No message to send"))?;
-        let parts = serde_json::json!([{"type": "text", "text": last_msg.content}]);
+        let last_msg_content = {
+            let last_msg = self
+                .messages
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("No message to send"))?;
+            last_msg.content.clone()
+        };
+        let parts = serde_json::json!([{"type": "text", "text": last_msg_content}]);
 
         // 解析 model 为 providerID 和 modelID
         let (provider_id, model_id) = self.parse_opencode_model()?;
+
+        let parent_id = {
+            let opencode = self.provider_session.as_opencode().unwrap();
+            opencode.parent_id.clone()
+        };
 
         let mut body = serde_json::json!({
             "parts": parts,
@@ -489,7 +644,7 @@ impl AgentClientSession {
         });
 
         // 如果有 parentID，添加到请求体中
-        if let Some(ref parent_id) = self.opencode_parent_id {
+        if let Some(ref parent_id) = parent_id {
             body["parentID"] = serde_json::Value::String(parent_id.clone());
         }
 
@@ -520,9 +675,15 @@ impl AgentClientSession {
         let content = self.parse_opencode_response(&response_text)?;
 
         // 从响应中提取 parentID（用户消息的 ID），作为下一次请求的 parentID
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response_text) {
-            if let Some(parent_id) = json["info"]["parentID"].as_str() {
-                self.opencode_parent_id = Some(parent_id.to_string());
+        {
+            let opencode = self
+                .provider_session
+                .as_opencode_mut()
+                .ok_or_else(|| anyhow::anyhow!("Expected OpenCode provider session"))?;
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response_text) {
+                if let Some(parent_id) = json["info"]["parentID"].as_str() {
+                    opencode.parent_id = Some(parent_id.to_string());
+                }
             }
         }
 
@@ -564,15 +725,22 @@ impl AgentClientSession {
 
     // ==================== Codex app-server WebSocket 协议支持 ====================
 
+    /// 获取 Codex 会话的可变引用
+    fn codex_session_mut(&mut self) -> anyhow::Result<&mut CodexSession> {
+        self.provider_session
+            .as_codex_mut()
+            .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))
+    }
+
     /// 获取下一个 JSON-RPC 请求 ID
     fn next_codex_request_id(&mut self) -> i64 {
-        self.codex_request_id += 1;
-        self.codex_request_id
+        self.codex_session_mut().unwrap().next_request_id()
     }
 
     /// 确保 Codex WebSocket 连接已建立并完成初始化
     async fn ensure_codex_connected(&mut self) -> anyhow::Result<()> {
-        if self.codex_ws.is_some() {
+        let codex = self.codex_session_mut()?;
+        if codex.ws.is_some() {
             return Ok(());
         }
 
@@ -618,13 +786,15 @@ impl AgentClientSession {
         });
         ws.send_text(&init_notify.to_string()).await?;
 
-        self.codex_ws = Some(ws);
+        let codex = self.codex_session_mut()?;
+        codex.ws = Some(ws);
 
         // 3. 如果有保存的 thread_id，尝试恢复线程
-        if let Some(thread_id) = self.codex_thread_id.clone() {
+        if let Some(thread_id) = codex.thread_id.clone() {
             let req_id = self.next_codex_request_id();
             {
-                let ws = self.codex_ws.as_mut().unwrap();
+                let codex = self.codex_session_mut()?;
+                let ws = codex.ws.as_mut().unwrap();
                 let req = serde_json::json!({
                     "method": "thread/resume",
                     "id": req_id,
@@ -634,27 +804,30 @@ impl AgentClientSession {
                 });
                 if let Err(e) = ws.send_text(&req.to_string()).await {
                     eprintln!("WARN: Failed to send thread/resume: {}", e);
-                    self.codex_thread_id = None;
+                    codex.thread_id = None;
                 }
             }
-            if self.codex_thread_id.is_some() {
+            let codex = self.codex_session_mut()?;
+            if codex.thread_id.is_some() {
                 let res = {
-                    let ws = self.codex_ws.as_mut().unwrap();
+                    let codex = self.codex_session_mut()?;
+                    let ws = codex.ws.as_mut().unwrap();
                     match Self::recv_codex_jsonrpc_response(ws).await {
                         Ok(res) => res,
                         Err(e) => {
                             eprintln!("WARN: Failed to receive thread/resume response: {}", e);
-                            self.codex_thread_id = None;
+                            codex.thread_id = None;
                             return Ok(());
                         }
                     }
                 };
+                let codex = self.codex_session_mut()?;
                 if res.get("error").is_some() {
                     eprintln!(
                         "WARN: Codex thread/resume failed: {}, will create new thread",
                         res["error"]
                     );
-                    self.codex_thread_id = None;
+                    codex.thread_id = None;
                 }
             }
         }
@@ -703,7 +876,8 @@ impl AgentClientSession {
 
         let req_id = self.next_codex_request_id();
         {
-            let ws = self.codex_ws.as_mut().unwrap();
+            let codex = self.codex_session_mut()?;
+            let ws = codex.ws.as_mut().unwrap();
             let req = serde_json::json!({
                 "method": "model/list",
                 "id": req_id,
@@ -713,7 +887,8 @@ impl AgentClientSession {
         }
 
         let res = {
-            let ws = self.codex_ws.as_mut().unwrap();
+            let codex = self.codex_session_mut()?;
+            let ws = codex.ws.as_mut().unwrap();
             Self::recv_codex_jsonrpc_response(ws).await?
         };
         if let Some(error) = res.get("error") {
@@ -742,7 +917,8 @@ impl AgentClientSession {
         self.ensure_codex_connected().await?;
 
         // 如果没有 thread，先创建一个
-        if self.codex_thread_id.is_none() {
+        let codex = self.codex_session_mut()?;
+        if codex.thread_id.is_none() {
             let (model, model_provider) = self.parse_codex_model();
             let req_id = self.next_codex_request_id();
 
@@ -755,9 +931,13 @@ impl AgentClientSession {
             if let Some(model_provider) = model_provider {
                 thread_params["modelProvider"] = serde_json::Value::String(model_provider);
             }
+            if let Some(ref cwd) = self.working_directory {
+                thread_params["cwd"] = serde_json::Value::String(cwd.clone());
+            }
 
             {
-                let ws = self.codex_ws.as_mut().unwrap();
+                let codex = self.codex_session_mut()?;
+                let ws = codex.ws.as_mut().unwrap();
                 let req = serde_json::json!({
                     "method": "thread/start",
                     "id": req_id,
@@ -767,14 +947,16 @@ impl AgentClientSession {
             }
 
             let res = {
-                let ws = self.codex_ws.as_mut().unwrap();
+                let codex = self.codex_session_mut()?;
+                let ws = codex.ws.as_mut().unwrap();
                 Self::recv_codex_jsonrpc_response(ws).await?
             };
             if let Some(error) = res.get("error") {
                 return Err(anyhow::anyhow!("Codex thread/start failed: {}", error));
             }
 
-            self.codex_thread_id = Some(
+            let codex = self.codex_session_mut()?;
+            codex.thread_id = Some(
                 res["result"]["thread"]["id"]
                     .as_str()
                     .ok_or_else(|| {
@@ -784,7 +966,10 @@ impl AgentClientSession {
             );
         }
 
-        let thread_id = self.codex_thread_id.as_ref().unwrap().clone();
+        let thread_id = {
+            let codex = self.codex_session_mut()?;
+            codex.thread_id.as_ref().unwrap().clone()
+        };
 
         // 构建输入：如果有历史消息（除了最后一条），将历史作为上下文附加
         let input_text = if self.messages.len() > 1 {
@@ -810,27 +995,35 @@ impl AgentClientSession {
         };
 
         let req_id = self.next_codex_request_id();
+        let cwd = self.working_directory.clone();
         {
-            let ws = self.codex_ws.as_mut().unwrap();
+            let codex = self.codex_session_mut()?;
+            let ws = codex.ws.as_mut().unwrap();
+            let mut turn_params = serde_json::json!({
+                "threadId": thread_id,
+                "input": [
+                    {
+                        "type": "text",
+                        "text": input_text
+                    }
+                ]
+            });
+            // 如果设置了工作目录，传递给 turn/start 作为 cwd
+            if let Some(ref cwd) = cwd {
+                turn_params["cwd"] = serde_json::Value::String(cwd.clone());
+            }
             let req = serde_json::json!({
                 "method": "turn/start",
                 "id": req_id,
-                "params": {
-                    "threadId": thread_id,
-                    "input": [
-                        {
-                            "type": "text",
-                            "text": input_text
-                        }
-                    ]
-                }
+                "params": turn_params
             });
             ws.send_text(&req.to_string()).await?;
         }
 
         // 等待 turn/start 响应
         let turn_res = {
-            let ws = self.codex_ws.as_mut().unwrap();
+            let codex = self.codex_session_mut()?;
+            let ws = codex.ws.as_mut().unwrap();
             Self::recv_codex_jsonrpc_response(ws).await?
         };
         if let Some(error) = turn_res.get("error") {
@@ -843,7 +1036,8 @@ impl AgentClientSession {
 
         while !turn_completed {
             let notification = {
-                let ws = self.codex_ws.as_mut().unwrap();
+                let codex = self.codex_session_mut()?;
+                let ws = codex.ws.as_mut().unwrap();
                 Self::recv_codex_notification(ws).await?
             };
             let method = notification["method"].as_str().unwrap_or("");
@@ -1018,16 +1212,19 @@ impl AgentClientSession {
     /// 序列化内容包括：provider、base_url、api_key、model、messages、opencode_session_id、opencode_parent_id
     /// 注意：Session（HTTP 连接）不会被序列化，反序列化后会重新创建
     pub fn serialize(&self) -> anyhow::Result<String> {
+        let opencode = self.provider_session.as_opencode();
+        let codex = self.provider_session.as_codex();
         let state = serde_json::json!({
             "provider": self.provider,
             "base_url": self.base_url,
             "api_key": self.api_key,
             "model": self.model,
             "messages": self.messages,
-            "opencode_session_id": self.opencode_session_id,
-            "opencode_parent_id": self.opencode_parent_id,
-            "codex_thread_id": self.codex_thread_id,
             "thinking_mode": self.thinking_mode,
+            "working_directory": self.working_directory,
+            "opencode_session_id": opencode.and_then(|s| s.session_id.as_ref()),
+            "opencode_parent_id": opencode.and_then(|s| s.parent_id.as_ref()),
+            "codex_thread_id": codex.and_then(|s| s.thread_id.as_ref()),
         });
         Ok(state.to_string())
     }
@@ -1067,6 +1264,14 @@ impl AgentClientSession {
                 .ok_or_else(|| anyhow::anyhow!("missing messages field"))?
                 .clone(),
         )?;
+        let thinking_mode = state
+            .get("thinking_mode")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or(ThinkingMode::Medium);
+        let working_directory = state
+            .get("working_directory")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let opencode_session_id = state
             .get("opencode_session_id")
             .and_then(|v| v.as_str())
@@ -1079,10 +1284,15 @@ impl AgentClientSession {
             .get("codex_thread_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let thinking_mode = state
-            .get("thinking_mode")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or(ThinkingMode::Medium);
+
+        let mut provider_session = ProviderSession::from_provider(&provider);
+        if let ProviderSession::OpenCode(ref mut opencode) = provider_session {
+            opencode.session_id = opencode_session_id;
+            opencode.parent_id = opencode_parent_id;
+        }
+        if let ProviderSession::Codex(ref mut codex) = provider_session {
+            codex.thread_id = codex_thread_id;
+        }
 
         Ok(Self {
             provider,
@@ -1091,12 +1301,9 @@ impl AgentClientSession {
             model,
             session: Session::new(),
             messages,
-            opencode_session_id,
-            opencode_parent_id,
-            codex_ws: None,
-            codex_thread_id,
-            codex_request_id: 0,
             thinking_mode,
+            working_directory,
+            provider_session,
         })
     }
 
