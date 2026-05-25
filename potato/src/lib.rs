@@ -2234,25 +2234,25 @@ pub struct HttpResponseBodyStream<'a> {
 
 impl HttpResponseBody {
     pub async fn data(&mut self) -> &[u8] {
-        // 先检查是否是 Stream 类型
-        let is_stream = matches!(self, HttpResponseBody::Stream(_));
-
-        if is_stream {
-            // 从 Stream 中替换出 rx，接收所有数据
-            if let HttpResponseBody::Stream(mut rx) =
-                std::mem::replace(self, HttpResponseBody::Data(vec![]))
-            {
-                let mut data = Vec::with_capacity(1024);
-                while let Some(chunk) = rx.recv().await {
-                    data.extend_from_slice(&chunk);
-                }
-                *self = HttpResponseBody::Data(data);
+        if let HttpResponseBody::Stream(rx) = self {
+            let mut buf = vec![];
+            while let Some(chunk) = rx.recv().await {
+                buf.extend_from_slice(&chunk);
             }
+            *self = HttpResponseBody::Data(buf);
         }
 
         match self {
             HttpResponseBody::Data(data) => data.as_slice(),
             HttpResponseBody::Stream(_) => &[], // Should not reach here
+        }
+    }
+
+    pub async fn into_data(mut self) -> Vec<u8> {
+        self.data().await;
+        match self {
+            HttpResponseBody::Data(data) => data,
+            HttpResponseBody::Stream(_) => vec![],
         }
     }
 

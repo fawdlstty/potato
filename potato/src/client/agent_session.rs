@@ -29,7 +29,7 @@ fn url_encode_path(path: &str) -> String {
 
 /// 统一的思考强度级别
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum ThinkingMode {
+pub enum ReasoningEffort {
     /// 禁用思考模式
     Disabled,
     /// 低强度思考（快速响应）
@@ -44,20 +44,20 @@ pub enum ThinkingMode {
     Max,
 }
 
-impl ThinkingMode {
+impl ReasoningEffort {
     pub fn as_str(&self) -> &'static str {
         match self {
-            ThinkingMode::Disabled => "disabled",
-            ThinkingMode::Low => "low",
-            ThinkingMode::Medium => "medium",
-            ThinkingMode::High => "high",
-            ThinkingMode::XHigh => "xhigh",
-            ThinkingMode::Max => "max",
+            ReasoningEffort::Disabled => "disabled",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
         }
     }
 }
 
-impl std::fmt::Display for ThinkingMode {
+impl std::fmt::Display for ReasoningEffort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
@@ -96,10 +96,20 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn new(role: MessageRole, content: impl Into<String>) -> Self {
-        Self {
-            role,
-            content: content.into(),
-        }
+        let content = content.into();
+        Self { role, content }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::new(MessageRole::System, content)
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new(MessageRole::User, content)
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new(MessageRole::Assistant, content)
     }
 }
 
@@ -236,7 +246,7 @@ pub struct AgentClientSession {
     session: Session,
     messages: Vec<ChatMessage>,
     /// 思考等级（推理强度），仅部分提供商的推理模型支持
-    thinking_mode: ThinkingMode,
+    reasoning_effort: ReasoningEffort,
     /// 工作目录路径（源代码路径），仅 OpenCode 和 Codex provider 使用
     /// OpenCode: 作为 POST /session?directory= 查询参数传递
     /// Codex: 作为 thread/start 和 turn/start 的 cwd 参数传递
@@ -265,7 +275,7 @@ impl AgentClientSession {
             model: None,
             session: Session::new(),
             messages: Vec::new(),
-            thinking_mode: ThinkingMode::Medium,
+            reasoning_effort: ReasoningEffort::Medium,
             working_directory: None,
             provider_session,
         }
@@ -306,13 +316,13 @@ impl AgentClientSession {
     ///
     /// # 参数
     /// - `effort`: 思考等级
-    pub fn set_thinking_mode(&mut self, effort: ThinkingMode) {
-        self.thinking_mode = effort;
+    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) {
+        self.reasoning_effort = effort;
     }
 
     /// 获取当前设置的思考等级
-    pub fn thinking_mode(&self) -> &ThinkingMode {
-        &self.thinking_mode
+    pub fn reasoning_effort(&self) -> &ReasoningEffort {
+        &self.reasoning_effort
     }
 
     /// 设置工作目录（源代码路径）
@@ -519,14 +529,14 @@ impl AgentClientSession {
         &self.messages
     }
 
-    /// 清空会话历史（保留 system prompt）
-    pub fn clear_messages(&mut self) {
-        let system_msgs: Vec<ChatMessage> = self
+    /// 设置会话历史消息（覆盖现有消息，保留 system prompt）
+    pub fn set_messages(&mut self, messages: Vec<ChatMessage>) {
+        self.messages = self
             .messages
             .drain(..)
             .filter(|m| m.role == MessageRole::System)
             .collect();
-        self.messages = system_msgs;
+        self.messages.extend(messages);
     }
 
     /// 发送消息并获取完整响应（非流式）
@@ -1220,7 +1230,7 @@ impl AgentClientSession {
             "api_key": self.api_key,
             "model": self.model,
             "messages": self.messages,
-            "thinking_mode": self.thinking_mode,
+            "reasoning_effort": self.reasoning_effort,
             "working_directory": self.working_directory,
             "opencode_session_id": opencode.and_then(|s| s.session_id.as_ref()),
             "opencode_parent_id": opencode.and_then(|s| s.parent_id.as_ref()),
@@ -1264,10 +1274,10 @@ impl AgentClientSession {
                 .ok_or_else(|| anyhow::anyhow!("missing messages field"))?
                 .clone(),
         )?;
-        let thinking_mode = state
-            .get("thinking_mode")
+        let reasoning_effort = state
+            .get("reasoning_effort")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or(ThinkingMode::Medium);
+            .unwrap_or(ReasoningEffort::Medium);
         let working_directory = state
             .get("working_directory")
             .and_then(|v| v.as_str())
@@ -1301,7 +1311,7 @@ impl AgentClientSession {
             model,
             session: Session::new(),
             messages,
-            thinking_mode,
+            reasoning_effort,
             working_directory,
             provider_session,
         })
@@ -1334,11 +1344,11 @@ impl AgentClientSession {
                     "messages": messages,
                     "stream": stream,
                 });
-                if self.thinking_mode == ThinkingMode::Disabled {
+                if self.reasoning_effort == ReasoningEffort::Disabled {
                     body["thinking"] = serde_json::json!({"type": "disabled"});
                 } else {
                     body["thinking"] = serde_json::json!({"type": "enabled"});
-                    body["reasoning_effort"] = self.thinking_mode.as_str().into();
+                    body["reasoning_effort"] = self.reasoning_effort.as_str().into();
                 }
                 Ok((url, body, headers))
             }
@@ -1374,12 +1384,12 @@ impl AgentClientSession {
                     self.api_key.clone().unwrap_or_default(),
                 ));
                 headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
-                if self.thinking_mode == ThinkingMode::Disabled {
+                if self.reasoning_effort == ReasoningEffort::Disabled {
                     body["thinking"] = serde_json::json!({"type": "disabled"});
                 } else {
                     body["thinking"] = serde_json::json!({"type": "enabled"});
                     body["output_config"] =
-                        serde_json::json!({ "effort": self.thinking_mode.as_str() })
+                        serde_json::json!({ "effort": self.reasoning_effort.as_str() })
                 }
                 Ok((url, body, headers))
             }
