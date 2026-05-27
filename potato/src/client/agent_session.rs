@@ -91,13 +91,19 @@ impl std::fmt::Display for MessageRole {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
+    pub ts_micros: i64,
     pub content: String,
 }
 
 impl ChatMessage {
     pub fn new(role: MessageRole, content: impl Into<String>) -> Self {
         let content = content.into();
-        Self { role, content }
+        let ts_micros = chrono::Utc::now().timestamp_micros();
+        Self {
+            role,
+            ts_micros,
+            content,
+        }
     }
 
     pub fn system(content: impl Into<String>) -> Self {
@@ -356,7 +362,7 @@ impl AgentClientSession {
     }
 
     async fn list_reasoning_efforts_openai(&mut self, model: &str) -> anyhow::Result<Vec<String>> {
-        let url = format!("{}/v1/models/{}", self.base_url, model);
+        let url = format!("{}/models/{}", self.base_url, model);
         let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         if let Some(ref key) = self.api_key {
             headers.push(("Authorization".to_string(), format!("Bearer {key}")));
@@ -451,7 +457,7 @@ impl AgentClientSession {
         api_key: &Option<String>,
         session: &mut Session,
     ) -> anyhow::Result<Vec<ModelInfo>> {
-        let url = format!("{}/v1/models", base_url);
+        let url = format!("{}/models", base_url);
         let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         if let Some(ref key) = api_key {
             headers.push(("Authorization".to_string(), format!("Bearer {key}")));
@@ -1328,7 +1334,7 @@ impl AgentClientSession {
 
         match self.provider {
             LlmProvider::OpenAI => {
-                let url = format!("{}/v1/chat/completions", self.base_url);
+                let url = format!("{}/chat/completions", self.base_url);
                 let messages: Vec<serde_json::Value> = self
                     .messages
                     .iter()
@@ -1353,7 +1359,7 @@ impl AgentClientSession {
                 Ok((url, body, headers))
             }
             LlmProvider::Anthropic => {
-                let url = format!("{}/v1/messages", self.base_url);
+                let url = format!("{}/messages", self.base_url);
                 let system_msg = self
                     .messages
                     .iter()
