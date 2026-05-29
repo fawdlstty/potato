@@ -28,6 +28,7 @@ pub use utils::jemalloc_helper::*;
 pub use webrtc::*;
 
 use anyhow::anyhow;
+use base64::Engine;
 use chrono::Utc;
 use core::str;
 use hipstr::{LocalHipByt, LocalHipStr};
@@ -948,7 +949,10 @@ impl Websocket {
         req.apply_header(Headers::Connection("Upgrade".to_string()));
         req.apply_header(Headers::Upgrade("Websocket".to_string()));
         req.apply_header(Headers::Sec_WebSocket_Version("13".to_string()));
-        req.apply_header(Headers::Sec_WebSocket_Key("VerySecurity".to_string()));
+        // RFC 6455 要求 Sec-WebSocket-Key 为 16 字节随机数据的 base64 编码
+        let random_bytes: [u8; 16] = rand::random();
+        let key = base64::engine::general_purpose::STANDARD.encode(random_bytes);
+        req.apply_header(Headers::Sec_WebSocket_Key(key));
         let res = sess.do_request(req).await?;
         if res.http_code != 101 {
             let body_str = match &res.body {
@@ -1018,13 +1022,16 @@ impl Websocket {
 
     pub async fn recv(&mut self) -> anyhow::Result<WsFrame> {
         let mut tmp = vec![];
+        let mut ping_failures = 0u32;
         loop {
             let timeout = ServerConfig::get_ws_ping_duration().await;
             match tokio::time::timeout(timeout, self.recv_impl()).await {
                 Ok(ws_frame) => match ws_frame? {
                     WsFrameImpl::Close => return Err(anyhow::Error::msg("close frame")),
                     WsFrameImpl::Ping => self.send_impl(WsFrameImpl::Pong).await?,
-                    WsFrameImpl::Pong => (),
+                    WsFrameImpl::Pong => {
+                        ping_failures = 0;
+                    }
                     WsFrameImpl::Binary(data) => {
                         tmp.extend(data);
                         return Ok(WsFrame::Binary(tmp));
@@ -1036,7 +1043,31 @@ impl Websocket {
                     }
                     WsFrameImpl::PartData(data) => tmp.extend(data),
                 },
-                Err(_) => self.send_impl(WsFrameImpl::Ping).await?,
+                Err(_) => {
+                    // 发送 ping 探测连接状态，带超时保护
+                    match tokio::time::timeout(Duration::from_secs(5), self.send_impl(WsFrameImpl::Ping)).await {
+                        Ok(Ok(())) => {
+                            ping_failures = 0;
+                        }
+                        Ok(Err(e)) => {
+                            ping_failures += 1;
+                            if ping_failures >= 3 {
+                                return Err(anyhow::Error::msg(format!(
+                                    "WebSocket ping failed {} times, last error: {}",
+                                    ping_failures, e
+                                )));
+                            }
+                        }
+                        Err(_) => {
+                            ping_failures += 1;
+                            if ping_failures >= 3 {
+                                return Err(anyhow::Error::msg(
+                                    "WebSocket ping timed out 3 times, connection appears dead"
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
     }

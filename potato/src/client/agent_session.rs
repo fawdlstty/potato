@@ -29,6 +29,7 @@ fn url_encode_path(path: &str) -> String {
 
 /// 统一的思考强度级别
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     /// 禁用思考模式
     Disabled,
@@ -39,6 +40,7 @@ pub enum ReasoningEffort {
     /// 高强度思考
     High,
     /// 极高强度思考
+    #[serde(rename = "xhigh")]
     XHigh,
     /// 最大强度思考（最耗资源）
     Max,
@@ -154,7 +156,7 @@ pub struct CodexSession {
     /// Codex app-server 的 thread ID
     pub thread_id: Option<String>,
     /// Codex app-server 的 JSON-RPC 请求 ID 计数器
-    pub request_id: i64,
+    pub request_id: std::sync::atomic::AtomicI64,
 }
 
 impl CodexSession {
@@ -162,14 +164,15 @@ impl CodexSession {
         Self {
             ws: None,
             thread_id: None,
-            request_id: 0,
+            request_id: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
     /// 获取下一个 JSON-RPC 请求 ID
-    pub fn next_request_id(&mut self) -> i64 {
-        self.request_id += 1;
+    pub fn next_request_id(&self) -> i64 {
         self.request_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
     }
 }
 
@@ -177,8 +180,8 @@ impl CodexSession {
 pub enum ProviderSession {
     /// OpenCode 会话状态
     OpenCode(OpenCodeSession),
-    /// Codex 会话状态
-    Codex(CodexSession),
+    /// Codex 会话状态（Arc<tokio::Mutex<>> 包装，支持主线程与后台任务共享）
+    Codex(std::sync::Arc<tokio::sync::Mutex<CodexSession>>),
     /// 其他提供商无需特殊状态
     Other,
 }
@@ -188,7 +191,9 @@ impl ProviderSession {
     pub fn from_provider(provider: &LlmProvider) -> Self {
         match provider {
             LlmProvider::OpenCode => ProviderSession::OpenCode(OpenCodeSession::new()),
-            LlmProvider::Codex => ProviderSession::Codex(CodexSession::new()),
+            LlmProvider::Codex => ProviderSession::Codex(std::sync::Arc::new(
+                tokio::sync::Mutex::new(CodexSession::new()),
+            )),
             _ => ProviderSession::Other,
         }
     }
@@ -201,10 +206,10 @@ impl ProviderSession {
         }
     }
 
-    /// 获取 Codex 会话状态的可变引用
-    pub fn as_codex_mut(&mut self) -> Option<&mut CodexSession> {
+    /// 获取 Codex 会话状态的 Arc 克隆
+    pub fn as_codex_arc(&self) -> Option<std::sync::Arc<tokio::sync::Mutex<CodexSession>>> {
         match self {
-            ProviderSession::Codex(ref mut s) => Some(s),
+            ProviderSession::Codex(arc) => Some(arc.clone()),
             _ => None,
         }
     }
@@ -220,9 +225,17 @@ impl ProviderSession {
     /// 获取 Codex 会话状态的不可变引用
     pub fn as_codex(&self) -> Option<&CodexSession> {
         match self {
-            ProviderSession::Codex(ref s) => Some(s),
+            ProviderSession::Codex(_arc) => {
+                // 注意：此方法在 Arc<Mutex<>> 下不安全，建议改用 as_codex_arc
+                None
+            }
             _ => None,
         }
+    }
+
+    /// 判断当前是否为 Codex 状态
+    pub fn is_codex(&self) -> bool {
+        matches!(self, ProviderSession::Codex(_))
     }
 }
 
@@ -296,9 +309,7 @@ impl AgentClientSession {
     /// 异步设置模型并验证其是否在可用列表中
     pub async fn set_model(&mut self, model: impl Into<String>) -> anyhow::Result<()> {
         let model = model.into();
-        // Anthropic provider 没有标准模型列表 API，跳过验证
-        if self.provider != LlmProvider::Anthropic {
-            let available_models = self.list_models().await?;
+        if let Ok(available_models) = self.list_models().await {
             let exists = available_models.iter().any(|m| m.id == model);
             if !exists {
                 return Err(anyhow::anyhow!(
@@ -375,10 +386,8 @@ impl AgentClientSession {
         let body_data = res.body.data().await;
         let response_text = String::from_utf8_lossy(body_data).to_string();
         if res.http_code != 200 {
-            return Err(anyhow::anyhow!(
-                "Failed to get model info: HTTP {}",
-                res.http_code
-            ));
+            // 部分 OpenAI 兼容服务不支持 /models/{model} 接口，返回空列表作为默认处理
+            return Ok(vec![]);
         }
         let json: serde_json::Value = serde_json::from_str(&response_text)?;
 
@@ -407,7 +416,9 @@ impl AgentClientSession {
             LlmProvider::OpenAI => {
                 Self::list_models_openai(&self.base_url, &self.api_key, &mut self.session).await
             }
-            LlmProvider::Anthropic => Ok(vec![]), // Anthropic 没有标准模型列表 API
+            LlmProvider::Anthropic => Err(anyhow::anyhow!(
+                "Anthropic does not have a standard model list API"
+            )),
             LlmProvider::Ollama => {
                 Self::list_models_ollama(&self.base_url, &mut self.session).await
             }
@@ -628,8 +639,15 @@ impl AgentClientSession {
         }
 
         let session_id = {
-            let opencode = self.provider_session.as_opencode().unwrap();
-            opencode.session_id.as_ref().unwrap().clone()
+            let opencode = self
+                .provider_session
+                .as_opencode()
+                .ok_or_else(|| anyhow::anyhow!("Expected OpenCode provider session"))?;
+            opencode
+                .session_id
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("OpenCode session not created"))?
+                .clone()
         };
         let url = format!("{}/session/{}/message", self.base_url, session_id);
 
@@ -647,7 +665,10 @@ impl AgentClientSession {
         let (provider_id, model_id) = self.parse_opencode_model()?;
 
         let parent_id = {
-            let opencode = self.provider_session.as_opencode().unwrap();
+            let opencode = self
+                .provider_session
+                .as_opencode()
+                .ok_or_else(|| anyhow::anyhow!("Expected OpenCode provider session"))?;
             opencode.parent_id.clone()
         };
 
@@ -741,24 +762,17 @@ impl AgentClientSession {
 
     // ==================== Codex app-server WebSocket 协议支持 ====================
 
-    /// 获取 Codex 会话的可变引用
-    fn codex_session_mut(&mut self) -> anyhow::Result<&mut CodexSession> {
-        self.provider_session
-            .as_codex_mut()
-            .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))
-    }
-
-    /// 获取下一个 JSON-RPC 请求 ID
-    fn next_codex_request_id(&mut self) -> i64 {
-        self.codex_session_mut().unwrap().next_request_id()
-    }
-
     /// 确保 Codex WebSocket 连接已建立并完成初始化
     async fn ensure_codex_connected(&mut self) -> anyhow::Result<()> {
-        let codex = self.codex_session_mut()?;
+        let arc = self
+            .provider_session
+            .as_codex_arc()
+            .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+        let codex = arc.lock().await;
         if codex.ws.is_some() {
             return Ok(());
         }
+        drop(codex);
 
         // 将 http:// 或 https:// 转换为 ws:// 或 wss://
         let ws_url = self
@@ -766,10 +780,22 @@ impl AgentClientSession {
             .replacen("http://", "ws://", 1)
             .replacen("https://", "wss://", 1);
 
-        let mut ws = crate::Websocket::connect(&ws_url, vec![]).await?;
+        // 构建 WebSocket 连接 headers，包含 Authorization
+        let mut ws_headers = vec![];
+        if let Some(ref api_key) = self.api_key {
+            ws_headers.push(crate::Headers::Authorization(format!("Bearer {api_key}")));
+        }
+
+        let mut ws = crate::Websocket::connect(&ws_url, ws_headers).await?;
 
         // 1. 发送 initialize 请求
-        let init_id = self.next_codex_request_id();
+        let init_id = self
+            .provider_session
+            .as_codex_arc()
+            .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?
+            .lock()
+            .await
+            .next_request_id();
         let init_req = serde_json::json!({
             "method": "initialize",
             "id": init_id,
@@ -802,15 +828,32 @@ impl AgentClientSession {
         });
         ws.send_text(&init_notify.to_string()).await?;
 
-        let codex = self.codex_session_mut()?;
+        let arc = self
+            .provider_session
+            .as_codex_arc()
+            .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+        let mut codex = arc.lock().await;
         codex.ws = Some(ws);
 
         // 3. 如果有保存的 thread_id，尝试恢复线程
         if let Some(thread_id) = codex.thread_id.clone() {
-            let req_id = self.next_codex_request_id();
+            let req_id = self
+                .provider_session
+                .as_codex_arc()
+                .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?
+                .lock()
+                .await
+                .next_request_id();
             {
-                let codex = self.codex_session_mut()?;
-                let ws = codex.ws.as_mut().unwrap();
+                let arc = self
+                    .provider_session
+                    .as_codex_arc()
+                    .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+                let mut codex = arc.lock().await;
+                let ws = codex
+                    .ws
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Codex WebSocket not connected"))?;
                 let req = serde_json::json!({
                     "method": "thread/resume",
                     "id": req_id,
@@ -823,11 +866,22 @@ impl AgentClientSession {
                     codex.thread_id = None;
                 }
             }
-            let codex = self.codex_session_mut()?;
+            let arc = self
+                .provider_session
+                .as_codex_arc()
+                .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+            let codex = arc.lock().await;
             if codex.thread_id.is_some() {
                 let res = {
-                    let codex = self.codex_session_mut()?;
-                    let ws = codex.ws.as_mut().unwrap();
+                    let arc = self
+                        .provider_session
+                        .as_codex_arc()
+                        .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+                    let mut codex = arc.lock().await;
+                    let ws = codex
+                        .ws
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("Codex WebSocket not connected"))?;
                     match Self::recv_codex_jsonrpc_response(ws).await {
                         Ok(res) => res,
                         Err(e) => {
@@ -837,7 +891,11 @@ impl AgentClientSession {
                         }
                     }
                 };
-                let codex = self.codex_session_mut()?;
+                let arc = self
+                    .provider_session
+                    .as_codex_arc()
+                    .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+                let mut codex = arc.lock().await;
                 if res.get("error").is_some() {
                     eprintln!(
                         "WARN: Codex thread/resume failed: {}, will create new thread",
@@ -851,19 +909,40 @@ impl AgentClientSession {
     }
 
     /// 接收 Codex WebSocket 上的 JSON-RPC 响应（静态方法，避免借用冲突）
+    ///
+    /// 根据 Codex 协议，服务端可能在响应前发送通知。此方法会：
+    /// 1. 优先返回带 id 的 JSON-RPC 响应
+    /// 2. 如果遇到 error 通知（如认证失败），立即返回错误
+    /// 3. 忽略其他普通通知（如 thread/started）
     async fn recv_codex_jsonrpc_response(
         ws: &mut crate::Websocket,
     ) -> anyhow::Result<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            match ws.recv().await? {
-                crate::WsFrame::Text(text) => {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, ws.recv()).await {
+                Ok(Ok(crate::WsFrame::Text(text))) => {
                     let val: serde_json::Value = serde_json::from_str(&text)?;
-                    // 忽略通知，只返回响应（有 id 字段的）
+                    // 有 id 字段的是响应，直接返回
                     if val.get("id").is_some() {
                         return Ok(val);
                     }
+                    // 没有 id 但有 error 字段的是错误通知，立即报错
+                    if val.get("error").is_some() {
+                        return Err(anyhow::anyhow!(
+                            "Codex server sent error notification: {}",
+                            val["error"]
+                        ));
+                    }
+                    // 其他通知（如 thread/started）忽略，继续等待响应
                 }
-                crate::WsFrame::Binary(_) => {}
+                Ok(Ok(crate::WsFrame::Binary(_))) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "Timeout waiting for Codex JSON-RPC response"
+                    ))
+                }
             }
         }
     }
@@ -872,16 +951,21 @@ impl AgentClientSession {
     async fn recv_codex_notification(
         ws: &mut crate::Websocket,
     ) -> anyhow::Result<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            match ws.recv().await? {
-                crate::WsFrame::Text(text) => {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, ws.recv()).await {
+                Ok(Ok(crate::WsFrame::Text(text))) => {
                     let val: serde_json::Value = serde_json::from_str(&text)?;
-                    // 通知没有 id 字段，或者 method 字段存在
-                    if val.get("method").is_some() {
+                    // 通知没有 id 字段，但有 method 字段
+                    // 注意：error 通知也可能没有 id，需要处理
+                    if val.get("method").is_some() || val.get("error").is_some() {
                         return Ok(val);
                     }
                 }
-                crate::WsFrame::Binary(_) => {}
+                Ok(Ok(crate::WsFrame::Binary(_))) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(anyhow::anyhow!("Timeout waiting for Codex notification")),
             }
         }
     }
@@ -890,10 +974,23 @@ impl AgentClientSession {
     async fn list_models_codex(&mut self) -> anyhow::Result<Vec<ModelInfo>> {
         self.ensure_codex_connected().await?;
 
-        let req_id = self.next_codex_request_id();
+        let req_id = self
+            .provider_session
+            .as_codex_arc()
+            .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?
+            .lock()
+            .await
+            .next_request_id();
         {
-            let codex = self.codex_session_mut()?;
-            let ws = codex.ws.as_mut().unwrap();
+            let arc = self
+                .provider_session
+                .as_codex_arc()
+                .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+            let mut codex = arc.lock().await;
+            let ws = codex
+                .ws
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Codex WebSocket not connected"))?;
             let req = serde_json::json!({
                 "method": "model/list",
                 "id": req_id,
@@ -903,8 +1000,15 @@ impl AgentClientSession {
         }
 
         let res = {
-            let codex = self.codex_session_mut()?;
-            let ws = codex.ws.as_mut().unwrap();
+            let arc = self
+                .provider_session
+                .as_codex_arc()
+                .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+            let mut codex = arc.lock().await;
+            let ws = codex
+                .ws
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Codex WebSocket not connected"))?;
             Self::recv_codex_jsonrpc_response(ws).await?
         };
         if let Some(error) = res.get("error") {
@@ -928,15 +1032,26 @@ impl AgentClientSession {
         Ok(models)
     }
 
-    /// Codex provider: 发送消息并获取完整响应
-    async fn chat_codex(&mut self) -> anyhow::Result<String> {
+    /// 准备 Codex turn：确保连接、创建 thread（如需要）、发送 turn/start
+    /// 返回确认 turn 已启动，此时 WebSocket 上即将开始流式通知
+    async fn prepare_codex_turn(&mut self) -> anyhow::Result<()> {
         self.ensure_codex_connected().await?;
 
         // 如果没有 thread，先创建一个
-        let codex = self.codex_session_mut()?;
+        let arc = self
+            .provider_session
+            .as_codex_arc()
+            .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+        let codex = arc.lock().await;
         if codex.thread_id.is_none() {
             let (model, model_provider) = self.parse_codex_model();
-            let req_id = self.next_codex_request_id();
+            let req_id = self
+                .provider_session
+                .as_codex_arc()
+                .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?
+                .lock()
+                .await
+                .next_request_id();
 
             let mut thread_params = serde_json::json!({
                 "ephemeral": true
@@ -952,8 +1067,15 @@ impl AgentClientSession {
             }
 
             {
-                let codex = self.codex_session_mut()?;
-                let ws = codex.ws.as_mut().unwrap();
+                let arc = self
+                    .provider_session
+                    .as_codex_arc()
+                    .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+                let mut codex = arc.lock().await;
+                let ws = codex
+                    .ws
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Codex WebSocket not connected"))?;
                 let req = serde_json::json!({
                     "method": "thread/start",
                     "id": req_id,
@@ -963,15 +1085,26 @@ impl AgentClientSession {
             }
 
             let res = {
-                let codex = self.codex_session_mut()?;
-                let ws = codex.ws.as_mut().unwrap();
+                let arc = self
+                    .provider_session
+                    .as_codex_arc()
+                    .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+                let mut codex = arc.lock().await;
+                let ws = codex
+                    .ws
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Codex WebSocket not connected"))?;
                 Self::recv_codex_jsonrpc_response(ws).await?
             };
             if let Some(error) = res.get("error") {
                 return Err(anyhow::anyhow!("Codex thread/start failed: {}", error));
             }
 
-            let codex = self.codex_session_mut()?;
+            let arc = self
+                .provider_session
+                .as_codex_arc()
+                .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+            let mut codex = arc.lock().await;
             codex.thread_id = Some(
                 res["result"]["thread"]["id"]
                     .as_str()
@@ -983,8 +1116,16 @@ impl AgentClientSession {
         }
 
         let thread_id = {
-            let codex = self.codex_session_mut()?;
-            codex.thread_id.as_ref().unwrap().clone()
+            let arc = self
+                .provider_session
+                .as_codex_arc()
+                .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+            let codex = arc.lock().await;
+            codex
+                .thread_id
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Codex thread not created"))?
+                .clone()
         };
 
         // 构建输入：如果有历史消息（除了最后一条），将历史作为上下文附加
@@ -1003,18 +1144,38 @@ impl AgentClientSession {
                     }
                 }
             }
-            let last_msg = self.messages.last().unwrap();
+            let last_msg = self
+                .messages
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("No message to send"))?;
             context.push_str(&format!("[用户]\n{}\n", last_msg.content));
             context
         } else {
-            self.messages.last().unwrap().content.clone()
+            self.messages
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("No message to send"))?
+                .content
+                .clone()
         };
 
-        let req_id = self.next_codex_request_id();
+        let req_id = self
+            .provider_session
+            .as_codex_arc()
+            .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?
+            .lock()
+            .await
+            .next_request_id();
         let cwd = self.working_directory.clone();
         {
-            let codex = self.codex_session_mut()?;
-            let ws = codex.ws.as_mut().unwrap();
+            let arc = self
+                .provider_session
+                .as_codex_arc()
+                .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+            let mut codex = arc.lock().await;
+            let ws = codex
+                .ws
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Codex WebSocket not connected"))?;
             let mut turn_params = serde_json::json!({
                 "threadId": thread_id,
                 "input": [
@@ -1038,13 +1199,27 @@ impl AgentClientSession {
 
         // 等待 turn/start 响应
         let turn_res = {
-            let codex = self.codex_session_mut()?;
-            let ws = codex.ws.as_mut().unwrap();
+            let arc = self
+                .provider_session
+                .as_codex_arc()
+                .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+            let mut codex = arc.lock().await;
+            let ws = codex
+                .ws
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Codex WebSocket not connected"))?;
             Self::recv_codex_jsonrpc_response(ws).await?
         };
         if let Some(error) = turn_res.get("error") {
             return Err(anyhow::anyhow!("Codex turn/start failed: {}", error));
         }
+
+        Ok(())
+    }
+
+    /// Codex provider: 发送消息并获取完整响应
+    async fn chat_codex(&mut self) -> anyhow::Result<String> {
+        self.prepare_codex_turn().await?;
 
         // 收集流式响应
         let mut agent_text = String::new();
@@ -1052,8 +1227,15 @@ impl AgentClientSession {
 
         while !turn_completed {
             let notification = {
-                let codex = self.codex_session_mut()?;
-                let ws = codex.ws.as_mut().unwrap();
+                let arc = self
+                    .provider_session
+                    .as_codex_arc()
+                    .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+                let mut codex = arc.lock().await;
+                let ws = codex
+                    .ws
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Codex WebSocket not connected"))?;
                 Self::recv_codex_notification(ws).await?
             };
             let method = notification["method"].as_str().unwrap_or("");
@@ -1090,6 +1272,118 @@ impl AgentClientSession {
         Ok(agent_text)
     }
 
+    /// Codex provider: 发送消息并获取流式响应
+    async fn chat_stream_codex(
+        &mut self,
+    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<StreamChunk>> {
+        self.prepare_codex_turn().await?;
+
+        // 克隆 Arc，供后台任务共享访问
+        let codex_arc = self
+            .provider_session
+            .as_codex_arc()
+            .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(64);
+        let messages =
+            std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut self.messages)));
+
+        // 启动后台任务监听 WebSocket 通知并实时转发
+        tokio::spawn(async move {
+            let mut assistant_content = String::new();
+            let mut turn_completed = false;
+            let mut error_occurred = false;
+
+            while !turn_completed {
+                let mut codex = codex_arc.lock().await;
+                let ws = match codex.ws.as_mut() {
+                    Some(ws) => ws,
+                    None => {
+                        error_occurred = true;
+                        break;
+                    }
+                };
+                match Self::recv_codex_notification(ws).await {
+                    Ok(notification) => {
+                        let method = notification["method"].as_str().unwrap_or("");
+                        match method {
+                            "item/agentMessage/delta" => {
+                                if let Some(delta) = notification["params"]["delta"].as_str() {
+                                    assistant_content.push_str(delta);
+                                    // 实时更新历史记录
+                                    if let Ok(mut msgs) = messages.lock() {
+                                        if msgs
+                                            .last()
+                                            .map_or(false, |m| m.role == MessageRole::Assistant)
+                                        {
+                                            if let Some(last) = msgs.last_mut() {
+                                                last.content = assistant_content.clone();
+                                            }
+                                        } else {
+                                            msgs.push(ChatMessage::new(
+                                                MessageRole::Assistant,
+                                                assistant_content.clone(),
+                                            ));
+                                        }
+                                    }
+                                    if tx
+                                        .send(StreamChunk::Content(delta.to_string()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        // 接收端已关闭，提前结束
+                                        turn_completed = true;
+                                    }
+                                }
+                            }
+                            "turn/completed" => {
+                                turn_completed = true;
+                            }
+                            "item/completed" => {}
+                            "turn/started" | "item/started" | "thread/started" => {}
+                            "error" => {
+                                let _ = tx
+                                    .send(StreamChunk::Content(format!(
+                                        "\n[Codex error: {}]",
+                                        notification["params"]
+                                    )))
+                                    .await;
+                                error_occurred = true;
+                                turn_completed = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(StreamChunk::Content(format!(
+                                "\n[Codex WebSocket error: {}]",
+                                e
+                            )))
+                            .await;
+                        error_occurred = true;
+                        turn_completed = true;
+                    }
+                }
+            }
+
+            // 流结束时确保历史记录中已存在 Assistant 消息
+            if !error_occurred {
+                if let Ok(mut msgs) = messages.lock() {
+                    if msgs
+                        .last()
+                        .map_or(true, |m| m.role != MessageRole::Assistant)
+                    {
+                        msgs.push(ChatMessage::new(MessageRole::Assistant, assistant_content));
+                    }
+                }
+            }
+            let _ = tx.send(StreamChunk::Done).await;
+        });
+
+        Ok(rx)
+    }
+
     /// 解析 Codex 的 model 配置字符串
     /// 格式: "providerID:modelID" 或纯 "modelID"
     /// 返回 (model, model_provider)
@@ -1108,6 +1402,9 @@ impl AgentClientSession {
     }
 
     /// 发送消息并获取流式响应
+    ///
+    /// 流式响应过程中，助手回复会实时追加到历史记录的最后一项中，
+    /// 每收到新数据即更新历史记录并转发给调用方。
     pub async fn chat_stream(
         &mut self,
         message: impl Into<String>,
@@ -1134,6 +1431,11 @@ impl AgentClientSession {
             return Ok(rx);
         }
 
+        // Codex provider 使用 WebSocket JSON-RPC 协议，需要特殊处理
+        if self.provider == LlmProvider::Codex {
+            return self.chat_stream_codex().await;
+        }
+
         let (url, body, headers) = self.build_request(true)?;
         let mut args = Vec::new();
         for (k, v) in headers {
@@ -1152,25 +1454,26 @@ impl AgentClientSession {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(64);
         let provider = self.provider.clone();
+        let messages =
+            std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut self.messages)));
 
         // 启动后台任务解析流式响应
         tokio::spawn(async move {
             let mut stream = res.body.stream_data();
             let mut buffer = String::new();
+            let mut assistant_content = String::new();
             while let Some(chunk) = stream.next().await {
                 let text = String::from_utf8_lossy(&chunk);
                 buffer.push_str(&text);
+                let mut contents = Vec::new();
                 match provider {
                     LlmProvider::OpenAI => {
                         while let Some(pos) = buffer.find("\n\n") {
                             let event = buffer[..pos].to_string();
                             buffer = buffer[pos + 2..].to_string();
                             if let Some(content) = Self::parse_openai_sse_chunk(&event) {
-                                if content.is_empty() {
-                                    continue;
-                                }
-                                if tx.send(StreamChunk::Content(content)).await.is_err() {
-                                    return;
+                                if !content.is_empty() {
+                                    contents.push(content);
                                 }
                             }
                         }
@@ -1180,11 +1483,8 @@ impl AgentClientSession {
                             let event = buffer[..pos].to_string();
                             buffer = buffer[pos + 2..].to_string();
                             if let Some(content) = Self::parse_anthropic_sse_chunk(&event) {
-                                if content.is_empty() {
-                                    continue;
-                                }
-                                if tx.send(StreamChunk::Content(content)).await.is_err() {
-                                    return;
+                                if !content.is_empty() {
+                                    contents.push(content);
                                 }
                             }
                         }
@@ -1194,11 +1494,8 @@ impl AgentClientSession {
                             let line = buffer[..pos].to_string();
                             buffer = buffer[pos + 1..].to_string();
                             if let Some(content) = Self::parse_ollama_ndjson_chunk(&line) {
-                                if content.is_empty() {
-                                    continue;
-                                }
-                                if tx.send(StreamChunk::Content(content)).await.is_err() {
-                                    return;
+                                if !content.is_empty() {
+                                    contents.push(content);
                                 }
                             }
                         }
@@ -1209,6 +1506,37 @@ impl AgentClientSession {
                     LlmProvider::Codex => {
                         // 不会走到这里，Codex 使用 WebSocket 协议
                     }
+                }
+                for content in contents {
+                    assistant_content.push_str(&content);
+                    // 更新历史记录最后一项（Assistant 消息）
+                    if let Ok(mut msgs) = messages.lock() {
+                        if msgs
+                            .last()
+                            .map_or(false, |m| m.role == MessageRole::Assistant)
+                        {
+                            if let Some(last) = msgs.last_mut() {
+                                last.content = assistant_content.clone();
+                            }
+                        } else {
+                            msgs.push(ChatMessage::new(
+                                MessageRole::Assistant,
+                                assistant_content.clone(),
+                            ));
+                        }
+                    }
+                    if tx.send(StreamChunk::Content(content)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            // 流结束时确保历史记录中已存在 Assistant 消息
+            if let Ok(mut msgs) = messages.lock() {
+                if msgs
+                    .last()
+                    .map_or(true, |m| m.role != MessageRole::Assistant)
+                {
+                    msgs.push(ChatMessage::new(MessageRole::Assistant, assistant_content));
                 }
             }
             let _ = tx.send(StreamChunk::Done).await;
@@ -1306,8 +1634,12 @@ impl AgentClientSession {
             opencode.session_id = opencode_session_id;
             opencode.parent_id = opencode_parent_id;
         }
-        if let ProviderSession::Codex(ref mut codex) = provider_session {
+        // Codex 的 thread_id 在创建时设置（deserialize 是同步函数，无法 await lock）
+        if provider == LlmProvider::Codex {
+            let mut codex = CodexSession::new();
             codex.thread_id = codex_thread_id;
+            provider_session =
+                ProviderSession::Codex(std::sync::Arc::new(tokio::sync::Mutex::new(codex)));
         }
 
         Ok(Self {

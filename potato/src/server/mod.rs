@@ -1361,7 +1361,6 @@ impl PipeContext {
                                 let etag = {
                                     use std::collections::hash_map::DefaultHasher;
                                     use std::hash::{Hash, Hasher};
-                                    let data: Vec<u8> = data;
                                     let mut hasher = DefaultHasher::new();
                                     data.hash(&mut hasher);
                                     let content_hash = hasher.finish();
