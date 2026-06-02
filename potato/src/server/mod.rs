@@ -1597,13 +1597,13 @@ impl HttpServer {
         self.pipe_ctx = Arc::new(ctx);
     }
 
-    pub fn shutdown_signal(&mut self) -> Option<oneshot::Sender<()>> {
+    pub fn shutdown_signal(&mut self) -> anyhow::Result<oneshot::Sender<()>> {
         if self.shutdown_signal.is_some() {
-            return None; // Signal already set
+            anyhow::bail!("signal already set");
         }
         let (tx, rx) = oneshot::channel();
         self.shutdown_signal = Some(rx);
-        Some(tx)
+        Ok(tx)
     }
 
     pub async fn serve_http(&mut self) -> anyhow::Result<()> {

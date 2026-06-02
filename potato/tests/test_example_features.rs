@@ -472,9 +472,7 @@ mod tests {
         }
 
         // 设置关闭信号
-        if let Some(tx) = server.shutdown_signal() {
-            *SHUTDOWN_SIGNAL.lock().await = Some(tx);
-        }
+        *SHUTDOWN_SIGNAL.lock().await = Some(server.shutdown_signal()?);
 
         let server_handle = tokio::spawn(async move {
             let _ = server.serve_http().await;

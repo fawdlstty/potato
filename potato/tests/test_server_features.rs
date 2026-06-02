@@ -401,8 +401,8 @@ mod tests {
         // 第二次获取应该返回 None
         let second_signal = server.shutdown_signal();
         assert!(
-            second_signal.is_none(),
-            "Second shutdown signal should return None"
+            second_signal.is_err(),
+            "Second shutdown signal should return failed"
         );
 
         println!("✅ Shutdown signal correctly allows only one acquisition");
@@ -728,9 +728,7 @@ mod tests {
         stream.read_to_end(&mut response).await?;
         let response_text = String::from_utf8_lossy(&response);
         assert!(response_text.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(
-            response_text.contains("conflicting headers: Transfer-Encoding and Content-Length")
-        );
+        assert!(response_text.contains("conflicting headers: Transfer-Encoding and Content-Length"));
 
         server_handle.abort();
         Ok(())
