@@ -8,19 +8,9 @@ default = []
 websocket = ["dep:sha1"]
 
 [dependencies]
-embassy-executor = { version = "0.10.0", features = [
-    "platform-std",
-    "executor-thread",
-] }
-embassy-net = { version = "0.6", default-features = false, features = [
-    "tcp",
-    "dns",
-    "proto-ipv4",
-    "medium-ip",
-] }
+embassy-executor = { version = "0.10.0", features = ["platform-std", "executor-thread"] }
+embassy-net = { version = "0.6", default-features = false, features = ["tcp", "dns", "proto-ipv4", "medium-ip"] }
 embassy-time = { version = "0.4", default-features = false }
 httparse = { version = "1", default-features = false }
-potato-macro = { version = "0.3.15", path = "../potato-macro", features = [
-    "lite",
-] }
+potato-macro-lite = { version = "0.1.0", path = "../potato-macro-lite" }
 sha1 = { version = "0.10", optional = true, default-features = false }

@@ -13,7 +13,6 @@ readme = "../README.md"
 
 [features]
 default = []
-lite = []
 
 [dependencies]
 inventory = "0.3.15"

@@ -1,0 +1,15 @@
+[package]
+name = "potato-macro-lite"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Lite proc-macro for potato-lite (no_std embedded HTTP)"
+
+[dependencies]
+proc-macro2 = "1.0.103"
+quote = "1.0.42"
+syn = { version = "2.0.114", features = ["full"] }
+
+[lib]
+proc-macro = true

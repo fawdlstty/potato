@@ -12,7 +12,7 @@ pub mod websocket;
 pub use websocket::*;
 
 pub use crate::server::*;
-pub use potato_macro::*;
+pub use potato_macro_lite::*;
 
 use alloc::string::String;
 use alloc::vec::Vec;
