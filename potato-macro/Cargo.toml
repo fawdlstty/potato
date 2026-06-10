@@ -11,6 +11,10 @@ keywords = ["http", "web"]
 categories = []
 readme = "../README.md"
 
+[features]
+default = []
+lite = []
+
 [dependencies]
 inventory = "0.3.15"
 proc-macro2 = "1.0.103"

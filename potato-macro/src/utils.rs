@@ -16,7 +16,11 @@ impl StringExt for String {
             .replace("potato::HttpRequest", "HttpRequest")
             .replace("potato::HttpResponse", "HttpResponse")
             .replace("potato::SessionCache", "SessionCache")
-            .replace("potato::OnceCache", "OnceCache");
+            .replace("potato::OnceCache", "OnceCache")
+            .replace("potato_lite::HttpRequest", "HttpRequest")
+            .replace("potato_lite::HttpResponse", "HttpResponse")
+            .replace("potato_lite::SessionCache", "SessionCache")
+            .replace("potato_lite::OnceCache", "OnceCache");
         match ret.is_empty() {
             true => "()".to_string(),
             false => ret,
