@@ -832,11 +832,14 @@ impl AgentClientSession {
             .provider_session
             .as_codex_arc()
             .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
-        let mut codex = arc.lock().await;
-        codex.ws = Some(ws);
+        let saved_thread_id = {
+            let mut codex = arc.lock().await;
+            codex.ws = Some(ws);
+            codex.thread_id.clone()
+        };
 
         // 3. 如果有保存的 thread_id，尝试恢复线程
-        if let Some(thread_id) = codex.thread_id.clone() {
+        if let Some(thread_id) = saved_thread_id {
             let req_id = self
                 .provider_session
                 .as_codex_arc()
@@ -844,6 +847,7 @@ impl AgentClientSession {
                 .lock()
                 .await
                 .next_request_id();
+            let mut resume_sent = false;
             {
                 let arc = self
                     .provider_session
@@ -864,14 +868,11 @@ impl AgentClientSession {
                 if let Err(e) = ws.send_text(&req.to_string()).await {
                     eprintln!("WARN: Failed to send thread/resume: {}", e);
                     codex.thread_id = None;
+                } else {
+                    resume_sent = true;
                 }
             }
-            let arc = self
-                .provider_session
-                .as_codex_arc()
-                .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
-            let codex = arc.lock().await;
-            if codex.thread_id.is_some() {
+            if resume_sent {
                 let res = {
                     let arc = self
                         .provider_session
@@ -1042,8 +1043,11 @@ impl AgentClientSession {
             .provider_session
             .as_codex_arc()
             .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
-        let codex = arc.lock().await;
-        if codex.thread_id.is_none() {
+        let has_thread = {
+            let codex = arc.lock().await;
+            codex.thread_id.is_some()
+        };
+        if !has_thread {
             let (model, model_provider) = self.parse_codex_model();
             let req_id = self
                 .provider_session
