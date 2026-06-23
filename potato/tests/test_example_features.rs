@@ -13,6 +13,7 @@ fn get_test_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDateTime;
     use potato::{Headers, HttpRequest, HttpResponse, HttpServer, Session, Websocket, WsFrame};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{LazyLock, Mutex};
@@ -124,6 +125,72 @@ mod tests {
 
         server_handle.abort();
         println!("✅ Handler args test completed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handler_datetime_args_server() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let server_addr = format!("127.0.0.1:{port}");
+
+        let mut server = HttpServer::new(&server_addr);
+        server.configure(|ctx| {
+            ctx.use_handlers();
+        });
+
+        #[potato::http_get("/datetime")]
+        async fn datetime_args(
+            temp: i64,
+            start_time: Option<NaiveDateTime>,
+            end_time: Option<NaiveDateTime>,
+        ) -> HttpResponse {
+            let start = start_time
+                .map(|v| v.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let end = end_time
+                .map(|v| v.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "none".to_string());
+            HttpResponse::text(format!("temp={temp};start={start};end={end}"))
+        }
+
+        #[potato::http_get("/plain")]
+        async fn plain_args(temp: i64, count: i64) -> HttpResponse {
+            HttpResponse::text(format!("temp={temp};count={count}"))
+        }
+
+        let server_handle = tokio::spawn(async move {
+            server.serve_http().await
+        });
+
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            !server_handle.is_finished(),
+            "datetime args test server exited early"
+        );
+
+        let plain_url = format!("http://{server_addr}/plain?temp=7&count=9");
+        let plain_res = potato::get(&plain_url, vec![]).await?;
+        let plain_body = match &plain_res.body {
+            potato::HttpResponseBody::Data(data) => String::from_utf8(data.clone()).unwrap(),
+            potato::HttpResponseBody::Stream(_) => String::new(),
+        };
+        assert_eq!(plain_res.http_code, 200);
+        assert!(plain_body.contains("temp=7;count=9"));
+
+        let url = format!(
+            "http://{server_addr}/datetime?temp=7&start_time=2025-05-21+08%3A03%3A01&end_time=2025-05-29+12%3A00%3A00"
+        );
+        let res = potato::get(&url, vec![]).await?;
+        let body = match &res.body {
+            potato::HttpResponseBody::Data(data) => String::from_utf8(data.clone()).unwrap(),
+            potato::HttpResponseBody::Stream(_) => String::new(),
+        };
+        assert_eq!(res.http_code, 200);
+        assert!(body.contains("temp=7"));
+        assert!(body.contains("start=2025-05-21 08:03:01"));
+        assert!(body.contains("end=2025-05-29 12:00:00"));
+
+        server_handle.abort();
         Ok(())
     }
 

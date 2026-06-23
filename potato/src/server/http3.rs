@@ -412,7 +412,7 @@ pub async fn serve_http3_impl(
                             req.url_query = query
                                 .split('&')
                                 .map(|s| s.split_once('=').unwrap_or((s, "")))
-                                .map(|(a, b)| (a.into(), b.into()))
+                                .map(|(a, b)| (a.url_decode().into(), b.url_decode().into()))
                                 .collect();
                         }
                         None => {
@@ -641,7 +641,7 @@ pub async fn serve_http3_without_encrypt_impl(
                             req.url_query = query
                                 .split('&')
                                 .map(|s| s.split_once('=').unwrap_or((s, "")))
-                                .map(|(a, b)| (a.into(), b.into()))
+                                .map(|(a, b)| (a.url_decode().into(), b.url_decode().into()))
                                 .collect();
                         }
                         None => {

@@ -741,6 +741,7 @@ impl PipeContext {
                         if let Some(args) = args.as_array() {
                             for arg in args.iter() {
                                 let arg_name = arg["name"].as_str().unwrap_or("");
+                                let arg_required = arg["required"].as_bool().unwrap_or(true);
                                 let arg_type = {
                                     let arg_type = arg["type"].as_str().unwrap_or("");
                                     match arg_type.starts_with('i') || arg_type.starts_with('u') {
@@ -749,7 +750,11 @@ impl PipeContext {
                                         false => "string",
                                     }
                                 };
-                                arg_pairs.push((arg_name.to_string(), arg_type.to_string()));
+                                arg_pairs.push((
+                                    arg_name.to_string(),
+                                    arg_type.to_string(),
+                                    arg_required,
+                                ));
                             }
                         }
                     }
@@ -758,12 +763,12 @@ impl PipeContext {
                 if !arg_pairs.is_empty() {
                     if flag.method == HttpMethod::GET {
                         let mut parameters = vec![];
-                        for (arg_name, arg_type) in arg_pairs.iter() {
+                        for (arg_name, arg_type, arg_required) in arg_pairs.iter() {
                             parameters.push(serde_json::json!({
                                 "name": arg_name,
                                 "in": "query",
                                 "description": "",
-                                "required": true,
+                                "required": arg_required,
                                 "schema": { "type": arg_type },
                             }));
                         }
@@ -771,14 +776,16 @@ impl PipeContext {
                     } else {
                         let mut properties = serde_json::json!({});
                         let mut required = vec![];
-                        for (arg_name, arg_type) in arg_pairs.iter() {
+                        for (arg_name, arg_type, arg_required) in arg_pairs.iter() {
                             properties[arg_name] = match arg_type == "file" {
                                 true => {
                                     serde_json::json!({ "type": "string", "format": "binary" })
                                 }
                                 false => serde_json::json!({ "type": arg_type }),
                             };
-                            required.push(arg_name);
+                            if *arg_required {
+                                required.push(arg_name);
+                            }
                         }
                         // TODO add file
                         root_cur_path["requestBody"]["content"] = serde_json::json!({
@@ -1765,12 +1772,12 @@ impl HttpServer {
                     match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
                         Ok((req, n)) => (req, n),
                         Err(err) => {
-                            if let Some(mut res) = HttpRequest::parse_error_response(&err) {
-                                let mut stream_guard = stream.lock().await;
-                                let _ = res
-                                    .write_to_stream(&mut stream_guard, CompressMode::None, None)
-                                    .await;
-                            }
+                            let mut res = HttpResponse::bad_request(err.to_string());
+                            res.add_header("Connection".into(), "close".into());
+                            let mut stream_guard = stream.lock().await;
+                            let _ = res
+                                .write_to_stream(&mut stream_guard, CompressMode::None, None)
+                                .await;
                             break;
                         }
                     }

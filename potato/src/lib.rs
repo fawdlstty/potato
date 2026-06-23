@@ -39,7 +39,6 @@ use sha1::{Digest, Sha1};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::fmt;
 use std::fs::{File, Metadata};
 use std::io::Read;
 use std::net::SocketAddr;
@@ -624,29 +623,6 @@ pub enum PreflightResult {
     PreconditionFailed,
 }
 
-#[derive(Debug)]
-pub enum HttpRequestParseError {
-    BadRequest(String),
-    NotImplemented(String),
-    ExpectationFailed(String),
-    RequestHeaderFieldsTooLarge(String),
-    PayloadTooLarge(String),
-}
-
-impl fmt::Display for HttpRequestParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HttpRequestParseError::BadRequest(msg) => write!(f, "{msg}"),
-            HttpRequestParseError::NotImplemented(msg) => write!(f, "{msg}"),
-            HttpRequestParseError::ExpectationFailed(msg) => write!(f, "{msg}"),
-            HttpRequestParseError::RequestHeaderFieldsTooLarge(msg) => write!(f, "{msg}"),
-            HttpRequestParseError::PayloadTooLarge(msg) => write!(f, "{msg}"),
-        }
-    }
-}
-
-impl std::error::Error for HttpRequestParseError {}
-
 fn parse_declared_trailer_names(raw: Option<&str>) -> HashSet<String> {
     raw.map(|value| {
         value
@@ -1180,61 +1156,15 @@ impl Default for HttpRequest {
 }
 
 impl HttpRequest {
-    fn bad_request(msg: impl Into<String>) -> anyhow::Error {
-        anyhow::Error::new(HttpRequestParseError::BadRequest(msg.into()))
-    }
-
-    fn expectation_failed(msg: impl Into<String>) -> anyhow::Error {
-        anyhow::Error::new(HttpRequestParseError::ExpectationFailed(msg.into()))
-    }
-
-    fn not_implemented(msg: impl Into<String>) -> anyhow::Error {
-        anyhow::Error::new(HttpRequestParseError::NotImplemented(msg.into()))
-    }
-
-    fn request_header_fields_too_large(msg: impl Into<String>) -> anyhow::Error {
-        anyhow::Error::new(HttpRequestParseError::RequestHeaderFieldsTooLarge(
-            msg.into(),
-        ))
-    }
-
-    pub fn bad_request_message(err: &anyhow::Error) -> Option<&str> {
-        err.downcast_ref::<HttpRequestParseError>()
-            .and_then(|parse_err| match parse_err {
-                HttpRequestParseError::BadRequest(msg) => Some(msg.as_str()),
-                HttpRequestParseError::NotImplemented(_) => None,
-                HttpRequestParseError::ExpectationFailed(_) => None,
-                HttpRequestParseError::RequestHeaderFieldsTooLarge(_) => None,
-                HttpRequestParseError::PayloadTooLarge(_) => None,
-            })
-    }
-
-    pub fn parse_error_response(err: &anyhow::Error) -> Option<HttpResponse> {
-        err.downcast_ref::<HttpRequestParseError>()
-            .map(|parse_err| {
-                let (status, msg) = match parse_err {
-                    HttpRequestParseError::BadRequest(msg) => (400, msg.as_str()),
-                    HttpRequestParseError::NotImplemented(msg) => (501, msg.as_str()),
-                    HttpRequestParseError::ExpectationFailed(msg) => (417, msg.as_str()),
-                    HttpRequestParseError::RequestHeaderFieldsTooLarge(msg) => (431, msg.as_str()),
-                    HttpRequestParseError::PayloadTooLarge(msg) => (413, msg.as_str()),
-                };
-                let mut res = HttpResponse::text(msg.to_string());
-                res.http_code = status;
-                res.add_header("Connection".into(), "close".into());
-                res
-            })
-    }
-
     fn ensure_header_section_size(buf: &[u8], max_header_bytes: usize) -> anyhow::Result<()> {
         let header_len = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
             Some(pos) => pos + 4,
             None => buf.len(),
         };
         if header_len > max_header_bytes {
-            Err(Self::request_header_fields_too_large(format!(
+            anyhow::bail!(
                 "request headers too large: {header_len} bytes exceeds {max_header_bytes} bytes"
-            )))?;
+            );
         }
         Ok(())
     }
@@ -1248,22 +1178,18 @@ impl HttpRequest {
             return Ok(());
         };
         if self.version < 11 {
-            Err(Self::expectation_failed(
-                "Expect header is not supported for HTTP versions below 1.1",
-            ))?;
+            anyhow::bail!("Expect header is not supported for HTTP versions below 1.1");
         }
         let mut has_100_continue = false;
         for token in expect.split(',').map(|token| token.trim()) {
             if token.is_empty() {
-                Err(Self::expectation_failed("empty Expect header"))?;
+                anyhow::bail!("empty Expect header");
             }
             if token.eq_ignore_ascii_case("100-continue") {
                 has_100_continue = true;
                 continue;
             }
-            Err(Self::expectation_failed(format!(
-                "unsupported Expect header: {token}"
-            )))?;
+            anyhow::bail!("unsupported Expect header: {token}");
         }
         if has_100_continue && has_request_body {
             stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
@@ -1325,7 +1251,7 @@ impl HttpRequest {
                 self.url_query = target[p + 1..]
                     .split('&')
                     .map(|s| s.split_once('=').unwrap_or((s, "")))
-                    .map(|(a, b)| (LocalHipStr::from(a), LocalHipStr::from(b)))
+                    .map(|(a, b)| (LocalHipStr::from(a.url_decode()), LocalHipStr::from(b.url_decode())))
                     .collect();
             }
             None => {
@@ -1361,9 +1287,7 @@ impl HttpRequest {
     fn parse_request_target(&mut self, target: &str) -> anyhow::Result<()> {
         if target == "*" {
             if self.method != HttpMethod::OPTIONS {
-                Err(Self::bad_request(
-                    "asterisk-form request-target requires OPTIONS",
-                ))?;
+                anyhow::bail!("asterisk-form request-target requires OPTIONS");
             }
             self.target_form = HttpRequestTargetForm::Asterisk;
             self.url_query.clear();
@@ -1373,9 +1297,7 @@ impl HttpRequest {
 
         if target.starts_with('/') {
             if self.method == HttpMethod::CONNECT {
-                Err(Self::bad_request(
-                    "CONNECT requires authority-form request-target",
-                ))?;
+                anyhow::bail!("CONNECT requires authority-form request-target");
             }
             self.target_form = HttpRequestTargetForm::Origin;
             self.parse_path_and_query(target);
@@ -1384,17 +1306,13 @@ impl HttpRequest {
 
         if target.contains("://") {
             if self.method == HttpMethod::CONNECT {
-                Err(Self::bad_request(
-                    "CONNECT requires authority-form, absolute-form is invalid",
-                ))?;
+                anyhow::bail!("CONNECT requires authority-form, absolute-form is invalid");
             }
             let uri = target
                 .parse::<Uri>()
-                .map_err(|_| Self::bad_request("invalid absolute-form request-target"))?;
+                .map_err(|_| anyhow!("invalid absolute-form request-target"))?;
             if uri.scheme().is_none() || uri.authority().is_none() {
-                Err(Self::bad_request(
-                    "absolute-form request-target must include scheme and authority",
-                ))?;
+                anyhow::bail!("absolute-form request-target must include scheme and authority");
             }
             self.target_form = HttpRequestTargetForm::Absolute;
             let path_and_query = uri.path_and_query().map(|v| v.as_str()).unwrap_or("/");
@@ -1404,9 +1322,7 @@ impl HttpRequest {
 
         if http::uri::Authority::from_str(target).is_ok() {
             if self.method != HttpMethod::CONNECT {
-                Err(Self::bad_request(
-                    "authority-form request-target is only valid for CONNECT",
-                ))?;
+                anyhow::bail!("authority-form request-target is only valid for CONNECT");
             }
             self.target_form = HttpRequestTargetForm::Authority;
             self.url_query.clear();
@@ -1414,7 +1330,7 @@ impl HttpRequest {
             return Ok(());
         }
 
-        Err(Self::bad_request("unsupported request-target form"))
+        anyhow::bail!("unsupported request-target form")
     }
 
     pub fn get_uri(&self, is_https: bool) -> anyhow::Result<http::Uri> {
@@ -1625,14 +1541,12 @@ impl HttpRequest {
             .filter(|part| !part.is_empty())
             .collect();
         if codings.is_empty() {
-            Err(Self::bad_request("empty Transfer-Encoding header"))?
+            anyhow::bail!("empty Transfer-Encoding header");
         }
         if codings.len() == 1 && codings[0] == "chunked" {
             return Ok(true);
         }
-        Err(Self::not_implemented(format!(
-            "unsupported Transfer-Encoding: {raw_val}"
-        )))
+        anyhow::bail!("unsupported Transfer-Encoding: {raw_val}")
     }
 
     async fn read_chunked_body(
@@ -1809,15 +1723,10 @@ impl HttpRequest {
         let mut content_length = 0usize;
         if has_chunked_transfer_encoding {
             if req.get_header_key(HeaderItem::Content_Length).is_some() {
-                Err(Self::bad_request(
-                    "conflicting headers: Transfer-Encoding and Content-Length",
-                ))?;
+                anyhow::bail!("conflicting headers: Transfer-Encoding and Content-Length");
             }
         } else {
-            content_length = req
-                .parse_header_content_length()
-                .map_err(|err| Self::bad_request(err.to_string()))?
-                .unwrap_or(0);
+            content_length = req.parse_header_content_length()?.unwrap_or(0);
         }
 
         let has_request_body = has_chunked_transfer_encoding || content_length > 0;
@@ -1828,9 +1737,7 @@ impl HttpRequest {
             let allowed_trailers =
                 parse_declared_trailer_names(req.get_header_key(HeaderItem::Trailer));
             let (body, trailers, consumed_len) =
-                Self::read_chunked_body(buf, stream, hdr_len, &allowed_trailers)
-                    .await
-                    .map_err(|err| Self::bad_request(err.to_string()))?;
+                Self::read_chunked_body(buf, stream, hdr_len, &allowed_trailers).await?;
             req.body = body;
             req.trailers = trailers;
             bdy_len = consumed_len;
@@ -1949,9 +1856,9 @@ impl HttpRequest {
                 Ok(httparse::Status::Complete(n)) => n,
                 Ok(httparse::Status::Partial) => return Ok(None),
                 Err(httparse::Error::TooManyHeaders) => {
-                    Err(Self::request_header_fields_too_large(format!(
+                    anyhow::bail!(
                         "too many request headers: exceeds configured limit {max_header_count}"
-                    )))?
+                    )
                 }
                 Err(err) => Err(anyhow!(err))?,
             };
@@ -1959,9 +1866,9 @@ impl HttpRequest {
         };
         let parsed_header_count = rreq.headers.iter().filter(|h| !h.name.is_empty()).count();
         if parsed_header_count > max_header_count {
-            Err(Self::request_header_fields_too_large(format!(
+            anyhow::bail!(
                 "too many request headers: {parsed_header_count} exceeds {max_header_count}"
-            )))?;
+            );
         }
         let mut req = HttpRequest::new();
         let mut content_length_seen: Option<String> = None;
@@ -1988,9 +1895,7 @@ impl HttpRequest {
                 7 if method == "CONNECT" => HttpMethod::CONNECT,
                 8 if method == "PROPFIND" => HttpMethod::PROPFIND,
                 9 if method == "PROPPATCH" => HttpMethod::PROPPATCH,
-                _ => Err(Self::not_implemented(format!(
-                    "unsupported method: {method}"
-                )))?,
+                _ => anyhow::bail!("unsupported method: {method}"),
             }
         };
         let target = rreq
@@ -2020,13 +1925,13 @@ impl HttpRequest {
             if h.name.eq_ignore_ascii_case("Host") {
                 host_header_count += 1;
                 if host_header_count > 1 {
-                    Err(Self::bad_request("multiple Host headers are not allowed"))?;
+                    anyhow::bail!("multiple Host headers are not allowed");
                 }
                 if normalized_header_value.is_empty() {
-                    Err(Self::bad_request("empty Host header"))?;
+                    anyhow::bail!("empty Host header");
                 }
                 if http::uri::Authority::from_str(normalized_header_value).is_err() {
-                    Err(Self::bad_request("invalid Host header"))?;
+                    anyhow::bail!("invalid Host header");
                 }
                 has_valid_host = true;
             }
@@ -2052,7 +1957,7 @@ impl HttpRequest {
             }
         }
         if req.version >= 11 && !has_valid_host {
-            Err(Self::bad_request("missing required Host header"))?;
+            anyhow::bail!("missing required Host header");
         }
         Ok(Some((req, n)))
     }
@@ -2434,6 +2339,12 @@ impl HttpResponse {
         ret
     }
 
+    pub fn bad_request(payload: impl Into<String>) -> Self {
+        let mut ret = Self::html(payload);
+        ret.http_code = 400;
+        ret
+    }
+
     pub fn empty() -> Self {
         Self::html("")
     }
@@ -2512,6 +2423,7 @@ impl HttpResponse {
                 Some("js") => "application/javascript",
                 Some("json") => "application/json",
                 Some("pdf") => "application/pdf",
+                Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 Some("xml") => "application/xml",
                 _ if path.ends_with('/') => "text/html",
                 _ => "application/octet-stream",
@@ -3129,7 +3041,7 @@ mod tests {
     }
 
     #[test]
-    fn request_parser_returns_431_for_too_many_headers() {
+    fn request_parser_rejects_too_many_headers() {
         let mut raw = String::from("GET / HTTP/1.1\r\nHost: example.com\r\n");
         for i in 0..64 {
             raw.push_str(&format!("X-Header-{i}: value\r\n"));
@@ -3137,18 +3049,16 @@ mod tests {
         raw.push_str("\r\n");
 
         let err = HttpRequest::from_headers_part(raw.as_bytes()).unwrap_err();
-        let res = HttpRequest::parse_error_response(&err).unwrap();
-        assert_eq!(res.http_code, 431);
+        assert!(err.to_string().contains("too many request headers"));
     }
 
     #[test]
-    fn request_parser_returns_431_for_oversized_header_section() {
+    fn request_parser_rejects_oversized_header_section() {
         let oversized = "a".repeat(20 * 1024);
         let raw = format!("GET / HTTP/1.1\r\nHost: example.com\r\nX-Large: {oversized}\r\n\r\n");
 
         let err = HttpRequest::from_headers_part(raw.as_bytes()).unwrap_err();
-        let res = HttpRequest::parse_error_response(&err).unwrap();
-        assert_eq!(res.http_code, 431);
+        assert!(err.to_string().contains("request headers too large"));
     }
 
     #[test]

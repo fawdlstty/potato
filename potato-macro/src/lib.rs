@@ -97,19 +97,29 @@ static ARG_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 
 /// Controller 字段类型
 /// 验证 Controller 结构体字段
-fn validate_controller_struct(item_struct: &syn::ItemStruct) -> (bool, bool) {
+fn validate_controller_struct(
+    item_struct: &syn::ItemStruct,
+) -> (bool, bool, Vec<syn::Ident>, Vec<syn::Ident>) {
     let mut has_once_cache = false;
     let mut has_session_cache = false;
+    let mut once_cache_fields = Vec::new();
+    let mut session_cache_fields = Vec::new();
 
     if let syn::Fields::Named(fields_named) = &item_struct.fields {
         for field in &fields_named.named {
+            let field_ident = field
+                .ident
+                .clone()
+                .expect("named controller fields must have an identifier");
             let field_type_str = field.ty.to_token_stream().to_string().type_simplify();
 
             // 验证类型必须是 &OnceCache 或 &SessionCache（支持生命周期参数）
             if field_type_str.contains("OnceCache") {
                 has_once_cache = true;
+                once_cache_fields.push(field_ident);
             } else if field_type_str.contains("SessionCache") {
                 has_session_cache = true;
+                session_cache_fields.push(field_ident);
             } else {
                 panic!(
                     "Controller field must be &OnceCache or &SessionCache, got: {}",
@@ -119,7 +129,12 @@ fn validate_controller_struct(item_struct: &syn::ItemStruct) -> (bool, bool) {
         }
     }
 
-    (has_once_cache, has_session_cache)
+    (
+        has_once_cache,
+        has_session_cache,
+        once_cache_fields,
+        session_cache_fields,
+    )
 }
 
 /// 解析 header 标注的 tokens，返回 (key, value)
@@ -166,6 +181,13 @@ fn attr_last_ident(attr: &syn::Attribute) -> Option<String> {
         .iter()
         .last()
         .map(|segment| segment.ident.to_string())
+}
+
+fn parse_arg_name_attr(attr: &syn::Attribute) -> Option<String> {
+    if attr_last_ident(attr).as_deref() != Some("name") {
+        return None;
+    }
+    attr.parse_args::<syn::LitStr>().ok().map(|lit| lit.value())
 }
 
 fn parse_hook_attr_items(attr: &syn::Attribute, attr_name: &str) -> Vec<Ident> {
@@ -1031,6 +1053,11 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 .to_string()
                 .type_simplify();
             let arg_name_str = arg.pat.to_token_stream().to_string();
+            let arg_query_name = arg
+                .attrs
+                .iter()
+                .find_map(parse_arg_name_attr)
+                .unwrap_or_else(|| arg_name_str.clone());
             let arg_value = match &arg_type_str[..] {
                 "& mut HttpRequest" => quote! { req },
                 "& mut OnceCache" => {
@@ -1042,24 +1069,66 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 "PostFile" => {
                     doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
                     quote! {
-                        match req.body_files.get(&potato::utils::refstr::LocalHipStr<'static>::from_str(#arg_name_str)).cloned() {
+                        match req.body_files.get(&potato::utils::refstr::LocalHipStr<'static>::from_str(#arg_query_name)).cloned() {
                             Some(file) => file,
-                            None => return potato::HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
+                            None => return potato::HttpResponse::bad_request(format!("miss arg: {}", #arg_query_name)),
+                        }
+                    }
+                }
+                "chrono::NaiveDateTime" | "NaiveDateTime" => {
+                    doc_args.push(json!({ "name": arg_query_name, "type": arg_type_str, "required": true }));
+                    quote! {
+                        {
+                            let __potato_raw = match req.body_pairs
+                                .get(&potato::hipstr::LocalHipStr::from(#arg_query_name))
+                                .map(|p| p.to_string()) {
+                                Some(val) => val,
+                                None => match req.url_query
+                                    .get(&potato::hipstr::LocalHipStr::from(#arg_query_name))
+                                    .map(|p| p.as_str().to_string()) {
+                                    Some(val) => val,
+                                    None => return potato::HttpResponse::bad_request(format!("miss arg: {}", #arg_query_name)),
+                                },
+                            };
+                            match chrono::NaiveDateTime::parse_from_str(&__potato_raw, "%Y-%m-%d %H:%M:%S") {
+                                Ok(val) => val,
+                                Err(_) => return potato::HttpResponse::bad_request(format!("arg[{}] is not {} type", #arg_query_name, #arg_type_str)),
+                            }
+                        }
+                    }
+                }
+                "Option<chrono::NaiveDateTime>" | "Option<NaiveDateTime>" => {
+                    doc_args.push(json!({ "name": arg_query_name, "type": arg_type_str, "required": false }));
+                    quote! {
+                        match req.body_pairs
+                            .get(&potato::hipstr::LocalHipStr::from(#arg_query_name))
+                            .map(|p| p.to_string())
+                            .or_else(|| req.url_query
+                                .get(&potato::hipstr::LocalHipStr::from(#arg_query_name))
+                                .map(|p| p.as_str().to_string()))
+                        {
+                            Some(val) if !val.is_empty() => {
+                                match chrono::NaiveDateTime::parse_from_str(&val, "%Y-%m-%d %H:%M:%S") {
+                                    Ok(val) => Some(val),
+                                    Err(_) => return potato::HttpResponse::bad_request(format!("arg[{}] is not {} type", #arg_query_name, #arg_type_str)),
+                                }
+                            }
+                            Some(_) | None => None,
                         }
                     }
                 }
                 arg_type_str if ARG_TYPES.contains(arg_type_str) => {
-                    doc_args.push(json!({ "name": arg_name_str, "type": arg_type_str }));
+                    doc_args.push(json!({ "name": arg_query_name, "type": arg_type_str, "required": true }));
                     let mut arg_value = quote! {
                         match req.body_pairs
-                            .get(&potato::hipstr::LocalHipStr::from(#arg_name_str))
+                            .get(&potato::hipstr::LocalHipStr::from(#arg_query_name))
                             .map(|p| p.to_string()) {
                             Some(val) => val,
                             None => match req.url_query
-                                .get(&potato::hipstr::LocalHipStr::from(#arg_name_str))
+                                .get(&potato::hipstr::LocalHipStr::from(#arg_query_name))
                                 .map(|p| p.as_str().to_string()) {
                                 Some(val) => val,
-                                None => return potato::HttpResponse::error(format!("miss arg: {}", #arg_name_str)),
+                                None => return potato::HttpResponse::bad_request(format!("miss arg: {}", #arg_query_name)),
                             },
                         }
                     };
@@ -1067,7 +1136,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         arg_value = quote! {
                             match #arg_value.parse() {
                                 Ok(val) => val,
-                                Err(err) => return potato::HttpResponse::error(format!("arg[{}] is not {} type", #arg_name_str, #arg_type_str)),
+                                Err(err) => return potato::HttpResponse::bad_request(format!("arg[{}] is not {} type", #arg_query_name, #arg_type_str)),
                             }
                         }
                     }
@@ -2021,9 +2090,18 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     // 验证结构体字段并获取字段信息
-    let (has_once_cache, has_session_cache) = validate_controller_struct(&item_struct);
+    let (has_once_cache, has_session_cache, once_cache_fields, session_cache_fields) =
+        validate_controller_struct(&item_struct);
     let struct_name = &item_struct.ident;
     let struct_name_str = struct_name.to_string();
+    let once_cache_inits: Vec<_> = once_cache_fields
+        .iter()
+        .map(|field| quote! { #field: once_cache })
+        .collect();
+    let session_cache_inits: Vec<_> = session_cache_fields
+        .iter()
+        .map(|field| quote! { #field: session_cache })
+        .collect();
 
     // 生成结构体定义、常量和 inventory 提交
     // 同时生成隐藏的 controller 创建辅助函数
@@ -2063,8 +2141,8 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
 
                 // 创建 controller 实例
                 let controller = Self {
-                    once_cache,
-                    sess_cache: session_cache,
+                    #(#once_cache_inits,)*
+                    #(#session_cache_inits,)*
                 };
 
                 Ok(Box::new(controller))
@@ -2085,7 +2163,7 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
 
                 // 创建 controller 实例（不包含 sess_cache 字段）
                 let controller = Self {
-                    once_cache,
+                    #(#once_cache_inits,)*
                 };
 
                 Ok(Box::new(controller))

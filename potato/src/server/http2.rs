@@ -177,7 +177,7 @@ async fn handle_h2_request(
             req.url_query = query
                 .split('&')
                 .map(|s| s.split_once('=').unwrap_or((s, "")))
-                .map(|(a, b)| (a.into(), b.into()))
+                .map(|(a, b)| (a.url_decode().into(), b.url_decode().into()))
                 .collect();
         }
         None => {

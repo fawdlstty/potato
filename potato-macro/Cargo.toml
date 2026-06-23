@@ -1,6 +1,6 @@
 [package]
 name = "potato-macro"
-version = "0.3.21"
+version = "0.3.22"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -15,6 +15,7 @@ readme = "../README.md"
 default = []
 
 [dependencies]
+chrono = "0.4.42"
 inventory = "0.3.15"
 proc-macro2 = "1.0.103"
 quote = "1.0.42"
