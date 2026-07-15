@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 
 pub trait StringExt {
     fn http_std_case(&self) -> String;
+    fn url_encode(&self) -> String;
     fn url_decode(&self) -> String;
     fn starts_with_ignore_ascii_case(&self, other: &str) -> bool;
 }
@@ -20,6 +21,20 @@ impl StringExt for str {
                 upper = false;
             } else {
                 ret.push(ch.to_ascii_lowercase());
+            }
+        }
+        ret
+    }
+
+    fn url_encode(&self) -> String {
+        let mut ret = String::with_capacity(self.len());
+        for b in self.as_bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    ret.push(*b as char)
+                }
+                b' ' => ret.push('+'),
+                _ => ret.push_str(&format!("%{b:02X}")),
             }
         }
         ret
@@ -57,6 +72,10 @@ impl StringExt for str {
 impl StringExt for String {
     fn http_std_case(&self) -> String {
         self[..].http_std_case()
+    }
+
+    fn url_encode(&self) -> String {
+        self[..].url_encode()
     }
 
     fn url_decode(&self) -> String {

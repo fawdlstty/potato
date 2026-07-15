@@ -91,7 +91,7 @@ async fn test_json_value_return_integration() -> anyhow::Result<()> {
     assert_eq!(json["code"], 200);
 
     // 测试 3: 返回 Result<serde_json::Value> - 错误
-    let url = format!("http://{}/result-json-value-error", server_addr);
+    let url = format!("http://{}/result-json-value-error?fail=true", server_addr);
     let res = potato::get(&url, vec![]).await?;
     // 错误应该返回 500
     assert_eq!(res.http_code, 500);

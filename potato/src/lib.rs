@@ -1222,9 +1222,9 @@ impl HttpRequest {
     pub fn query_string(&self) -> String {
         let mut q = "?".to_string();
         for (k, v) in self.url_query.iter() {
-            q.push_str(k);
+            q.push_str(&k.url_encode());
             q.push('=');
-            q.push_str(v);
+            q.push_str(&v.url_encode());
             q.push('&');
         }
         q.pop();
@@ -1345,19 +1345,7 @@ impl HttpRequest {
 
     pub fn get_uri(&self, is_https: bool) -> anyhow::Result<http::Uri> {
         let mut q = self.url_path.to_string();
-        let mut is_first = true;
-        for (k, v) in self.url_query.iter() {
-            match is_first {
-                true => {
-                    is_first = false;
-                    q.push('?');
-                }
-                false => q.push('&'),
-            }
-            q.push_str(k);
-            q.push('=');
-            q.push_str(v);
-        }
+        q.push_str(&self.query_string());
         Ok(http::uri::Builder::new()
             .scheme(if is_https { "https" } else { "http" })
             .path_and_query(q)
@@ -3079,6 +3067,21 @@ mod tests {
         let serialized = String::from_utf8(req.as_bytes()).unwrap();
 
         assert!(serialized.starts_with("GET /search?q=rust HTTP/1.0\r\n"));
+    }
+
+    #[test]
+    fn request_serialization_reencodes_decoded_query() {
+        let (req, _, _) = HttpRequest::from_url(
+            "http://example.com/datetime?start_time=2025-05-21+08%3A03%3A01&token=%2B",
+            HttpMethod::GET,
+        )
+        .unwrap();
+        let serialized = String::from_utf8(req.as_bytes()).unwrap();
+
+        assert!(serialized.starts_with("GET /datetime?"));
+        assert!(serialized.contains("start_time=2025-05-21+08%3A03%3A01"));
+        assert!(serialized.contains("token=%2B"));
+        assert!(serialized.contains(" HTTP/1.1\r\n"));
     }
 
     #[test]

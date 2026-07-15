@@ -301,12 +301,7 @@ impl H3Session {
         };
         let uri_str = format!("https://{}{}", host_with_port, req.url_path);
         let uri: http::Uri = if !req.url_query.is_empty() {
-            let query: Vec<String> = req
-                .url_query
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect();
-            format!("{uri_str}?{}", query.join("&")).parse()?
+            format!("{uri_str}{}", req.query_string()).parse()?
         } else {
             uri_str.parse()?
         };

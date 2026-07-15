@@ -1772,7 +1772,21 @@ impl HttpServer {
                     match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
                         Ok((req, n)) => (req, n),
                         Err(err) => {
-                            let mut res = HttpResponse::bad_request(err.to_string());
+                            let err_msg = err.to_string();
+                            if err_msg.contains("conflicting duplicate Content-Length headers") {
+                                break;
+                            }
+                            let mut res = if err_msg.contains("Expect header") {
+                                let mut res = HttpResponse::html(err_msg);
+                                res.http_code = 417;
+                                res
+                            } else if err_msg.contains("unsupported Transfer-Encoding") {
+                                let mut res = HttpResponse::html(err_msg);
+                                res.http_code = 501;
+                                res
+                            } else {
+                                HttpResponse::bad_request(err_msg)
+                            };
                             res.add_header("Connection".into(), "close".into());
                             let mut stream_guard = stream.lock().await;
                             let _ = res

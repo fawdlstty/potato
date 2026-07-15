@@ -171,12 +171,7 @@ impl H2Session {
         // 构建 HTTP/2 请求
         let uri_str = format!("https://{}{}", sess_impl.unique_host.0, req.url_path);
         let uri: http::Uri = if !req.url_query.is_empty() {
-            let query: Vec<String> = req
-                .url_query
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect();
-            format!("{uri_str}?{}", query.join("&")).parse()?
+            format!("{uri_str}{}", req.query_string()).parse()?
         } else {
             uri_str.parse()?
         };
