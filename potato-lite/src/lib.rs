@@ -1,8 +1,12 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
+#[cfg(feature = "std")]
 pub mod client;
+#[cfg(feature = "std")]
 pub mod server;
 
 #[cfg(feature = "websocket")]
@@ -11,12 +15,37 @@ pub mod websocket;
 #[cfg(feature = "websocket")]
 pub use websocket::*;
 
+#[cfg(feature = "std")]
 pub use crate::server::*;
+
+#[cfg(feature = "std")]
+pub use agnostic_net::tokio::TcpStream as TcpSocket;
+
+/// 兼容旧调用签名的上下文占位类型。
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stack;
+
+#[cfg(feature = "std")]
+impl Stack {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
 pub use potato_macro_lite::*;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
+use linkme::distributed_slice;
+
+#[cfg(not(feature = "std"))]
+pub type RuntimeInstant =
+    <agnostic_lite::embassy::EmbassyRuntime as agnostic_lite::LocalRuntimeLite>::Instant;
+#[cfg(feature = "std")]
+pub type RuntimeInstant =
+    <agnostic_lite::tokio::TokioRuntime as agnostic_lite::LocalRuntimeLite>::Instant;
 
 // ---------------------------------------------------------------------------
 // HttpMethod
@@ -303,6 +332,22 @@ fn is_leap(year: u64) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Handler registry (distributed slice via linkme, compile-time registration)
+// ---------------------------------------------------------------------------
+
+/// A registered route handler entry
+pub struct RouteHandler {
+    pub method: &'static str,
+    pub path: &'static str,
+    pub handler: fn(&mut HttpRequest) -> Option<HttpResponse>,
+}
+
+/// Distributed slice collecting all route handlers registered via `#[http_*]` macros.
+/// Elements are gathered by the linker at compile time — no runtime registration needed.
+#[distributed_slice]
+pub static ROUTE_HANDLERS: [RouteHandler];
+
+// ---------------------------------------------------------------------------
 // get! macro
 // ---------------------------------------------------------------------------
 
@@ -312,6 +357,7 @@ fn is_leap(year: u64) -> bool {
 /// ```ignore
 /// let res = potato_lite::get!(stack, "http://192.168.1.1/api").await;
 /// ```
+#[cfg(feature = "std")]
 #[macro_export]
 macro_rules! get {
     ($stack:expr, $url:expr $(,)?) => {
@@ -332,7 +378,7 @@ macro_rules! get {
 /// let mut ws = potato_lite::websocket!(stack, "ws://192.168.1.1/ws", &mut rx, &mut tx).await?;
 /// ws.send_text("hello").await?;
 /// ```
-#[cfg(feature = "websocket")]
+#[cfg(all(feature = "std", feature = "websocket"))]
 #[macro_export]
 macro_rules! websocket {
     ($stack:expr, $url:expr, $rx_buf:expr, $tx_buf:expr $(,)?) => {

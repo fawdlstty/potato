@@ -952,7 +952,7 @@ impl AgentClientSession {
     async fn recv_codex_notification(
         ws: &mut crate::Websocket,
     ) -> anyhow::Result<serde_json::Value> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(remaining, ws.recv()).await {

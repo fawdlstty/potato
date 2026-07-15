@@ -1,6 +1,7 @@
 #![cfg(feature = "http3")]
 
 use crate::utils::refstr::HeaderOrHipStr;
+use crate::utils::string::StringExt;
 use crate::{HttpMethod, HttpRequest, HttpRequestTargetForm};
 use anyhow::Result;
 use bytes::Buf;

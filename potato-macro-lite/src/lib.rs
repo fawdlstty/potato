@@ -99,8 +99,12 @@ fn lite_http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str
         }
 
         #[doc(hidden)]
-        pub const #route_info_name: (&str, &str, fn(&mut potato_lite::HttpRequest) -> Option<potato_lite::HttpResponse>) =
-            (#http_method, #route_path_static, #wrap_func_name);
+        #[::linkme::distributed_slice(potato_lite::ROUTE_HANDLERS)]
+        static #route_info_name: potato_lite::RouteHandler = potato_lite::RouteHandler {
+            method: #http_method,
+            path: #route_path_static,
+            handler: #wrap_func_name,
+        };
     };
 
     output.into()

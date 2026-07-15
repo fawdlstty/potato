@@ -1021,7 +1021,12 @@ impl Websocket {
                 },
                 Err(_) => {
                     // 发送 ping 探测连接状态，带超时保护
-                    match tokio::time::timeout(Duration::from_secs(5), self.send_impl(WsFrameImpl::Ping)).await {
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.send_impl(WsFrameImpl::Ping),
+                    )
+                    .await
+                    {
                         Ok(Ok(())) => {
                             ping_failures = 0;
                         }
@@ -1038,7 +1043,7 @@ impl Websocket {
                             ping_failures += 1;
                             if ping_failures >= 3 {
                                 return Err(anyhow::Error::msg(
-                                    "WebSocket ping timed out 3 times, connection appears dead"
+                                    "WebSocket ping timed out 3 times, connection appears dead",
                                 ));
                             }
                         }
@@ -1251,7 +1256,12 @@ impl HttpRequest {
                 self.url_query = target[p + 1..]
                     .split('&')
                     .map(|s| s.split_once('=').unwrap_or((s, "")))
-                    .map(|(a, b)| (LocalHipStr::from(a.url_decode()), LocalHipStr::from(b.url_decode())))
+                    .map(|(a, b)| {
+                        (
+                            LocalHipStr::from(a.url_decode()),
+                            LocalHipStr::from(b.url_decode()),
+                        )
+                    })
                     .collect();
             }
             None => {

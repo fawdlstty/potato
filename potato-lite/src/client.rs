@@ -1,14 +1,12 @@
-use crate::HttpResponse;
+use crate::{HttpResponse, Stack, TcpSocket};
 use alloc::string::String;
 use alloc::vec::Vec;
-use embassy_net::dns::DnsQueryType;
-use embassy_net::tcp::TcpSocket;
-use embassy_net::{IpAddress, IpEndpoint, Ipv4Address, Stack};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 发起 HTTP/1.1 GET 请求
 ///
 /// # 参数
-/// * `stack` - embassy-net 网络栈（`Copy`，按值传入）
+/// * `stack` - agnostic-net 提供的统一网络上下文
 /// * `url`   - 完整 URL，格式: `http://host[:port]/path`
 ///
 /// # 示例
@@ -16,20 +14,16 @@ use embassy_net::{IpAddress, IpEndpoint, Ipv4Address, Stack};
 /// let res = potato_lite::client::get(stack, "http://192.168.1.1/api/data").await?;
 /// // res.http_code, res.body
 /// ```
-pub async fn get(stack: Stack<'_>, url: &str) -> Result<HttpResponse, &'static str> {
+pub async fn get(_stack: Stack, url: &str) -> anyhow::Result<HttpResponse> {
     // 1. 解析 URL
     let (host, port, path) = parse_url(url)?;
 
-    // 2. 解析目标地址
-    let addr = resolve_addr(stack, &host, port).await?;
+    // 2. 创建 TCP socket 并连接
+    let mut socket = <TcpSocket as agnostic_net::TcpStream>::connect((host.as_str(), port))
+        .await
+        .map_err(|e| anyhow::anyhow!("connect failed: {:?}", e))?;
 
-    // 3. 创建 TCP socket 并连接
-    let mut rx_buf = [0u8; 2048];
-    let mut tx_buf = [0u8; 2048];
-    let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-    socket.connect(addr).await.map_err(|_| "connect failed")?;
-
-    // 4. 发送 HTTP GET 请求
+    // 3. 发送 HTTP GET 请求
     let host_header = if port != 80 {
         alloc::format!("{}:{}", host, port)
     } else {
@@ -46,15 +40,15 @@ pub async fn get(stack: Stack<'_>, url: &str) -> Result<HttpResponse, &'static s
         let n = socket
             .write(&req_bytes[written..])
             .await
-            .map_err(|_| "write failed")?;
+            .map_err(|e| anyhow::anyhow!("write failed: {:?}", e))?;
         if n == 0 {
-            return Err("write failed");
+            return Err(anyhow::anyhow!("write failed: connection closed"));
         }
         written += n;
     }
     let _ = socket.flush().await;
 
-    // 5. 读取响应
+    // 4. 读取响应
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
     loop {
@@ -65,7 +59,7 @@ pub async fn get(stack: Stack<'_>, url: &str) -> Result<HttpResponse, &'static s
         }
     }
 
-    // 6. 解析响应
+    // 5. 解析响应
     parse_response(&buf)
 }
 
@@ -74,12 +68,12 @@ pub async fn get(stack: Stack<'_>, url: &str) -> Result<HttpResponse, &'static s
 // ---------------------------------------------------------------------------
 
 /// 解析 URL，返回 (host, port, path)
-fn parse_url(url: &str) -> Result<(String, u16, String), &'static str> {
+fn parse_url(url: &str) -> anyhow::Result<(String, u16, String)> {
     // 去除 http:// 前缀
     let rest = if let Some(stripped) = url.strip_prefix("http://") {
         stripped
     } else {
-        return Err("URL must start with http://");
+        return Err(anyhow::anyhow!("URL must start with http://"));
     };
 
     // 分离 host:port 和 path
@@ -92,55 +86,19 @@ fn parse_url(url: &str) -> Result<(String, u16, String), &'static str> {
     let (host, port) = match authority.rfind(':') {
         Some(pos) => {
             let port_str = &authority[pos + 1..];
-            let port = port_str.parse::<u16>().map_err(|_| "invalid port")?;
+            let port = port_str
+                .parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("invalid port in URL: {}", port_str))?;
             (&authority[..pos], port)
         }
         None => (authority, 80u16),
     };
 
     if host.is_empty() {
-        return Err("empty host");
+        return Err(anyhow::anyhow!("empty host in URL"));
     }
 
     Ok((String::from(host), port, String::from(path)))
-}
-
-/// 将主机名解析为 IpEndpoint
-async fn resolve_addr(stack: Stack<'_>, host: &str, port: u16) -> Result<IpEndpoint, &'static str> {
-    // 尝试直接解析为 IPv4 地址
-    if let Some(addr) = parse_ipv4(host) {
-        return Ok(IpEndpoint::new(IpAddress::Ipv4(addr), port));
-    }
-
-    // DNS 查询
-    let addrs = stack
-        .dns_query(host, DnsQueryType::A)
-        .await
-        .map_err(|_| "DNS query failed")?;
-
-    for addr in addrs {
-        return Ok(IpEndpoint::new(addr, port));
-    }
-
-    Err("no A record found")
-}
-
-/// 解析 IPv4 地址字符串，如 "192.168.1.1"
-fn parse_ipv4(s: &str) -> Option<Ipv4Address> {
-    let mut octets = [0u8; 4];
-    let mut idx = 0;
-    for part in s.split('.') {
-        if idx >= 4 {
-            return None;
-        }
-        octets[idx] = part.parse().ok()?;
-        idx += 1;
-    }
-    if idx == 4 {
-        Some(Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]))
-    } else {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,30 +106,39 @@ fn parse_ipv4(s: &str) -> Option<Ipv4Address> {
 // ---------------------------------------------------------------------------
 
 /// 解析 HTTP 响应字节流
-fn parse_response(data: &[u8]) -> Result<HttpResponse, &'static str> {
+fn parse_response(data: &[u8]) -> anyhow::Result<HttpResponse> {
     if data.is_empty() {
-        return Err("empty response");
+        return Err(anyhow::anyhow!("empty response"));
     }
 
     // 查找头部结束位置
     let header_end = data
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .ok_or("no header end")?;
+        .ok_or_else(|| anyhow::anyhow!("no header end found in response"))?;
 
     let header_bytes = &data[..header_end];
     let body_bytes = &data[header_end + 4..];
 
     // 解析状态行
-    let header_str = core::str::from_utf8(header_bytes).map_err(|_| "invalid UTF-8 in headers")?;
+    let header_str = core::str::from_utf8(header_bytes)
+        .map_err(|_| anyhow::anyhow!("invalid UTF-8 in response headers"))?;
     let mut lines = header_str.split("\r\n");
 
-    let status_line = lines.next().ok_or("no status line")?;
+    let status_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no status line in response"))?;
     // "HTTP/1.1 200 OK"
     let mut parts = status_line.splitn(3, ' ');
-    let _version = parts.next().ok_or("no version")?;
-    let code_str = parts.next().ok_or("no status code")?;
-    let http_code: u16 = code_str.parse().map_err(|_| "invalid status code")?;
+    let _version = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no version in status line"))?;
+    let code_str = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no status code in status line"))?;
+    let http_code: u16 = code_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid status code: {}", code_str))?;
 
     // 解析响应头
     let mut headers = Vec::new();
@@ -203,7 +170,7 @@ fn parse_response(data: &[u8]) -> Result<HttpResponse, &'static str> {
 }
 
 /// 解码 chunked transfer encoding
-fn decode_chunked(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+fn decode_chunked(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut result = Vec::new();
     let mut pos = 0;
 
@@ -212,13 +179,14 @@ fn decode_chunked(data: &[u8]) -> Result<Vec<u8>, &'static str> {
         let line_end = data[pos..]
             .windows(2)
             .position(|w| w == b"\r\n")
-            .ok_or("incomplete chunk")?;
+            .ok_or_else(|| anyhow::anyhow!("incomplete chunk: missing CRLF"))?;
 
         let size_str = core::str::from_utf8(&data[pos..pos + line_end])
-            .map_err(|_| "invalid chunk size")?
+            .map_err(|_| anyhow::anyhow!("invalid UTF-8 in chunk size"))?
             .trim();
 
-        let chunk_size = usize::from_str_radix(size_str, 16).map_err(|_| "invalid chunk size")?;
+        let chunk_size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| anyhow::anyhow!("invalid chunk size: {}", size_str))?;
 
         pos += line_end + 2; // skip past \r\n
 
@@ -227,7 +195,7 @@ fn decode_chunked(data: &[u8]) -> Result<Vec<u8>, &'static str> {
         }
 
         if pos + chunk_size > data.len() {
-            return Err("chunk data truncated");
+            return Err(anyhow::anyhow!("chunk data truncated at position {}", pos));
         }
 
         result.extend_from_slice(&data[pos..pos + chunk_size]);

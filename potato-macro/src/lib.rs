@@ -1076,7 +1076,9 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     }
                 }
                 "chrono::NaiveDateTime" | "NaiveDateTime" => {
-                    doc_args.push(json!({ "name": arg_query_name, "type": arg_type_str, "required": true }));
+                    doc_args.push(
+                        json!({ "name": arg_query_name, "type": arg_type_str, "required": true }),
+                    );
                     quote! {
                         {
                             let __potato_raw = match req.body_pairs
@@ -1098,7 +1100,9 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     }
                 }
                 "Option<chrono::NaiveDateTime>" | "Option<NaiveDateTime>" => {
-                    doc_args.push(json!({ "name": arg_query_name, "type": arg_type_str, "required": false }));
+                    doc_args.push(
+                        json!({ "name": arg_query_name, "type": arg_type_str, "required": false }),
+                    );
                     quote! {
                         match req.body_pairs
                             .get(&potato::hipstr::LocalHipStr::from(#arg_query_name))
@@ -1118,7 +1122,9 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     }
                 }
                 arg_type_str if ARG_TYPES.contains(arg_type_str) => {
-                    doc_args.push(json!({ "name": arg_query_name, "type": arg_type_str, "required": true }));
+                    doc_args.push(
+                        json!({ "name": arg_query_name, "type": arg_type_str, "required": true }),
+                    );
                     let mut arg_value = quote! {
                         match req.body_pairs
                             .get(&potato::hipstr::LocalHipStr::from(#arg_query_name))

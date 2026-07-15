@@ -1,8 +1,8 @@
-use crate::{HttpMethod, HttpRequest, HttpResponse};
+use crate::{HttpMethod, HttpRequest, HttpResponse, Stack, TcpSocket};
+use agnostic_net::tokio::TcpListener as AgnosticTcpListener;
 use alloc::string::String;
 use alloc::vec::Vec;
-use embassy_net::tcp::TcpSocket;
-use embassy_net::Stack;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(feature = "websocket")]
 use alloc::boxed::Box;
@@ -27,7 +27,7 @@ static mut ROUTES: Option<Vec<Route>> = None;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "websocket")]
-type WsHandler = for<'a> fn(&'a mut TcpSocket<'a>) -> Pin<Box<dyn Future<Output = ()> + 'a>>;
+type WsHandler = for<'a> fn(&'a mut TcpSocket) -> Pin<Box<dyn Future<Output = ()> + 'a>>;
 
 #[cfg(feature = "websocket")]
 struct WsRoute {
@@ -68,6 +68,22 @@ impl PipeContext {
                 .as_mut()
                 .unwrap()
                 .push(Route { path, handler });
+        }
+    }
+
+    /// 注册通过 `#[http_*]` 宏声明的所有路由处理器
+    ///
+    /// 路由在编译期由 linker 自动收集（基于 `linkme` 的 distributed_slice）
+    ///
+    /// # 示例
+    /// ```ignore
+    /// server.configure(|ctx| {
+    ///     ctx.use_handlers();
+    /// });
+    /// ```
+    pub fn use_handlers(&mut self) {
+        for route in crate::ROUTE_HANDLERS.iter() {
+            self.use_custom_sync(route.path, route.handler);
         }
     }
 
@@ -117,8 +133,12 @@ impl HttpServer {
     /// 创建新的 HTTP 服务器实例
     ///
     /// # 参数
-    /// * `port` - 监听端口号
-    pub fn new(port: u16) -> Self {
+    /// * `addr` - 监听地址，格式如 `"0.0.0.0:8080"`（与 potato 项目一致）
+    pub fn new(addr: &str) -> Self {
+        let port = addr
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(80);
         Self { port }
     }
 
@@ -148,32 +168,30 @@ impl HttpServer {
 
     /// 启动 HTTP 服务器，接受连接并顺序处理请求
     ///
-    /// 由于嵌入式环境资源有限，采用单任务顺序处理模式。
-    /// `Stack` 是 `Copy` 的，按值传入即可。
-    pub async fn serve(&mut self, stack: Stack<'_>) {
-        let port = self.port;
+    /// 由于资源有限，采用单任务顺序处理模式。
+    pub async fn serve_http(&mut self) {
+        self.serve_with_stack(Stack::new()).await;
+    }
 
-        let mut rx_buf = [0u8; 1024];
-        let mut tx_buf = [0u8; 1024];
-        let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-
-        if socket.accept(port).await.is_err() {
-            return;
-        }
-
+    async fn serve_with_stack(&mut self, _stack: Stack) {
+        let addr = alloc::format!("0.0.0.0:{}", self.port);
+        let listener =
+            match <AgnosticTcpListener as agnostic_net::TcpListener>::bind(addr.as_str()).await {
+                Ok(listener) => listener,
+                Err(_) => return,
+            };
         loop {
-            // 处理当前连接（顺序处理，单任务）
+            let (mut socket, _) =
+                match <AgnosticTcpListener as agnostic_net::TcpListener>::accept(&listener).await {
+                    Ok(accepted) => accepted,
+                    Err(_) => break,
+                };
             let _ = Self::handle_connection(&mut socket).await;
-            // 连接关闭后 socket 回到 Closed 状态，重新 accept
-            socket.abort();
-            if socket.accept(port).await.is_err() {
-                break;
-            }
         }
     }
 
     /// 处理单个 HTTP 连接
-    async fn handle_connection(socket: &mut TcpSocket<'_>) -> Result<(), ()> {
+    async fn handle_connection(socket: &mut TcpSocket) -> anyhow::Result<()> {
         let mut buf = [0u8; 4096];
         let mut pos: usize = 0;
 
@@ -183,11 +201,11 @@ impl HttpServer {
                 break p;
             }
             if pos >= buf.len() {
-                return Err(()); // 头部过大
+                anyhow::bail!("request header too large, exceeds {} bytes", buf.len());
             }
-            let n = socket.read(&mut buf[pos..]).await.map_err(|_| ())?;
+            let n = socket_read(socket, &mut buf[pos..]).await?;
             if n == 0 {
-                return Err(());
+                anyhow::bail!("connection closed before receiving complete header");
             }
             pos += n;
         };
@@ -236,7 +254,7 @@ impl HttpServer {
                         req_headers,
                     )
                 }
-                _ => return Err(()),
+                _ => anyhow::bail!("failed to parse HTTP request header"),
             }
             // raw_req dropped here, buf immutable borrow released
         };
@@ -245,11 +263,11 @@ impl HttpServer {
         let total_needed = hdr_len + content_length;
         while pos < total_needed {
             if pos >= buf.len() {
-                return Err(());
+                anyhow::bail!("request body too large, exceeds {} byte buffer", buf.len());
             }
-            let n = socket.read(&mut buf[pos..]).await.map_err(|_| ())?;
+            let n = socket_read(socket, &mut buf[pos..]).await?;
             if n == 0 {
-                return Err(());
+                anyhow::bail!("connection closed before receiving complete body");
             }
             pos += n;
         }
@@ -281,21 +299,19 @@ impl HttpServer {
                     let upgrade_resp = crate::websocket::build_ws_upgrade_response(&ws_key);
                     let mut written = 0;
                     while written < upgrade_resp.len() {
-                        let n = socket
-                            .write(&upgrade_resp[written..])
-                            .await
-                            .map_err(|_| ())?;
+                        let n = socket_write(socket, &upgrade_resp[written..]).await?;
                         if n == 0 {
-                            return Err(());
+                            anyhow::bail!(
+                                "connection closed while writing WebSocket upgrade response"
+                            );
                         }
                         written += n;
                     }
-                    let _ = socket.flush().await;
+                    socket_flush(socket).await?;
 
                     // Safety: socket 的生命周期由 serve() 管理，长于 handler 的 future。
                     // handler 的 future 在此 await 点完成后才会返回，因此 socket 引用有效。
-                    let socket_ref: &mut TcpSocket<'_> =
-                        unsafe { &mut *(socket as *mut TcpSocket<'_>) };
+                    let socket_ref: &mut TcpSocket = unsafe { &mut *(socket as *mut TcpSocket) };
                     handler(socket_ref).await;
                     return Ok(());
                 }
@@ -309,16 +325,13 @@ impl HttpServer {
         let response_bytes = format_response(&res);
         let mut written = 0;
         while written < response_bytes.len() {
-            let n = socket
-                .write(&response_bytes[written..])
-                .await
-                .map_err(|_| ())?;
+            let n = socket_write(socket, &response_bytes[written..]).await?;
             if n == 0 {
-                return Err(());
+                anyhow::bail!("connection closed while writing response");
             }
             written += n;
         }
-        let _ = socket.flush().await;
+        socket_flush(socket).await?;
 
         Ok(())
     }
@@ -327,6 +340,27 @@ impl HttpServer {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+async fn socket_read(socket: &mut TcpSocket, buf: &mut [u8]) -> anyhow::Result<usize> {
+    socket
+        .read(buf)
+        .await
+        .map_err(|e| anyhow::anyhow!("socket read failed: {:?}", e))
+}
+
+async fn socket_write(socket: &mut TcpSocket, buf: &[u8]) -> anyhow::Result<usize> {
+    socket
+        .write(buf)
+        .await
+        .map_err(|e| anyhow::anyhow!("write response failed: {:?}", e))
+}
+
+async fn socket_flush(socket: &mut TcpSocket) -> anyhow::Result<()> {
+    socket
+        .flush()
+        .await
+        .map_err(|e| anyhow::anyhow!("flush failed: {:?}", e))
+}
 
 /// 在缓冲区中查找 \r\n\r\n 的位置（返回结束位置，即 \r\n\r\n 之后的偏移）
 fn find_header_end(buf: &[u8]) -> Option<usize> {

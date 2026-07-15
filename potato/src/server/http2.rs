@@ -1,6 +1,7 @@
 #![cfg(feature = "http2")]
 
 use crate::utils::refstr::HeaderOrHipStr;
+use crate::utils::string::StringExt;
 use crate::{HttpMethod, HttpRequest, HttpRequestTargetForm};
 use h2::server as h2_server;
 use std::net::SocketAddr;

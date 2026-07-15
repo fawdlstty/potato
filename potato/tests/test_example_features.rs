@@ -158,9 +158,7 @@ mod tests {
             HttpResponse::text(format!("temp={temp};count={count}"))
         }
 
-        let server_handle = tokio::spawn(async move {
-            server.serve_http().await
-        });
+        let server_handle = tokio::spawn(async move { server.serve_http().await });
 
         sleep(Duration::from_millis(300)).await;
         assert!(

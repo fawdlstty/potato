@@ -59,7 +59,10 @@ mod tests {
         let url = format!("http://{}/api/no-auth/data", server_addr);
         match potato::get(&url, vec![]).await {
             Ok(res) => {
-                assert_eq!(res.http_code, 200, "Should return 200 without Authorization header");
+                assert_eq!(
+                    res.http_code, 200,
+                    "Should return 200 without Authorization header"
+                );
                 println!("✅ GET /api/no-auth/data correctly returns 200 without auth");
             }
             Err(e) => {
@@ -71,7 +74,10 @@ mod tests {
         let url = format!("http://{}/api/no-auth/update", server_addr);
         match potato::post(&url, vec![], vec![]).await {
             Ok(res) => {
-                assert_eq!(res.http_code, 200, "Should return 200 without Authorization header");
+                assert_eq!(
+                    res.http_code, 200,
+                    "Should return 200 without Authorization header"
+                );
                 println!("✅ POST /api/no-auth/update correctly returns 200 without auth");
             }
             Err(e) => {
