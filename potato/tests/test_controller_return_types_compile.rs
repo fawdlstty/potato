@@ -1,6 +1,4 @@
 /// Controller 返回类型完整性测试
-use potato::HttpServer;
-
 #[potato::controller]
 pub struct ReturnTypeTestController<'a> {
     pub once_cache: &'a potato::OnceCache,
@@ -79,5 +77,4 @@ impl<'a> ReturnTypeTestController<'a> {
 async fn test_controller_return_types_compile() {
     // 这个测试主要验证所有返回类型都能正确编译
     // 如果编译成功，说明宏处理正确
-    assert!(true);
 }

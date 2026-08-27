@@ -9,7 +9,6 @@ fn test_http_get_json_value_return() {
             "status": "success"
         })
     }
-    assert!(true);
 }
 
 #[test]
@@ -21,7 +20,6 @@ fn test_http_post_json_value_return() {
             "data": "test data"
         })
     }
-    assert!(true);
 }
 
 #[test]
@@ -33,7 +31,6 @@ fn test_http_put_json_value_return() {
             "updated": true
         })
     }
-    assert!(true);
 }
 
 #[test]
@@ -45,7 +42,6 @@ fn test_http_delete_json_value_return() {
             "deleted": true
         })
     }
-    assert!(true);
 }
 
 #[test]
@@ -57,7 +53,6 @@ fn test_http_get_result_json_value_return() {
             "code": 200
         }))
     }
-    assert!(true);
 }
 
 #[test]
@@ -69,7 +64,6 @@ fn test_http_post_result_json_value_return() {
             "result": "success"
         }))
     }
-    assert!(true);
 }
 
 #[test]
@@ -84,7 +78,6 @@ fn test_http_get_result_json_value_error() {
             Err(anyhow::anyhow!("Operation failed"))
         }
     }
-    assert!(true);
 }
 
 #[test]
@@ -97,7 +90,6 @@ fn test_json_value_with_http_request() {
             "message": "Request processed"
         })
     }
-    assert!(true);
 }
 
 #[test]
@@ -112,7 +104,6 @@ fn test_result_json_value_with_http_request() {
             "status": "ok"
         }))
     }
-    assert!(true);
 }
 
 #[test]
@@ -125,7 +116,6 @@ fn test_json_value_with_args() {
             "message": "User created"
         })
     }
-    assert!(true);
 }
 
 #[test]
@@ -145,5 +135,4 @@ fn test_result_json_value_with_args() {
             }))
         }
     }
-    assert!(true);
 }

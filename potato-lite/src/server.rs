@@ -291,7 +291,7 @@ impl HttpServer {
         // 5. 检测 WebSocket 升级请求
         #[cfg(feature = "websocket")]
         if req.is_websocket() {
-            if let Some(ws_key) = req.get_header("Sec-WebSocket-Key").map(|s| String::from(s)) {
+            if let Some(ws_key) = req.get_header("Sec-WebSocket-Key").map(String::from) {
                 // 查找匹配的 WebSocket 路由
                 let handler = match_ws_route(&req.url_path);
                 if let Some(handler) = handler {

@@ -320,7 +320,6 @@ mod integration_tests {
             }
             Err(e) => {
                 println!("Expected connection error: {e}");
-                assert!(true);
             }
         }
 

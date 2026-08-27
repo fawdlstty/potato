@@ -1730,15 +1730,14 @@ impl HttpRequest {
         let has_request_body = has_chunked_transfer_encoding || content_length > 0;
         req.process_expect_header(stream, has_request_body).await?;
 
-        let bdy_len;
-        if has_chunked_transfer_encoding {
+        let bdy_len = if has_chunked_transfer_encoding {
             let allowed_trailers =
                 parse_declared_trailer_names(req.get_header_key(HeaderItem::Trailer));
             let (body, trailers, consumed_len) =
                 Self::read_chunked_body(buf, stream, hdr_len, &allowed_trailers).await?;
             req.body = body;
             req.trailers = trailers;
-            bdy_len = consumed_len;
+            consumed_len
         } else {
             while hdr_len + content_length > buf.len() {
                 let t = stream.read(&mut tmp_buf).await?;
@@ -1750,8 +1749,8 @@ impl HttpRequest {
             if content_length > 0 {
                 req.body = LocalHipByt::from(&buf[hdr_len..hdr_len + content_length]);
             }
-            bdy_len = content_length;
-        }
+            content_length
+        };
 
         // 先获取Content-Type的字符串值，避免借用冲突
         let content_type_str = {

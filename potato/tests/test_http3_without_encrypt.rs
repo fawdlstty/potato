@@ -173,7 +173,6 @@ mod http3_without_encrypt_tests {
         // 并发发送多个请求
         let mut handles = vec![];
         for _i in 0..5 {
-            let port = port;
             let handle = tokio::spawn(async move {
                 let url = format!("http://localhost:{}/http3_test", port);
                 let mut res = potato::client::http3::get(&url, vec![]).await?;

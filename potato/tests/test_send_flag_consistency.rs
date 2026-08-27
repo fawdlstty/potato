@@ -4,7 +4,7 @@
 //! 1. 直接使用http_get等宏，带Send标志
 //! 2. 直接使用http_get等宏，不带Send标志（默认为Send）
 
-use potato::{HttpResponse, HttpServer, OnceCache, SessionCache};
+use potato::{HttpResponse, HttpServer, OnceCache};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -174,6 +174,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::controller]
+        #[allow(dead_code)]
         struct TestController<'a> {
             pub once_cache: &'a OnceCache,
         }
@@ -219,6 +220,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::controller]
+        #[allow(dead_code)]
         struct TestController2<'a> {
             pub once_cache: &'a OnceCache,
         }
@@ -264,6 +266,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::controller]
+        #[allow(dead_code)]
         struct TestController3<'a> {
             pub once_cache: &'a OnceCache,
         }
@@ -309,6 +312,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         #[potato::controller]
+        #[allow(dead_code)]
         struct TestController4<'a> {
             pub once_cache: &'a OnceCache,
         }

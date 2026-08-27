@@ -81,21 +81,30 @@ impl fmt::Display for HttpMethod {
     }
 }
 
+impl core::str::FromStr for HttpMethod {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "GET" => Ok(HttpMethod::GET),
+            "POST" => Ok(HttpMethod::POST),
+            "PUT" => Ok(HttpMethod::PUT),
+            "DELETE" => Ok(HttpMethod::DELETE),
+            "HEAD" => Ok(HttpMethod::HEAD),
+            "OPTIONS" => Ok(HttpMethod::OPTIONS),
+            "PATCH" => Ok(HttpMethod::PATCH),
+            "CONNECT" => Ok(HttpMethod::CONNECT),
+            "TRACE" => Ok(HttpMethod::TRACE),
+            _ => Err(()),
+        }
+    }
+}
+
 impl HttpMethod {
     /// 从字符串解析 HTTP 方法
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "GET" => Some(HttpMethod::GET),
-            "POST" => Some(HttpMethod::POST),
-            "PUT" => Some(HttpMethod::PUT),
-            "DELETE" => Some(HttpMethod::DELETE),
-            "HEAD" => Some(HttpMethod::HEAD),
-            "OPTIONS" => Some(HttpMethod::OPTIONS),
-            "PATCH" => Some(HttpMethod::PATCH),
-            "CONNECT" => Some(HttpMethod::CONNECT),
-            "TRACE" => Some(HttpMethod::TRACE),
-            _ => None,
-        }
+        <Self as core::str::FromStr>::from_str(s).ok()
     }
 }
 
@@ -328,7 +337,7 @@ pub(crate) fn format_http_date(timestamp: u64) -> String {
 
 #[allow(dead_code)]
 fn is_leap(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 // ---------------------------------------------------------------------------

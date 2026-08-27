@@ -58,7 +58,7 @@ where
         if let Some(ext_data) = &self.ext_data {
             ext_data.get(key)
         } else {
-            match self.data.binary_search_by(|probe| probe.0.cmp(&key)) {
+            match self.data.binary_search_by(|probe| probe.0.cmp(key)) {
                 Ok(index) => Some(&self.data[index].1),
                 Err(_) => None,
             }
@@ -69,7 +69,7 @@ where
         if let Some(ext_data) = &mut self.ext_data {
             ext_data.remove(key)
         } else {
-            match self.data.binary_search_by(|probe| probe.0.cmp(&key)) {
+            match self.data.binary_search_by(|probe| probe.0.cmp(key)) {
                 Ok(index) => Some(self.data.remove(index).1),
                 Err(_) => None,
             }

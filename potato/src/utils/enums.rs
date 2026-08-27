@@ -8,6 +8,7 @@ pub enum HttpConnection {
 }
 
 impl HttpConnection {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(val: &str) -> Option<Self> {
         let mut parsed = None;
         for token in val
@@ -18,10 +19,8 @@ impl HttpConnection {
             match token.len() {
                 5 if token.eq_ignore_ascii_case("Close") => return Some(Self::Close),
                 7 if token.eq_ignore_ascii_case("Upgrade") => parsed = Some(Self::Upgrade),
-                10 if token.eq_ignore_ascii_case("Keep-Alive") => {
-                    if parsed.is_none() {
-                        parsed = Some(Self::KeepAlive);
-                    }
+                10 if token.eq_ignore_ascii_case("Keep-Alive") && parsed.is_none() => {
+                    parsed = Some(Self::KeepAlive);
                 }
                 _ => {}
             }
@@ -38,6 +37,7 @@ pub enum HttpContentType<'a> {
 }
 
 impl<'a> HttpContentType<'a> {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(val: &str) -> Option<Self> {
         match val.len() {
             16 if val.eq_ignore_ascii_case("application/json") => Some(Self::ApplicationJson),

@@ -167,10 +167,8 @@ async fn stream_body_to_channel(
         }
     } else {
         // 非 chunked 模式：直接转发已有数据和后续读取的数据
-        if !buf.is_empty() {
-            if tx.send(buf).await.is_err() {
-                return Ok(());
-            }
+        if !buf.is_empty() && tx.send(buf).await.is_err() {
+            return Ok(());
         }
         let mut tmp_buf = [0u8; 8192];
         loop {
@@ -1316,7 +1314,7 @@ impl TransferSession {
                 Some(s) if s.to_lowercase() == "gzip" => {
                     if let HttpResponseBody::Data(ref mut body_data) = res.body {
                         if let Ok(data) = body_data.decompress() {
-                            if let Ok(s) = str::from_utf8(&data) {
+                            if let Ok(s) = std::str::from_utf8(&data) {
                                 if let Some(ref dest_url) = self.dest_url {
                                     let proxy_url = if dest_url.ends_with('/') {
                                         &dest_url[..dest_url.len() - 1]
@@ -1340,7 +1338,7 @@ impl TransferSession {
                 Some(_) => {}
                 None => {
                     if let HttpResponseBody::Data(ref mut body_data) = res.body {
-                        if let Ok(s) = str::from_utf8(body_data) {
+                        if let Ok(s) = std::str::from_utf8(body_data) {
                             if let Some(ref dest_url) = self.dest_url {
                                 let proxy_url = if dest_url.ends_with('/') {
                                     &dest_url[..dest_url.len() - 1]
@@ -1418,10 +1416,8 @@ impl TransferSession {
 
             let use_ssl = req
                 .get_header("X-Forwarded-Proto")
-                .map_or(false, |proto| proto == "https" || proto == "wss")
-                || req
-                    .get_header("X-Forwarded-Proto-Https")
-                    .map_or(false, |_| true)
+                .is_some_and(|proto| proto == "https" || proto == "wss")
+                || req.get_header("X-Forwarded-Proto-Https").is_some()
                 || req.url_path.starts_with("https")
                 || host.contains(".com") && !host.contains("127.") && !host.starts_with("192.")
                 || host.contains("localhost");

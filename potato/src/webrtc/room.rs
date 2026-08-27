@@ -10,16 +10,19 @@ use tokio::sync::Mutex;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::TrackLocalWriter;
 
+pub type TrackLocalHandle = Arc<dyn TrackLocal + Send + Sync>;
+pub type RoomTracks = HashMap<String, Vec<TrackLocalHandle>>;
+pub type RtpForwarderSender = tokio::sync::broadcast::Sender<webrtc::rtp::packet::Packet>;
+pub type RtpForwarders = HashMap<String, Arc<RtpForwarderSender>>;
+
 /// 房间信息
 pub struct Room {
     pub room_id: String,
     pub max_peers: u32,
     pub peers: Arc<Mutex<HashMap<String, Arc<Peer>>>>,
-    pub tracks: Arc<Mutex<HashMap<String, Vec<Arc<dyn TrackLocal + Send + Sync>>>>>,
+    pub tracks: Arc<Mutex<RoomTracks>>,
     // 用于RTP转发: 从发布者到订阅者的转发器
-    pub rtp_forwarders: Arc<
-        Mutex<HashMap<String, Arc<tokio::sync::broadcast::Sender<webrtc::rtp::packet::Packet>>>>,
-    >,
+    pub rtp_forwarders: Arc<Mutex<RtpForwarders>>,
 }
 
 impl Room {
@@ -189,11 +192,7 @@ impl Room {
     }
 
     /// 添加Peer的轨道
-    pub async fn add_tracks(
-        &self,
-        peer_id: &str,
-        tracks: Vec<Arc<dyn TrackLocal + Send + Sync>>,
-    ) -> Result<()> {
+    pub async fn add_tracks(&self, peer_id: &str, tracks: Vec<TrackLocalHandle>) -> Result<()> {
         let mut track_map = self.tracks.lock().await;
         println!("Peer {} 添加了 {} 个轨道", peer_id, tracks.len());
         track_map.insert(peer_id.to_string(), tracks);

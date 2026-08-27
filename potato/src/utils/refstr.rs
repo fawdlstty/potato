@@ -11,6 +11,7 @@ pub enum HeaderOrHipStr {
 }
 
 impl HeaderOrHipStr {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(val: &str) -> Self {
         if let Some(item) = HeaderItem::try_from_str(val) {
             Self::HeaderItem(item)
@@ -27,9 +28,9 @@ impl HeaderOrHipStr {
     }
 }
 
-impl Into<HeaderOrHipStr> for HeaderItem {
-    fn into(self) -> HeaderOrHipStr {
-        HeaderOrHipStr::HeaderItem(self)
+impl From<HeaderItem> for HeaderOrHipStr {
+    fn from(value: HeaderItem) -> HeaderOrHipStr {
+        HeaderOrHipStr::HeaderItem(value)
     }
 }
 
@@ -134,8 +135,8 @@ pub enum HeaderItem {
     X_Frame_Options,
 }
 
-impl Into<HeaderOrHipStr> for &str {
-    fn into(self) -> HeaderOrHipStr {
-        HeaderOrHipStr::from_str(self)
+impl From<&str> for HeaderOrHipStr {
+    fn from(value: &str) -> HeaderOrHipStr {
+        HeaderOrHipStr::from_str(value)
     }
 }

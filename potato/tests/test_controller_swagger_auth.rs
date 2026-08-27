@@ -1,5 +1,5 @@
 /// 测试 Controller Swagger 鉴权标记
-use potato::{HttpRequest, HttpResponse, HttpServer, OnceCache, SessionCache};
+use potato::{HttpRequest, HttpResponse, OnceCache, SessionCache};
 
 #[potato::preprocess]
 fn my_preprocess(_req: &mut HttpRequest) -> anyhow::Result<()> {
@@ -47,11 +47,10 @@ async fn private_handler(cache: &mut SessionCache) -> HttpResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[cfg(feature = "openapi")]
     #[tokio::test]
     async fn test_controller_swagger_auth_marker() {
+        use potato::HttpServer;
         use std::time::Duration;
 
         let port = 18889;

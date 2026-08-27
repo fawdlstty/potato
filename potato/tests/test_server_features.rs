@@ -330,7 +330,7 @@ mod tests {
         println!("✅ Server configuration: handlers disabled");
 
         // 配置选项2: OpenAPI (如果启用)
-        let mut server2 = HttpServer::new(&format!("127.0.0.1:{}", get_test_port()));
+        let mut server2 = HttpServer::new(format!("127.0.0.1:{}", get_test_port()));
         server2.configure(|ctx| {
             ctx.use_handlers();
             // ctx.use_openapi("/doc/"); // 仅在 openapi 特性启用时

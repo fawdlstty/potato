@@ -364,7 +364,7 @@ impl AcmeManager {
                     // 使用ASN1解析证书的not_after字段
                     // CertificateDer内部是DER编码的X.509证书
                     // 我们需要解析ASN1结构来获取过期时间
-                    return Self::parse_cert_expiry(cert).map_or(false, |expiry| {
+                    return Self::parse_cert_expiry(cert).is_some_and(|expiry| {
                         let now = std::time::SystemTime::now();
                         let thirty_days = Duration::from_secs(30 * 24 * 3600);
 

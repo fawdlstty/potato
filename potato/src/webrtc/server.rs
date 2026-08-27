@@ -11,6 +11,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use webrtc::api::APIBuilder;
 
+pub type PeerSenderMap = HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>;
+pub type PeerSenders = Arc<Mutex<PeerSenderMap>>;
+pub type SharedPeerSenders = Arc<tokio::sync::RwLock<Option<PeerSenders>>>;
+
 /// SFU核心结构
 pub struct WebRTCSFU {
     rooms: Arc<Mutex<HashMap<String, Arc<Room>>>>,
@@ -18,15 +22,7 @@ pub struct WebRTCSFU {
     config: WebRTCConfig,
     // 修复问题1：用于发送ICE候选给客户端的通道
     // 使用RwLock允许多个reader同时访问，writer独占访问
-    peer_senders: Arc<
-        tokio::sync::RwLock<
-            Option<
-                Arc<
-                    tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>,
-                >,
-            >,
-        >,
-    >,
+    peer_senders: SharedPeerSenders,
 }
 
 impl WebRTCSFU {
@@ -43,10 +39,7 @@ impl WebRTCSFU {
 
     /// 设置peer发送器映射（用于ICE候选转发）
     /// 修复问题1：这个方法应该在WebSocket连接建立时调用
-    pub fn set_peer_senders(
-        &self,
-        peer_senders: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>>,
-    ) {
+    pub fn set_peer_senders(&self, peer_senders: PeerSenders) {
         // 使用RwLock的write锁来设置
         if let Ok(mut guard) = self.peer_senders.try_write() {
             *guard = Some(peer_senders);
@@ -54,17 +47,7 @@ impl WebRTCSFU {
     }
 
     /// 获取peer_senders的引用
-    pub fn get_peer_senders(
-        &self,
-    ) -> Arc<
-        tokio::sync::RwLock<
-            Option<
-                Arc<
-                    tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>,
-                >,
-            >,
-        >,
-    > {
+    pub fn get_peer_senders(&self) -> SharedPeerSenders {
         self.peer_senders.clone()
     }
 

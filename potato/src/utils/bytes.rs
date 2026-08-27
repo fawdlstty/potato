@@ -10,7 +10,7 @@ impl CompressExt for &[u8] {
     fn compress(&self) -> Result<Vec<u8>, std::io::Error> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(self)?;
-        Ok(encoder.finish()?)
+        encoder.finish()
     }
 
     fn decompress(&self) -> Result<Vec<u8>, std::io::Error> {

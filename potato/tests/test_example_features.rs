@@ -900,12 +900,9 @@ mod tests {
                 println!("✅ WebSocket text message sent");
 
                 // 接收响应
-                match ws.recv().await {
-                    Ok(WsFrame::Text(text)) => {
-                        println!("✅ WebSocket received text: {}", text);
-                        assert_eq!(text, "hello world");
-                    }
-                    _ => {}
+                if let Ok(WsFrame::Text(text)) = ws.recv().await {
+                    println!("✅ WebSocket received text: {}", text);
+                    assert_eq!(text, "hello world");
                 }
 
                 // 测试二进制数据
@@ -914,12 +911,9 @@ mod tests {
                 println!("✅ WebSocket binary sent");
 
                 // 接收二进制响应
-                match ws.recv().await {
-                    Ok(WsFrame::Binary(data)) => {
-                        println!("✅ WebSocket received binary: {:?}", data);
-                        assert_eq!(data, test_data);
-                    }
-                    _ => {}
+                if let Ok(WsFrame::Binary(data)) = ws.recv().await {
+                    println!("✅ WebSocket received binary: {:?}", data);
+                    assert_eq!(data, test_data);
                 }
             }
             Err(e) => {
@@ -1069,7 +1063,7 @@ mod tests {
             "X-Test-Header".to_string(),
             "test-value".to_string(),
         ))];
-        let url = format!("{base_url}");
+        let url = base_url.to_string();
         match potato::get(&url, headers).await {
             Ok(res) => {
                 println!("Custom headers test: status {}", res.http_code);

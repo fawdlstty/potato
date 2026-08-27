@@ -1,5 +1,5 @@
 /// 测试 SessionCache 自动标记为需要鉴权的功能
-use potato::{HttpResponse, HttpServer, SessionCache};
+use potato::{HttpResponse, SessionCache};
 
 // 不使用 SessionCache 的接口 - 不应该标记为需要鉴权
 #[potato::http_get("/api/public")]
@@ -17,11 +17,10 @@ async fn private_handler(cache: &mut SessionCache) -> HttpResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[cfg(feature = "openapi")]
     #[tokio::test]
     async fn test_session_cache_opensapi_auth_marker() {
+        use potato::HttpServer;
         use std::time::Duration;
 
         let port = 18888;
@@ -78,7 +77,7 @@ mod tests {
 
                 let security = &private_path["security"];
                 assert!(
-                    security.as_array().unwrap().len() > 0,
+                    !security.as_array().unwrap().is_empty(),
                     "security array should not be empty"
                 );
 

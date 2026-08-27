@@ -65,7 +65,7 @@ impl StringExt for str {
         if self.len() < other.len() {
             return false;
         }
-        (&self[..other.len()]).eq_ignore_ascii_case(other)
+        self[..other.len()].eq_ignore_ascii_case(other)
     }
 }
 

@@ -72,7 +72,7 @@ impl MediaStreamHandler {
             is_keyframe: self.is_keyframe(&rtp_packet),
         };
 
-        if let Err(_) = self.tx.send(packet).await {
+        if self.tx.send(packet).await.is_err() {
             // 接收端已关闭,忽略错误
         }
         Ok(())
@@ -85,7 +85,7 @@ impl MediaStreamHandler {
             return false;
         }
         // 简化的关键帧检测
-        packet.payload.first().map_or(false, |b| (*b & 0x1F) == 5)
+        packet.payload.first().is_some_and(|b| (*b & 0x1F) == 5)
     }
 }
 
@@ -161,10 +161,16 @@ impl MediaStreamManager {
         let streams = self.streams.read().await;
         if let Some(handler) = streams.get(stream_id) {
             let handler = handler.lock().await;
-            if let Err(_) = handler.tx.send(packet).await {
+            if handler.tx.send(packet).await.is_err() {
                 // 接收端已关闭
             }
         }
         Ok(())
+    }
+}
+
+impl Default for MediaStreamManager {
+    fn default() -> Self {
+        Self::new()
     }
 }

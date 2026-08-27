@@ -19,14 +19,14 @@ pub fn init_jemalloc() -> anyhow::Result<()> {
 
     if let Ok(conf) = std::env::var("MALLOC_CONF") {
         if conf.contains("prof:true") {
-            const PROF_ACTIVE: &'static [u8] = b"prof.active\0";
+            const PROF_ACTIVE: &[u8] = b"prof.active\0";
             let name = PROF_ACTIVE.name();
             match name.write(true) {
                 Ok(()) => {
                     INIT_JEMALLOC.store(false, Ordering::SeqCst);
                     return Ok(());
                 }
-                Err(err) => Err(anyhow!("{}", err.to_string()))?,
+                Err(err) => Err(anyhow!("{err}"))?,
             }
         }
     }
@@ -37,7 +37,7 @@ pub fn init_jemalloc() -> anyhow::Result<()> {
 }
 
 pub async fn dump_jemalloc_profile() -> anyhow::Result<Vec<u8>> {
-    const PROF_DUMP: &'static [u8] = b"prof.dump\0";
+    const PROF_DUMP: &[u8] = b"prof.dump\0";
     let prof_file = format!("/tmp/prof_{}.dump", env!("CARGO_PKG_NAME"));
     let pdf_file = format!("{prof_file}.pdf");
     _ = fs::remove_file(&prof_file).await;
@@ -46,7 +46,7 @@ pub async fn dump_jemalloc_profile() -> anyhow::Result<Vec<u8>> {
     let prof_name_ptr: &'static [u8] = unsafe { std::mem::transmute(prof_name) };
     let name = PROF_DUMP.name();
     if let Err(err) = name.write(prof_name_ptr) {
-        Err(anyhow!("{}", err.to_string()))?;
+        Err(anyhow!("{err}"))?;
     }
     let cur_path = {
         let cur_path = std::env::current_exe()?;

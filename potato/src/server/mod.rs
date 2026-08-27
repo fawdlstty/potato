@@ -175,7 +175,25 @@ pub struct PipeContext {
     items: Vec<PipeContextItem>,
 }
 
+impl Default for PipeContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PipeContext {
+    #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+    pub(crate) fn init_jemalloc_if_configured(&self) -> anyhow::Result<()> {
+        if self
+            .items
+            .iter()
+            .any(|item| matches!(item, PipeContextItem::Jemalloc(_)))
+        {
+            crate::init_jemalloc()?;
+        }
+        Ok(())
+    }
+
     fn sanitize_location_route_path(loc_path: &str, request_suffix: &str) -> Option<PathBuf> {
         let mut path = PathBuf::from(loc_path);
         for component in Path::new(request_suffix).components() {
@@ -310,9 +328,7 @@ impl PipeContext {
         if file_size == 0 {
             return Some(None);
         }
-        let Some(spec) = range_header.strip_prefix("bytes=") else {
-            return None;
-        };
+        let spec = range_header.strip_prefix("bytes=")?;
         if spec.contains(',') {
             return None;
         }
@@ -328,17 +344,11 @@ impl PipeContext {
             if suffix_len == 0 {
                 return Some(None);
             }
-            let start = if suffix_len >= file_size {
-                0
-            } else {
-                file_size - suffix_len
-            };
+            let start = file_size.saturating_sub(suffix_len);
             return Some(Some((start, file_size - 1)));
         }
 
-        let Some((start_str, end_str)) = spec.split_once('-') else {
-            return None;
-        };
+        let (start_str, end_str) = spec.split_once('-')?;
         let Ok(start) = start_str.trim().parse::<u64>() else {
             return None;
         };
@@ -491,7 +501,7 @@ impl PipeContext {
             .push(PipeContextItem::Custom(CustomHandler::Async(Arc::new(
                 move |req| {
                     let fut = callback(req);
-                    Box::pin(async move { fut.await })
+                    Box::pin(fut)
                 },
             ))));
     }
@@ -581,7 +591,7 @@ impl PipeContext {
     /// * `max_body_bytes` - Body 总大小限制 (字节)
     ///
     /// # 示例
-    /// ```rust
+    /// ```rust,no_run
     /// let mut server = potato::HttpServer::new("127.0.0.1:8080");
     /// server.configure(|ctx| {
     ///     ctx.use_limit_size(1024 * 1024, 50 * 1024 * 1024); // 1MB header, 50MB body
@@ -607,7 +617,7 @@ impl PipeContext {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// let mut server = potato::HttpServer::new("127.0.0.1:8080");
     /// server.configure(|ctx| {
     ///     ctx.use_transfer_limit(10_000_000, 20_000_000); // 入站 10 Mbps，出站 20 Mbps
@@ -639,7 +649,7 @@ impl PipeContext {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// let mut server = potato::HttpServer::new("127.0.0.1:8080");
     /// server.configure(|ctx| {
     ///     if let Err(e) = ctx.try_use_transfer_limit(10_000_000, 20_000_000) {
@@ -865,7 +875,7 @@ impl PipeContext {
             Cow::Borrowed(static_bytes)
         });
         //
-        for name in DocAsset::iter().into_iter() {
+        for name in DocAsset::iter() {
             if name == "swagger-initializer.js" {
                 ret.insert(
                     format!("{url_path}{name}"),
@@ -1056,7 +1066,7 @@ impl PipeContext {
                                         options.insert(HttpMethod::HEAD);
                                     }
                                 } else if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
-                                    options.extend(handlers.keys().map(|p| *p));
+                                    options.extend(handlers.keys().copied());
                                     if handlers.contains_key(&HttpMethod::GET) {
                                         options.insert(HttpMethod::HEAD);
                                     }
@@ -1175,8 +1185,7 @@ impl PipeContext {
                     if let Some(item) = embedded_items.get(&req.url_path[..]) {
                         let meta = std::env::current_exe()
                             .ok()
-                            .map(|p| std::fs::metadata(&p).ok())
-                            .flatten();
+                            .and_then(|p| std::fs::metadata(&p).ok());
 
                         // Generate ETag (based on content hash and file size)
                         let etag = {
@@ -1864,7 +1873,7 @@ impl HttpServer {
 
     async fn serve_http_impl(&mut self) -> anyhow::Result<()> {
         #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
-        crate::init_jemalloc()?;
+        self.pipe_ctx.init_jemalloc_if_configured()?;
 
         // 启动后台SessionCache清理任务
         Self::start_session_cache_cleanup();
@@ -1887,7 +1896,7 @@ impl HttpServer {
     #[cfg(feature = "tls")]
     async fn serve_https_impl(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
         #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
-        crate::init_jemalloc()?;
+        self.pipe_ctx.init_jemalloc_if_configured()?;
 
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;
@@ -1916,7 +1925,7 @@ impl HttpServer {
     #[cfg(feature = "acme")]
     async fn serve_acme_impl(&mut self) -> anyhow::Result<()> {
         #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
-        crate::init_jemalloc()?;
+        self.pipe_ctx.init_jemalloc_if_configured()?;
 
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;

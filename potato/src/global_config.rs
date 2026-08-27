@@ -34,7 +34,7 @@ impl ServerConfig {
     }
 
     pub async fn get_ws_ping_duration() -> Duration {
-        SERVER_WS_PING_DURATION.read().await.clone()
+        *SERVER_WS_PING_DURATION.read().await
     }
 
     pub fn set_max_header_count(limit: usize) {

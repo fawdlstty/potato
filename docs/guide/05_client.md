@@ -108,7 +108,7 @@ let mut session = potato::client::TransferSession::from_forward_proxy();
 
 ## Agent 客户端会话
 
-多轮对话 LLM 客户端，支持 OpenAI、Anthropic、Ollama、OpenCode、Codex 等提供商：
+多轮对话 LLM 客户端，支持 OpenAI、Anthropic、Ollama、OpenCode、Codex、ZCode、DSF 等提供商：
 
 ```rust
 // 创建会话

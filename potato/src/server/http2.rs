@@ -19,7 +19,7 @@ pub async fn serve_http2_impl(
     pipe_ctx: Arc<PipeContext>,
 ) -> anyhow::Result<()> {
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
-    crate::init_jemalloc()?;
+    pipe_ctx.init_jemalloc_if_configured()?;
 
     let addr: SocketAddr = addr.parse()?;
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -146,9 +146,9 @@ mod http2_tests {
 
         let mut tls_stream =
             connect_tls_with_alpn(&addr, &cert, vec![b"http/1.1".to_vec()]).await?;
-        let request = format!(
+        let request =
             "GET /http2_https_fallback HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        );
+                .to_string();
         tls_stream.write_all(request.as_bytes()).await?;
 
         let response = read_all_ignore_tls_close_notify(&mut tls_stream).await?;

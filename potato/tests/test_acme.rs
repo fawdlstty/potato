@@ -372,7 +372,7 @@ mod acme_integration_tests {
         use potato::acme::AcmeChallenge;
 
         // 模拟续期前的挑战
-        let old_challenges = vec![
+        let old_challenges = [
             AcmeChallenge {
                 token: "old_token_1".to_string(),
                 key_authorization: "old_key_auth_1".to_string(),
@@ -384,7 +384,7 @@ mod acme_integration_tests {
         ];
 
         // 模拟续期后的新挑战
-        let new_challenges = vec![AcmeChallenge {
+        let new_challenges = [AcmeChallenge {
             token: "new_token_1".to_string(),
             key_authorization: "new_key_auth_1".to_string(),
         }];

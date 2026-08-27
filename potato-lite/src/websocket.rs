@@ -31,22 +31,16 @@ pub trait WebsocketIo {
 impl WebsocketIo for crate::TcpSocket {
     type Error = std::io::Error;
 
-    fn read<'a>(
-        &'a mut self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = Result<usize, Self::Error>> + 'a {
-        async move { tokio::io::AsyncReadExt::read(self, buf).await }
+    async fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Result<usize, Self::Error> {
+        tokio::io::AsyncReadExt::read(self, buf).await
     }
 
-    fn write<'a>(
-        &'a mut self,
-        data: &'a [u8],
-    ) -> impl Future<Output = Result<usize, Self::Error>> + 'a {
-        async move { tokio::io::AsyncWriteExt::write(self, data).await }
+    async fn write<'a>(&'a mut self, data: &'a [u8]) -> Result<usize, Self::Error> {
+        tokio::io::AsyncWriteExt::write(self, data).await
     }
 
-    fn flush(&mut self) -> impl Future<Output = Result<(), Self::Error>> + '_ {
-        async move { tokio::io::AsyncWriteExt::flush(self).await }
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        tokio::io::AsyncWriteExt::flush(self).await
     }
 }
 
@@ -281,7 +275,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 const BASE64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub(crate) fn base64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 2 < data.len() {
         let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);

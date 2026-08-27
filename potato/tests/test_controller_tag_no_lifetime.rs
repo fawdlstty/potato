@@ -1,13 +1,15 @@
 #[cfg(test)]
 mod tests {
-    use potato::{HttpRequest, HttpResponse, HttpServer, SessionCache};
+    use potato::{HttpRequest, SessionCache};
 
     #[potato::preprocess]
+    #[allow(dead_code)]
     fn my_preprocess(_req: &mut HttpRequest) -> anyhow::Result<()> {
         Ok(())
     }
 
     #[potato::controller]
+    #[allow(dead_code)]
     pub struct UsersController<'a> {
         pub once_cache: &'a potato::OnceCache,
         pub sess_cache: &'a SessionCache,
@@ -25,6 +27,7 @@ mod tests {
     #[cfg(feature = "openapi")]
     #[tokio::test]
     async fn test_controller_tag_without_lifetime() {
+        use potato::HttpServer;
         use std::time::Duration;
 
         let port = 18081;

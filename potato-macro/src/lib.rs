@@ -68,10 +68,8 @@ fn parse_cors_attr(tokens: &proc_macro2::TokenStream) -> CorsAttrConfig {
                             _ => {}
                         }
                     }
-                    syn::Lit::Bool(b) => {
-                        if key == "credentials" {
-                            config.credentials = b.value();
-                        }
+                    syn::Lit::Bool(b) if key == "credentials" => {
+                        config.credentials = b.value();
                     }
                     _ => {}
                 }
@@ -179,7 +177,7 @@ fn attr_last_ident(attr: &syn::Attribute) -> Option<String> {
         .path()
         .segments
         .iter()
-        .last()
+        .next_back()
         .map(|segment| segment.ident.to_string())
 }
 
@@ -723,10 +721,10 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 }
                 i += 1;
             } else if let proc_macro2::TokenTree::Ident(ident) = token {
-                if ident.to_string() == "Send" {
+                if ident == "Send" {
                     is_send = true;
                     i += 1;
-                } else if ident.to_string() == "path" {
+                } else if ident == "path" {
                     // 处理 path = "/api/path" 格式
                     if i + 2 < tokens.len() {
                         if let proc_macro2::TokenTree::Punct(punct) = &tokens[i + 1] {
@@ -806,7 +804,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     .path()
                     .segments
                     .iter()
-                    .last()
+                    .next_back()
                     .map(|s| s.ident.to_string())
                     == Some("header".to_string()));
 
@@ -834,7 +832,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     .path()
                     .segments
                     .iter()
-                    .last()
+                    .next_back()
                     .map(|s| s.ident.to_string())
                     == Some("cors".to_string()));
 
@@ -869,7 +867,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     .path()
                     .segments
                     .iter()
-                    .last()
+                    .next_back()
                     .map(|s| s.ident.to_string())
                     == Some("max_concurrency".to_string()));
 
@@ -1164,17 +1162,6 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         .to_string()
         .type_simplify();
 
-    // 如果有 receiver，需要生成 __potato_create_controller 函数
-    // 通过检查是否存在 controller 常量来判断
-    let _controller_create_fn = if has_receiver {
-        quote! {
-            // 这个函数应该由 controller 宏生成，这里只是引用
-            // 如果编译出错，说明没有正确使用 #[potato::controller]
-        }
-    } else {
-        quote! {}
-    };
-
     // 为每个参数生成调用代码
     let call_args: Vec<_> = args
         .iter()
@@ -1420,8 +1407,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     // 从 Authorization header 中提取 Bearer token 并加载 session
                     if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
                         let header_value = h.as_str();
-                        if header_value.starts_with("Bearer ") {
-                            potato::SessionCache::from_token(&header_value[7..]).await.ok()
+                        if let Some(token) = header_value.strip_prefix("Bearer ") {
+                            potato::SessionCache::from_token(token).await.ok()
                         } else {
                             None
                         }
@@ -1533,8 +1520,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     // 从 Authorization header 中提取 Bearer token 并加载 session
                     if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
                         let header_value = h.as_str();
-                        if header_value.starts_with("Bearer ") {
-                            potato::SessionCache::from_token(&header_value[7..]).await.ok()
+                        if let Some(token) = header_value.strip_prefix("Bearer ") {
+                            potato::SessionCache::from_token(token).await.ok()
                         } else {
                             None
                         }
@@ -1645,8 +1632,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     // 从 Authorization header 中提取 Bearer token 并加载 session
                     if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
                         let header_value = h.as_str();
-                        if header_value.starts_with("Bearer ") {
-                            potato::SessionCache::from_token(&header_value[7..]).await.ok()
+                        if let Some(token) = header_value.strip_prefix("Bearer ") {
+                            potato::SessionCache::from_token(token).await.ok()
                         } else {
                             None
                         }
@@ -1758,8 +1745,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     // 从 Authorization header 中提取 Bearer token 并加载 session
                     if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
                         let header_value = h.as_str();
-                        if header_value.starts_with("Bearer ") {
-                            potato::SessionCache::from_token(&header_value[7..]).await.ok()
+                        if let Some(token) = header_value.strip_prefix("Bearer ") {
+                            potato::SessionCache::from_token(token).await.ok()
                         } else {
                             None
                         }
@@ -1850,81 +1837,42 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
     };
 
-    if is_async {
-        let (wrapper_sig, handler_variant) = if is_send {
-            (
-                quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> },
-                quote! { potato::HttpHandler::Async },
-            )
-        } else {
-            (
-                quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + '_>> },
-                quote! { potato::HttpHandler::AsyncNoSend },
-            )
-        };
-        quote! {
-            #root_fn
-
-            #auto_head_handler
-
-            #semaphore_static
-
-            #[doc(hidden)]
-            async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
-                #wrap_func_body
-            }
-
-            #[doc(hidden)]
-            #wrapper_sig {
-                Box::pin(#wrap_func_name2(req))
-            }
-
-            potato::inventory::submit!{potato::RequestHandlerFlag::new(
-                potato::HttpMethod::#req_name,
-                #final_path_expr,
-                #handler_variant(#wrap_func_name),
-                potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args, #tag_expr)
-            )}
-        }
-        .into()
+    let (wrapper_sig, handler_variant) = if is_send {
+        (
+            quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> },
+            quote! { potato::HttpHandler::Async },
+        )
     } else {
-        let (wrapper_sig, handler_variant) = if is_send {
-            (
-                quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> },
-                quote! { potato::HttpHandler::Async },
-            )
-        } else {
-            (
-                quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + '_>> },
-                quote! { potato::HttpHandler::AsyncNoSend },
-            )
-        };
-        quote! {
-            #root_fn
+        (
+            quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + '_>> },
+            quote! { potato::HttpHandler::AsyncNoSend },
+        )
+    };
+    quote! {
+        #root_fn
 
-            #auto_head_handler
+        #auto_head_handler
 
-            #semaphore_static
+        #semaphore_static
 
-            #[doc(hidden)]
-            async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
-                #wrap_func_body
-            }
-
-            #[doc(hidden)]
-            #wrapper_sig {
-                Box::pin(#wrap_func_name2(req))
-            }
-
-            potato::inventory::submit!{potato::RequestHandlerFlag::new(
-                potato::HttpMethod::#req_name,
-                #final_path_expr,
-                #handler_variant(#wrap_func_name),
-                potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args, #tag_expr)
-            )}
+        #[doc(hidden)]
+        async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+            #wrap_func_body
         }
-        .into()
+
+        #[doc(hidden)]
+        #wrapper_sig {
+            Box::pin(#wrap_func_name2(req))
+        }
+
+        potato::inventory::submit!{potato::RequestHandlerFlag::new(
+            potato::HttpMethod::#req_name,
+            #final_path_expr,
+            #handler_variant(#wrap_func_name),
+            potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args, #tag_expr)
+        )}
     }
+    .into()
     //}.to_string();
     //panic!("{content}");
     //todo!()
@@ -2125,8 +2073,8 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
                 let session_cache = {
                     if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
                         let header_value = h.as_str();
-                        if header_value.starts_with("Bearer ") {
-                            potato::SessionCache::from_token(&header_value[7..]).await.ok()
+                        if let Some(token) = header_value.strip_prefix("Bearer ") {
+                            potato::SessionCache::from_token(token).await.ok()
                         } else {
                             None
                         }
@@ -2339,7 +2287,7 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                                         i += 1;
                                     } else if let proc_macro2::TokenTree::Ident(ident) = &tokens[i]
                                     {
-                                        if ident.to_string() == "Send" {
+                                        if ident == "Send" {
                                             send = true;
                                         }
                                         i += 1;
@@ -2524,8 +2472,8 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                                             // 从 Authorization header 中提取 Bearer token 并加载 session
                                             if let Some(h) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
                                                 let header_value = h.as_str();
-                                                if header_value.starts_with("Bearer ") {
-                                                    potato::SessionCache::from_token(&header_value[7..]).await.ok()
+                                                if let Some(token) = header_value.strip_prefix("Bearer ") {
+                                                    potato::SessionCache::from_token(token).await.ok()
                                                 } else {
                                                     None
                                                 }
@@ -2573,29 +2521,15 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                             generate_response_handler(method_call.clone(), &ret_type_str, false);
 
                         // 生成包装函数
-                        let wrapper_fn = if is_async {
-                            quote! {
-                                #[doc(hidden)]
-                                fn #wrapper_fn_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
-                                    Box::pin(async move {
-                                        match #resp_handler {
-                                            Ok(resp) => resp,
-                                            Err(err) => potato::HttpResponse::error(err.to_string()),
-                                        }
-                                    })
-                                }
-                            }
-                        } else {
-                            quote! {
-                                #[doc(hidden)]
-                                fn #wrapper_fn_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
-                                    Box::pin(async move {
-                                        match #resp_handler {
-                                            Ok(resp) => resp,
-                                            Err(err) => potato::HttpResponse::error(err.to_string()),
-                                        }
-                                    })
-                                }
+                        let wrapper_fn = quote! {
+                            #[doc(hidden)]
+                            fn #wrapper_fn_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> {
+                                Box::pin(async move {
+                                    match #resp_handler {
+                                        Ok(resp) => resp,
+                                        Err(err) => potato::HttpResponse::error(err.to_string()),
+                                    }
+                                })
                             }
                         };
 
@@ -2881,7 +2815,7 @@ fn limit_size_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
         #body_check
         #original_block
     });
-    wrapped_fn.block = Box::new(new_block);
+    *wrapped_fn.block = new_block;
 
     quote! {
         #wrapped_fn

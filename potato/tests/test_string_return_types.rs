@@ -9,7 +9,6 @@ fn test_string_return_type() {
     }
 
     // 这个测试主要验证宏能正确编译
-    assert!(true);
 }
 
 #[test]
@@ -19,8 +18,6 @@ fn test_static_str_return_type() {
     async fn handler_static_str() -> &'static str {
         "<html><body><h1>Hello</h1></body></html>"
     }
-
-    assert!(true);
 }
 
 #[test]
@@ -30,8 +27,6 @@ fn test_result_string_return_type() {
     async fn handler_result_string() -> anyhow::Result<String> {
         Ok("<html><body><h1>Hello</h1></body></html>".to_string())
     }
-
-    assert!(true);
 }
 
 #[test]
@@ -41,8 +36,6 @@ fn test_result_static_str_return_type() {
     async fn handler_result_static_str() -> anyhow::Result<&'static str> {
         Ok("<html><body><h1>Hello</h1></body></html>")
     }
-
-    assert!(true);
 }
 
 #[test]
@@ -52,8 +45,6 @@ fn test_sync_string_return_type() {
     fn handler_string_sync() -> String {
         "<html><body><h1>Hello</h1></body></html>".to_string()
     }
-
-    assert!(true);
 }
 
 #[test]
@@ -63,8 +54,6 @@ fn test_sync_static_str_return_type() {
     fn handler_static_str_sync() -> &'static str {
         "<html><body><h1>Hello</h1></body></html>"
     }
-
-    assert!(true);
 }
 
 #[test]
@@ -74,8 +63,6 @@ fn test_sync_result_string_return_type() {
     fn handler_result_string_sync() -> anyhow::Result<String> {
         Ok("<html><body><h1>Hello</h1></body></html>".to_string())
     }
-
-    assert!(true);
 }
 
 #[test]
@@ -85,6 +72,4 @@ fn test_sync_result_static_str_return_type() {
     fn handler_result_static_str_sync() -> anyhow::Result<&'static str> {
         Ok("<html><body><h1>Hello</h1></body></html>")
     }
-
-    assert!(true);
 }

@@ -108,7 +108,7 @@ let mut session = potato::client::TransferSession::from_forward_proxy();
 
 ## Agent Client Session
 
-Multi-turn LLM client supporting OpenAI, Anthropic, Ollama, OpenCode, Codex:
+Multi-turn LLM client supporting OpenAI, Anthropic, Ollama, OpenCode, Codex, ZCode, DSF:
 
 ```rust
 // Create session

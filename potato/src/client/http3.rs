@@ -128,13 +128,13 @@ impl H3SessionImpl {
         // 直接构造地址，避免DNS解析延迟
         // 注意：需要先将localhost解析为127.0.0.1，因为SocketAddr不支持主机名
         let socket_addr: std::net::SocketAddr = if host == "localhost" {
-            format!("127.0.0.1:{port}")
-                .parse()
-                .map_err(|e| anyhow!("Invalid address {}: {}", format!("127.0.0.1:{port}"), e))?
+            let addr = format!("127.0.0.1:{port}");
+            addr.parse()
+                .map_err(|e| anyhow!("Invalid address {addr}: {e}"))?
         } else {
-            format!("{host}:{port}")
-                .parse()
-                .map_err(|e| anyhow!("Invalid address {}: {}", format!("{host}:{port}"), e))?
+            let addr = format!("{host}:{port}");
+            addr.parse()
+                .map_err(|e| anyhow!("Invalid address {addr}: {e}"))?
         };
 
         // 连接到服务器，设置合理的超时

@@ -278,7 +278,7 @@ fn quinn_server_config_without_encrypt() -> anyhow::Result<quinn::ServerConfig> 
     let cert_der = certified_key.cert.der();
     let key_der = certified_key.signing_key.serialize_der();
 
-    let certs = vec![CertificateDer::from(cert_der.clone())];
+    let certs = vec![cert_der.clone()];
     let key = PrivateKeyDer::try_from(key_der)
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
 
@@ -308,7 +308,7 @@ pub async fn serve_http3_impl(
     pipe_ctx: Arc<PipeContext>,
 ) -> anyhow::Result<()> {
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
-    crate::init_jemalloc()?;
+    pipe_ctx.init_jemalloc_if_configured()?;
 
     let addr: SocketAddr = addr.parse()?;
     let server_config = quinn_server_config(cert_file, key_file)?;
@@ -537,7 +537,7 @@ pub async fn serve_http3_without_encrypt_impl(
     pipe_ctx: Arc<PipeContext>,
 ) -> anyhow::Result<()> {
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
-    crate::init_jemalloc()?;
+    pipe_ctx.init_jemalloc_if_configured()?;
 
     let addr: SocketAddr = addr.parse()?;
     let server_config = quinn_server_config_without_encrypt()?;

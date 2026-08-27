@@ -145,7 +145,7 @@ mod tests {
         let url = format!("http://{}/header_standard", server_addr);
         let res = potato::get(&url, vec![]).await?;
         assert_eq!(res.http_code, 200);
-        assert!(res.headers.get("Cache-Control").is_some());
+        assert!(res.headers.contains_key("Cache-Control"));
         println!("✅ Standard header macro works");
 
         server_handle.abort();
@@ -173,7 +173,7 @@ mod tests {
         let url = format!("http://{}/header_custom", server_addr);
         let res = potato::get(&url, vec![]).await?;
         assert_eq!(res.http_code, 200);
-        assert!(res.headers.get("X-Custom-Header").is_some());
+        assert!(res.headers.contains_key("X-Custom-Header"));
         println!("✅ Custom header macro works");
 
         server_handle.abort();
@@ -203,7 +203,7 @@ mod tests {
         let url = format!("http://{}/cors_default", server_addr);
         let res = potato::get(&url, vec![]).await?;
         assert_eq!(res.http_code, 200);
-        assert!(res.headers.get("Access-Control-Allow-Origin").is_some());
+        assert!(res.headers.contains_key("Access-Control-Allow-Origin"));
         println!("✅ Default CORS macro works");
 
         server_handle.abort();
@@ -231,7 +231,7 @@ mod tests {
         let url = format!("http://{}/cors_custom", server_addr);
         let res = potato::post(&url, vec![], vec![]).await?;
         assert_eq!(res.http_code, 200);
-        assert!(res.headers.get("Access-Control-Allow-Origin").is_some());
+        assert!(res.headers.contains_key("Access-Control-Allow-Origin"));
         println!("✅ Custom CORS macro works");
 
         server_handle.abort();
@@ -302,7 +302,7 @@ mod tests {
         let url = format!("http://{}/hooks_test", server_addr);
         let res = potato::get(&url, vec![]).await?;
         assert_eq!(res.http_code, 200);
-        assert!(res.headers.get("X-Postprocessed").is_some());
+        assert!(res.headers.contains_key("X-Postprocessed"));
         println!("✅ Preprocess/Postprocess macros work");
 
         server_handle.abort();
@@ -470,8 +470,7 @@ mod tests {
         assert_eq!(res.http_code, 200);
         // 验证部分 headers（某些 header 可能在响应处理中被转换）
         assert!(
-            res.headers.get("Cache-Control").is_some()
-                || res.headers.get("cache-control").is_some()
+            res.headers.contains_key("Cache-Control") || res.headers.contains_key("cache-control")
         );
         println!("✅ Complex attribute combination works");
 

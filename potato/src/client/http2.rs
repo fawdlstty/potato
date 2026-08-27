@@ -247,17 +247,14 @@ impl H2Session {
             let mut body = response.into_body();
 
             tokio::spawn(async move {
-                loop {
-                    match body.data().await {
-                        Some(chunk_result) => match chunk_result {
-                            Ok(chunk) => {
-                                if tx.send(chunk.to_vec()).await.is_err() {
-                                    break;
-                                }
+                while let Some(chunk_result) = body.data().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            if tx.send(chunk.to_vec()).await.is_err() {
+                                break;
                             }
-                            Err(_) => break,
-                        },
-                        None => break,
+                        }
+                        Err(_) => break,
                     }
                 }
             });
@@ -274,14 +271,9 @@ impl H2Session {
             // 处理普通响应
             let mut body = response.into_body();
             let mut body_data = Vec::new();
-            loop {
-                match body.data().await {
-                    Some(chunk_result) => {
-                        let chunk = chunk_result?;
-                        body_data.extend_from_slice(&chunk);
-                    }
-                    None => break,
-                }
+            while let Some(chunk_result) = body.data().await {
+                let chunk = chunk_result?;
+                body_data.extend_from_slice(&chunk);
             }
 
             let mut res = HttpResponse::new();
