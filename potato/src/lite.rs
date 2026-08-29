@@ -1,51 +1,18 @@
-#![no_std]
-
-extern crate alloc;
-#[cfg(feature = "std")]
-extern crate std;
-
-#[cfg(feature = "std")]
-pub mod client;
-#[cfg(feature = "std")]
-pub mod server;
-
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
 #[cfg(feature = "websocket")]
 pub use websocket::*;
 
-#[cfg(feature = "std")]
-pub use crate::server::*;
-
-#[cfg(feature = "std")]
-pub use agnostic_net::tokio::TcpStream as TcpSocket;
-
-/// 兼容旧调用签名的上下文占位类型。
-#[cfg(feature = "std")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Stack;
-
-#[cfg(feature = "std")]
-impl Stack {
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-pub use potato_macro_lite::*;
-
+use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use core::future::Future;
+use core::sync::atomic::{AtomicPtr, Ordering};
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use linkme::distributed_slice;
-
-#[cfg(not(feature = "std"))]
-pub type RuntimeInstant =
-    <agnostic_lite::embassy::EmbassyRuntime as agnostic_lite::LocalRuntimeLite>::Instant;
-#[cfg(feature = "std")]
-pub type RuntimeInstant =
-    <agnostic_lite::tokio::TokioRuntime as agnostic_lite::LocalRuntimeLite>::Instant;
 
 // ---------------------------------------------------------------------------
 // HttpMethod
@@ -281,63 +248,90 @@ pub struct Headers {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP date formatting (no chrono dependency)
+// Minimal executor
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
-const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-#[allow(dead_code)]
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-#[allow(dead_code)]
-const MONTH_DAYS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+static WAIT_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
-/// 将 Unix 时间戳格式化为 RFC 7231 HTTP 日期字符串
-#[allow(dead_code)]
-pub(crate) fn format_http_date(timestamp: u64) -> String {
-    let secs = timestamp % 60;
-    let mins = (timestamp / 60) % 60;
-    let hours = (timestamp / 3600) % 24;
-    let dow = (timestamp / 86400) % 7;
-
-    let mut days = timestamp / 86400;
-    let mut year: u64 = 1970;
-    loop {
-        let diy = if is_leap(year) { 366 } else { 365 };
-        if days < diy {
-            break;
-        }
-        days -= diy;
-        year += 1;
-    }
-
-    let mut month: usize = 0;
-    for i in 0..12u64 {
-        let dim = MONTH_DAYS[i as usize] + if i == 1 && is_leap(year) { 1 } else { 0 };
-        if days < dim {
-            month = i as usize;
-            break;
-        }
-        days -= dim;
-    }
-    let day = days + 1;
-
-    alloc::format!(
-        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
-        DAYS[dow as usize],
-        day,
-        MONTHS[month],
-        year,
-        hours,
-        mins,
-        secs,
-    )
+/// Installs the platform's low-power wait callback. Passing `None` restores
+/// the readiness/spin fallback.
+pub fn set_wait_hook(hook: Option<fn()>) {
+    let hook = hook.map_or(core::ptr::null_mut(), |hook| hook as usize as *mut ());
+    WAIT_HOOK.store(hook, Ordering::Release);
 }
 
-#[allow(dead_code)]
-fn is_leap(year: u64) -> bool {
-    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+fn wait_for_wake() {
+    let hook = WAIT_HOOK.load(Ordering::Acquire);
+    if hook.is_null() {
+        core::hint::spin_loop();
+    } else {
+        // The pointer was installed from a valid `fn()` by `set_wait_hook`.
+        let hook: fn() = unsafe { core::mem::transmute(hook) };
+        hook();
+    }
+}
+
+use core::sync::atomic::AtomicBool;
+
+struct ExecutorWaker {
+    ready: AtomicBool,
+}
+
+impl ExecutorWaker {
+    fn wake(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+}
+
+fn waker_vtable() -> &'static RawWakerVTable {
+    &RawWakerVTable::new(clone_waker, wake_waker, wake_waker_by_ref, drop_waker)
+}
+
+unsafe fn clone_waker(data: *const ()) -> RawWaker {
+    let waker =
+        core::mem::ManuallyDrop::new(unsafe { Arc::from_raw(data.cast::<ExecutorWaker>()) });
+    RawWaker::new(Arc::into_raw(Arc::clone(&waker)).cast(), waker_vtable())
+}
+
+unsafe fn wake_waker(data: *const ()) {
+    let waker = unsafe { Arc::from_raw(data.cast::<ExecutorWaker>()) };
+    waker.wake();
+}
+
+unsafe fn wake_waker_by_ref(data: *const ()) {
+    let waker =
+        core::mem::ManuallyDrop::new(unsafe { Arc::from_raw(data.cast::<ExecutorWaker>()) });
+    waker.wake();
+}
+
+unsafe fn drop_waker(data: *const ()) {
+    drop(unsafe { Arc::from_raw(data.cast::<ExecutorWaker>()) });
+}
+
+fn waker(state: Arc<ExecutorWaker>) -> Waker {
+    // SAFETY: `data` remains a valid `Arc<ExecutorWaker>` pointer, and all
+    // vtable functions maintain its reference count.
+    unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(state).cast(), waker_vtable())) }
+}
+
+/// Polls a future to completion on the current thread.
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    let state = Arc::new(ExecutorWaker {
+        ready: core::sync::atomic::AtomicBool::new(false),
+    });
+    let waker = waker(Arc::clone(&state));
+    let mut cx = Context::from_waker(&waker);
+
+    let mut future = Box::pin(future);
+    loop {
+        if let Poll::Ready(output) = Future::poll(future.as_mut(), &mut cx) {
+            return output;
+        }
+
+        while !state.ready.swap(false, Ordering::Acquire) {
+            wait_for_wake();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,42 +349,3 @@ pub struct RouteHandler {
 /// Elements are gathered by the linker at compile time — no runtime registration needed.
 #[distributed_slice]
 pub static ROUTE_HANDLERS: [RouteHandler];
-
-// ---------------------------------------------------------------------------
-// get! macro
-// ---------------------------------------------------------------------------
-
-/// 发起 HTTP GET 请求的便捷宏。
-///
-/// # 示例
-/// ```ignore
-/// let res = potato_lite::get!(stack, "http://192.168.1.1/api").await;
-/// ```
-#[cfg(feature = "std")]
-#[macro_export]
-macro_rules! get {
-    ($stack:expr, $url:expr $(,)?) => {
-        $crate::client::get($stack, $url)
-    };
-}
-
-// ---------------------------------------------------------------------------
-// websocket! macro
-// ---------------------------------------------------------------------------
-
-/// 建立 WebSocket 连接的便捷宏（需要启用 `websocket` feature）。
-///
-/// # 示例
-/// ```ignore
-/// let mut rx = [0u8; 4096];
-/// let mut tx = [0u8; 4096];
-/// let mut ws = potato_lite::websocket!(stack, "ws://192.168.1.1/ws", &mut rx, &mut tx).await?;
-/// ws.send_text("hello").await?;
-/// ```
-#[cfg(all(feature = "std", feature = "websocket"))]
-#[macro_export]
-macro_rules! websocket {
-    ($stack:expr, $url:expr, $rx_buf:expr, $tx_buf:expr $(,)?) => {
-        $crate::websocket::Websocket::connect($stack, $url, $rx_buf, $tx_buf)
-    };
-}

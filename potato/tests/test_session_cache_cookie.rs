@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// SessionCache Cookie 功能测试
 use potato::{HttpRequest, HttpResponse, HttpServer, SessionCache};
 use std::time::Duration;

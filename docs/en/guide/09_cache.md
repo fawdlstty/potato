@@ -122,7 +122,7 @@ async fn cookie_delete(cache: &mut SessionCache) -> HttpResponse {
 #### Session Management
 - `SessionCache::set_jwt_secret(secret)` - Set JWT secret (global)
 - `SessionCache::generate_token(user_id, duration)` - Generate token
-- `SessionCache::invalidate(user_id)` - Invalidate session
+- `SessionCache::invalidate(token)` - Invalidate the session for one token
 
 #### Data Storage
 - `cache.get::<T>(key)` - Get value (requires Clone)

@@ -418,6 +418,34 @@ impl RateLimiter {
             Some(Duration::from_secs_f64(wait_secs))
         }
     }
+
+    /// 预先扣减可用令牌，返回实际允许传输的位数
+    pub fn reserve(&mut self, max_bits: u64) -> u64 {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update);
+        self.last_update = now;
+        self.tokens = (self.tokens + self.max_rate_bits_per_sec as f64 * elapsed.as_secs_f64())
+            .min(self.max_rate_bits_per_sec as f64);
+
+        let available = self.tokens.floor().max(0.0) as u64;
+        let bits = if max_bits >= 8 && available < 8 {
+            0
+        } else {
+            max_bits.min(available)
+        };
+        self.tokens -= bits as f64;
+        bits
+    }
+
+    /// 获取下一个可传输字节就绪的等待时间
+    pub fn wait_time_for_token(&self) -> Duration {
+        let deficit = if self.tokens >= 8.0 {
+            0.0
+        } else {
+            8.0 - self.tokens
+        };
+        Duration::from_secs_f64(deficit / self.max_rate_bits_per_sec as f64)
+    }
 }
 
 /// 速率限制的 HttpStream 包装器
@@ -549,26 +577,65 @@ impl RateLimitedStream {
     }
 
     pub async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
-        let n = self.stream.read(buf).await?;
-        if n > 0 {
-            let bits = (n * 8) as u64;
+        let admitted_bits = loop {
             let mut limiter = self.inbound_limiter.lock().await;
-            if let Some(wait_time) = limiter.acquire(bits) {
-                tokio::time::sleep(wait_time).await;
+            let bits = limiter.reserve((buf.len() * 8) as u64);
+            if bits >= 8 {
+                break bits;
             }
-        }
-        Ok(n)
+            let wait_time = limiter.wait_time_for_token();
+            drop(limiter);
+            tokio::time::sleep(wait_time).await;
+        };
+
+        let admitted_bytes = (admitted_bits / 8) as usize;
+
+        self.stream.read(&mut buf[..admitted_bytes]).await
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> anyhow::Result<()> {
-        let bits = (buf.len() * 8) as u64;
-        let mut limiter = self.outbound_limiter.lock().await;
-        if let Some(wait_time) = limiter.acquire(bits) {
-            drop(limiter);
-            tokio::time::sleep(wait_time).await;
-        } else {
-            drop(limiter);
+        let mut offset = 0usize;
+        while offset < buf.len() {
+            let admitted_bits = loop {
+                let mut limiter = self.outbound_limiter.lock().await;
+                let bits = limiter.reserve(((buf.len() - offset) * 8) as u64);
+                if bits >= 8 {
+                    break bits;
+                }
+                let wait_time = limiter.wait_time_for_token();
+                drop(limiter);
+                tokio::time::sleep(wait_time).await;
+            };
+
+            let admitted_bytes = (admitted_bits / 8) as usize;
+            self.stream
+                .write_all(&buf[offset..offset + admitted_bytes])
+                .await?;
+            offset += admitted_bytes;
         }
-        self.stream.write_all(buf).await
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RateLimiter;
+    use std::time::Duration;
+
+    #[test]
+    fn reserve_truncates_to_available_tokens() {
+        let mut limiter = RateLimiter::new(8_000);
+        assert_eq!(limiter.reserve(1_600), 800);
+        assert_eq!(limiter.reserve(1), 0);
+    }
+
+    #[tokio::test]
+    async fn reserve_refills_without_bulk_admission() {
+        let mut limiter = RateLimiter::new(8_000);
+        assert_eq!(limiter.reserve(800), 800);
+        assert_eq!(limiter.reserve(1), 0);
+
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        assert_eq!(limiter.reserve(800), 800);
     }
 }

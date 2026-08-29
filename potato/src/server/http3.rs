@@ -7,9 +7,12 @@ use anyhow::Result;
 use bytes::Buf;
 use h3::server as h3_server;
 use quinn::crypto::rustls::QuicServerConfig;
-use quinn::{self, Connection, RecvStream, SendStream, VarInt};
+#[cfg(feature = "webtransport")]
+use quinn::{Connection, RecvStream, SendStream, VarInt};
+#[cfg(feature = "webtransport")]
 use std::future::Future;
 use std::net::SocketAddr;
+#[cfg(feature = "webtransport")]
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_rustls::rustls;
@@ -17,12 +20,14 @@ use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKey
 
 use super::PipeContext;
 
-/// WebTransport 会话
+/// 实验性 WebTransport 会话；会话协议尚未完整实现。
+#[cfg(feature = "webtransport")]
 pub struct WebTransportSession {
     inner: Connection,
     remote_addr: SocketAddr,
 }
 
+#[cfg(feature = "webtransport")]
 impl WebTransportSession {
     pub(crate) fn new(connection: Connection) -> Self {
         let remote_addr = connection.remote_address();
@@ -103,11 +108,13 @@ impl WebTransportSession {
 }
 
 /// WebTransport 双向流
+#[cfg(feature = "webtransport")]
 pub struct WebTransportStream {
     send: SendStream,
     recv: RecvStream,
 }
 
+#[cfg(feature = "webtransport")]
 impl Drop for WebTransportStream {
     fn drop(&mut self) {
         // 当 WebTransportStream 被丢弃时，重置流以立即释放资源
@@ -119,6 +126,7 @@ impl Drop for WebTransportStream {
     }
 }
 
+#[cfg(feature = "webtransport")]
 impl WebTransportStream {
     pub(crate) fn new(send: SendStream, recv: RecvStream) -> Self {
         Self { send, recv }
@@ -160,25 +168,7 @@ impl WebTransportStream {
     }
 }
 
-#[derive(Clone)]
-pub struct WebTransportConfig {
-    pub max_sessions: usize,
-    pub max_streams_per_session: u32,
-    pub datagram_enabled: bool,
-    pub max_datagram_size: usize,
-}
-
-impl Default for WebTransportConfig {
-    fn default() -> Self {
-        Self {
-            max_sessions: 1000,
-            max_streams_per_session: 100,
-            datagram_enabled: true,
-            max_datagram_size: 1200,
-        }
-    }
-}
-
+#[cfg(feature = "webtransport")]
 pub type WebTransportHandler = Box<
     dyn Fn(WebTransportSession) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync,
 >;
@@ -316,13 +306,14 @@ pub async fn serve_http3_impl(
 
     while let Some(new_conn) = endpoint.accept().await {
         let pipe_ctx2 = Arc::clone(&pipe_ctx);
-        _ = tokio::task::spawn(async move {
+        super::HttpServer::spawn_connection(async move {
             let conn = match new_conn.await {
                 Ok(conn) => conn,
                 Err(_) => return,
             };
             let client_addr = conn.remote_address();
             // 为 WebTransport 克隆连接
+            #[cfg(feature = "webtransport")]
             let wt_conn = conn.clone();
             let mut h3_conn: h3_server::Connection<_, bytes::Bytes> =
                 match h3_server::Connection::new(h3_quinn::Connection::new(conn)).await {
@@ -337,41 +328,39 @@ pub async fn serve_http3_impl(
                     Err(_) => break,
                 };
                 let pipe_ctx3 = Arc::clone(&pipe_ctx2);
+                #[cfg(feature = "webtransport")]
                 let wt_conn = wt_conn.clone();
-                _ = tokio::task::spawn(async move {
+                super::HttpServer::spawn_connection(async move {
                     let (req_head, mut stream) = match resolver.resolve_request().await {
                         Ok(req_stream) => req_stream,
                         Err(_) => return,
                     };
 
                     // 检查是否是 WebTransport CONNECT 请求
+                    #[cfg(feature = "webtransport")]
                     if req_head.method() == http::Method::CONNECT {
                         if let Some(protocol) = req_head.headers().get(":protocol") {
                             if protocol == "webtransport" {
                                 // 检查路径是否匹配 WebTransport 路由
                                 let path = req_head.uri().path();
-                                let mut wt_handler: Option<(
-                                    &WebTransportConfig,
-                                    &WebTransportHandler,
-                                )> = None;
+                                let mut wt_handler: Option<&WebTransportHandler> = None;
 
                                 for item in pipe_ctx3.items.iter() {
                                     if let super::PipeContextItem::WebTransport((
                                         wt_path,
-                                        config,
                                         handler,
                                     )) = item
                                     {
                                         if path == wt_path
                                             || path.starts_with(&format!("{wt_path}/"))
                                         {
-                                            wt_handler = Some((config, handler));
+                                            wt_handler = Some(handler);
                                             break;
                                         }
                                     }
                                 }
 
-                                if let Some((_config, handler)) = wt_handler {
+                                if let Some(handler) = wt_handler {
                                     // 发送 200 响应接受 WebTransport 会话
                                     let response =
                                         match http::Response::builder().status(200).body(()) {
@@ -545,13 +534,14 @@ pub async fn serve_http3_without_encrypt_impl(
 
     while let Some(new_conn) = endpoint.accept().await {
         let pipe_ctx2 = Arc::clone(&pipe_ctx);
-        _ = tokio::task::spawn(async move {
+        super::HttpServer::spawn_connection(async move {
             let conn = match new_conn.await {
                 Ok(conn) => conn,
                 Err(_) => return,
             };
             let client_addr = conn.remote_address();
             // 为 WebTransport 克隆连接
+            #[cfg(feature = "webtransport")]
             let wt_conn = conn.clone();
             let mut h3_conn: h3_server::Connection<_, bytes::Bytes> =
                 match h3_server::Connection::new(h3_quinn::Connection::new(conn)).await {
@@ -566,41 +556,39 @@ pub async fn serve_http3_without_encrypt_impl(
                     Err(_) => break,
                 };
                 let pipe_ctx3 = Arc::clone(&pipe_ctx2);
+                #[cfg(feature = "webtransport")]
                 let wt_conn = wt_conn.clone();
-                _ = tokio::task::spawn(async move {
+                super::HttpServer::spawn_connection(async move {
                     let (req_head, mut stream) = match resolver.resolve_request().await {
                         Ok(req_stream) => req_stream,
                         Err(_) => return,
                     };
 
                     // 检查是否是 WebTransport CONNECT 请求
+                    #[cfg(feature = "webtransport")]
                     if req_head.method() == http::Method::CONNECT {
                         if let Some(protocol) = req_head.headers().get(":protocol") {
                             if protocol == "webtransport" {
                                 // 检查路径是否匹配 WebTransport 路由
                                 let path = req_head.uri().path();
-                                let mut wt_handler: Option<(
-                                    &WebTransportConfig,
-                                    &WebTransportHandler,
-                                )> = None;
+                                let mut wt_handler: Option<&WebTransportHandler> = None;
 
                                 for item in pipe_ctx3.items.iter() {
                                     if let super::PipeContextItem::WebTransport((
                                         wt_path,
-                                        config,
                                         handler,
                                     )) = item
                                     {
                                         if path == wt_path
                                             || path.starts_with(&format!("{wt_path}/"))
                                         {
-                                            wt_handler = Some((config, handler));
+                                            wt_handler = Some(handler);
                                             break;
                                         }
                                     }
                                 }
 
-                                if let Some((_config, handler)) = wt_handler {
+                                if let Some(handler) = wt_handler {
                                     // 发送 200 响应接受 WebTransport 会话
                                     let response =
                                         match http::Response::builder().status(200).body(()) {

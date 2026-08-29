@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 测试 Custom(key) = value 变量形式语法
 use potato::Headers;
 

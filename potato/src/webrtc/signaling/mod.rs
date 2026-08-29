@@ -1,10 +1,7 @@
 //! WebRTC信令模块
 //!
-//! 支持两种信令传输方式:
-//! - WebSocket: 实时双向通信,适合浏览器客户端
-//! - REST: 请求响应模式,适合服务端集成
+//! 客户端信令使用 WebSocket 传输。
 
-pub mod rest;
 pub mod websocket;
 
 use serde::{Deserialize, Serialize};

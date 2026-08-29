@@ -1,6 +1,7 @@
+#![cfg(feature = "std")]
 #[cfg(test)]
 mod tests {
-    use potato::{HttpRequest, SessionCache};
+    use potato::HttpRequest;
 
     #[potato::preprocess]
     #[allow(dead_code)]
@@ -35,7 +36,7 @@ mod tests {
 
         // 启动服务器
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
             ctx.use_openapi("/doc");
         });

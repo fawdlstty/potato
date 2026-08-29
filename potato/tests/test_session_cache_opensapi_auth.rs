@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 测试 SessionCache 自动标记为需要鉴权的功能
 use potato::{HttpResponse, SessionCache};
 
@@ -28,7 +29,7 @@ mod tests {
 
         // 创建服务器并启用 OpenAPI
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             // 不调用 use_handlers，只注册 OpenAPI 路由
             ctx.use_openapi("/doc/");
         });

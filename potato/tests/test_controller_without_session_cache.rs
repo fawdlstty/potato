@@ -1,6 +1,7 @@
+#![cfg(feature = "std")]
 /// 测试不带 SessionCache 成员的 Controller 结构体
 /// 确保不需要鉴权也能正常工作
-use potato::{HttpServer, OnceCache};
+use potato::HttpServer;
 
 // 定义不带 SessionCache 的 Controller 结构体
 #[potato::controller]
@@ -43,7 +44,7 @@ mod tests {
 
         // 创建服务器
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 

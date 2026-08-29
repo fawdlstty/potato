@@ -1,4 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["potato", "potato-lite", "potato-macro", "potato-macro-lite"]
+members = [
+    "potato",
+    "potato-macro",
+]
 default-members = ["potato"]

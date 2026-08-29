@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 特性标志测试
 /// 仅在启用对应特性时运行: jemalloc, webdav, ssh
 #[cfg(feature = "webdav")]
@@ -37,7 +38,7 @@ mod webdav_tests {
         fs::write(&test_file, "hello webdav")?;
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_webdav_localfs("/webdav", temp_dir.to_str().unwrap());
         });
 

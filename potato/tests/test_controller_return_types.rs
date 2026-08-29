@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// Controller 返回类型完整性测试 - 集成测试
 
 #[potato::controller]
@@ -78,7 +79,7 @@ impl<'a> ReturnTypeTestController<'a> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut server = potato::HttpServer::new("0.0.0.0:8081");
-    server.configure(|ctx| {
+    let _ = server.configure(|ctx| {
         ctx.use_handlers();
     });
 

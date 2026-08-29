@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 测试 HTTP handler 支持 serde_json::Value 和 anyhow::Result<serde_json::Value> 返回类型
 
 #[test]

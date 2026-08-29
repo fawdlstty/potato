@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 use std::sync::LazyLock;
 
 pub trait StringExt {
@@ -97,9 +97,9 @@ pub struct StringUtil;
 
 impl StringUtil {
     pub fn rand(num: usize) -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         std::iter::repeat(())
-            .map(|()| ALPHANUM_CHARS[rng.r#gen::<usize>() % ALPHANUM_CHARS.len()])
+            .map(|()| ALPHANUM_CHARS[(rng.random::<u64>() as usize) % ALPHANUM_CHARS.len()])
             .take(num)
             .collect()
     }

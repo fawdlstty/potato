@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 #[cfg(feature = "tls")]
 use std::sync::atomic::{AtomicU16, Ordering};
 #[cfg(feature = "tls")]

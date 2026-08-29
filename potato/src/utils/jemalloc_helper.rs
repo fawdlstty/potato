@@ -1,14 +1,12 @@
 #![cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 
-use crate::utils::process::ProgramRunner;
 use anyhow::anyhow;
+use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tikv_jemalloc_ctl::*;
-use tokio::fs::{self, File};
-use tokio::io::AsyncReadExt;
+use tikv_jemalloc_ctl::{raw, Access, AsName};
+use tokio::fs;
 
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+pub use tikv_jemallocator::Jemalloc as JemallocAllocator;
 
 static INIT_JEMALLOC: AtomicBool = AtomicBool::new(true);
 
@@ -37,17 +35,26 @@ pub fn init_jemalloc() -> anyhow::Result<()> {
 }
 
 pub async fn dump_jemalloc_profile() -> anyhow::Result<Vec<u8>> {
-    const PROF_DUMP: &[u8] = b"prof.dump\0";
-    let prof_file = format!("/tmp/prof_{}.dump", env!("CARGO_PKG_NAME"));
-    let pdf_file = format!("{prof_file}.pdf");
-    _ = fs::remove_file(&prof_file).await;
-    _ = fs::remove_file(&pdf_file).await;
-    let prof_name = format!("{prof_file}\0").into_boxed_str();
-    let prof_name_ptr: &'static [u8] = unsafe { std::mem::transmute(prof_name) };
-    let name = PROF_DUMP.name();
-    if let Err(err) = name.write(prof_name_ptr) {
-        Err(anyhow!("{err}"))?;
-    }
+    let prof_dir = std::env::temp_dir().join(format!(
+        "{}-prof-{}-{}",
+        env!("CARGO_PKG_NAME"),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    #[cfg(unix)]
+    fs::DirBuilder::new().mode(0o700).create(&prof_dir).await?;
+    #[cfg(not(unix))]
+    fs::create_dir(&prof_dir).await?;
+
+    let prof_file = prof_dir.join("profile.dump");
+    let prof_name = CString::new(prof_file.as_os_str().as_encoded_bytes())?;
+    let prof_name = Box::leak(prof_name.into_bytes().into_boxed_slice());
+    let mut mib = [0usize; 1];
+    raw::name_to_mib(b"prof.dump\0", &mut mib).map_err(|err| anyhow!("{err}"))?;
+    raw::write_str_mib(&mib, prof_name).map_err(|err| anyhow!("{err}"))?;
+
     let cur_path = {
         let cur_path = std::env::current_exe()?;
         cur_path
@@ -55,19 +62,18 @@ pub async fn dump_jemalloc_profile() -> anyhow::Result<Vec<u8>> {
             .ok_or(anyhow!("path convert failed"))?
             .to_string()
     };
-    let cmd_str = format!("jeprof --show_bytes --pdf {cur_path} {prof_file} > {pdf_file}");
-    let out = ProgramRunner::run_until_exit(&cmd_str).await;
-    let buf = {
-        let mut buf = Vec::with_capacity(4096);
-        let mut f = File::open(&pdf_file).await?;
-        f.read_to_end(&mut buf).await?;
-        buf
-    };
-    if buf.is_empty() {
-        let out = out?;
-        Err(anyhow!("{out}"))?;
+
+    let output = tokio::process::Command::new("jeprof")
+        .args(["--show_bytes", "--pdf", &cur_path])
+        .arg(&prof_file)
+        .output()
+        .await?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(anyhow!("jeprof failed: {message}"))?;
     }
-    _ = fs::remove_file(&prof_file).await;
-    _ = fs::remove_file(&pdf_file).await;
+
+    let buf = output.stdout;
+    let _ = fs::remove_dir_all(&prof_dir).await;
     Ok(buf)
 }

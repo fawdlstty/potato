@@ -4,11 +4,11 @@ Server-side routing is used to specify what actions to take for target request a
 
 ```rust
 server.configure(|ctx| {
-    ctx.use_handlers(false);
+    ctx.use_handlers();
 });
 ```
 
-Here the `use_handlers` function represents searching for matching handler functions for the request path. If found, it redirects to the corresponding handler function.
+Controller and OpenAPI routes register by default. `use_handlers()` explicitly enables the handler pipeline, which dispatches `http_*` handlers by request path.
 
 In addition to the above handler functions, there are several other routes:
 

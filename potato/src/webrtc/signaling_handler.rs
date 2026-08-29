@@ -37,6 +37,10 @@ impl WebRtcSignalingHandler {
         Self { sfu, peer_senders }
     }
 
+    pub fn ws_path(&self) -> &str {
+        &self.sfu.config().ws_path
+    }
+
     /// 处理WebSocket升级请求
     pub async fn handle_websocket(&self, req: &mut HttpRequest) -> Result<()> {
         // 升级到WebSocket
@@ -336,7 +340,7 @@ impl WebRtcSignalingHandler {
 
             // 查找对应的peer并添加ICE候选
             if let Some(peer) = peers.get(&params.peer_id) {
-                let ice_candidate = webrtc::ice_transport::ice_candidate::RTCIceCandidateInit {
+                let ice_candidate = webrtc::peer_connection::RTCIceCandidateInit {
                     candidate: params.candidate.clone(),
                     sdp_mid: if params.sdp_mid.is_empty() {
                         None
@@ -349,6 +353,7 @@ impl WebRtcSignalingHandler {
                         Some(params.sdp_mline_index)
                     },
                     username_fragment: None,
+                    url: None,
                 };
 
                 if let Err(e) = peer.peer_connection.add_ice_candidate(ice_candidate).await {

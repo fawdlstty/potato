@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 use chrono::Utc;
 /// SessionCache 完整Cookie功能测试
 use potato::{CookieBuilder, HttpResponse, SessionCache};

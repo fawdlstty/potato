@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// Controller 返回类型完整性测试
 #[potato::controller]
 pub struct ReturnTypeTestController<'a> {

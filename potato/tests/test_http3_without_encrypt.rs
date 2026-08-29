@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 #![cfg(feature = "http3")]
 
 use std::sync::atomic::{AtomicU16, Ordering};

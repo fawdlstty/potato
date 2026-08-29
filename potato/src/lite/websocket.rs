@@ -1,10 +1,8 @@
 //! WebSocket frame and handshake helpers (RFC 6455).
 
-use crate::RuntimeInstant;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
-use core::hash::{Hash, Hasher};
 
 // ---------------------------------------------------------------------------
 // Socket abstraction
@@ -25,23 +23,6 @@ pub trait WebsocketIo {
     ) -> impl Future<Output = Result<usize, Self::Error>> + 'a;
 
     fn flush(&mut self) -> impl Future<Output = Result<(), Self::Error>> + '_;
-}
-
-#[cfg(feature = "std")]
-impl WebsocketIo for crate::TcpSocket {
-    type Error = std::io::Error;
-
-    async fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Result<usize, Self::Error> {
-        tokio::io::AsyncReadExt::read(self, buf).await
-    }
-
-    async fn write<'a>(&'a mut self, data: &'a [u8]) -> Result<usize, Self::Error> {
-        tokio::io::AsyncWriteExt::write(self, data).await
-    }
-
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        tokio::io::AsyncWriteExt::flush(self).await
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -69,13 +50,14 @@ enum WsFrameImpl {
 // ---------------------------------------------------------------------------
 
 /// WebSocket connection backed by a user-provided async socket.
-pub struct Websocket<S> {
+pub struct Websocket<S, R> {
     socket: S,
+    rng: R,
 }
 
-impl<S> Websocket<S> {
-    pub const fn from_socket(socket: S) -> Self {
-        Self { socket }
+impl<S, R> Websocket<S, R> {
+    pub const fn from_socket(socket: S, rng: R) -> Self {
+        Self { socket, rng }
     }
 
     pub fn into_inner(self) -> S {
@@ -87,29 +69,7 @@ impl<S> Websocket<S> {
     }
 }
 
-#[cfg(feature = "std")]
-impl Websocket<crate::TcpSocket> {
-    /// Establishes a client WebSocket connection over the std/tokio backend.
-    pub async fn connect(
-        _stack: crate::Stack,
-        url: &str,
-        _rx_buf: &mut [u8],
-        _tx_buf: &mut [u8],
-    ) -> anyhow::Result<Self> {
-        let (host, port, path) = parse_ws_url(url)?;
-
-        let mut socket =
-            <crate::TcpSocket as agnostic_net::TcpStream>::connect((host.as_str(), port))
-                .await
-                .map_err(|e| anyhow::anyhow!("TCP connect failed: {:?}", e))?;
-
-        client_handshake(&mut socket, &host, port, &path).await?;
-
-        Ok(Self { socket })
-    }
-}
-
-impl<S: WebsocketIo> Websocket<S> {
+impl<S: WebsocketIo, R: FnMut(&mut [u8])> Websocket<S, R> {
     /// Receives a complete WebSocket message.
     pub async fn recv(&mut self) -> anyhow::Result<WsFrame> {
         ws_recv(&mut self.socket).await
@@ -119,10 +79,15 @@ impl<S: WebsocketIo> Websocket<S> {
     pub async fn send(&mut self, frame: WsFrame) -> anyhow::Result<()> {
         match frame {
             WsFrame::Binary(data) => {
-                send_client_frame(&mut self.socket, WsFrameImpl::Binary(data)).await
+                send_client_frame(&mut self.socket, WsFrameImpl::Binary(data), &mut self.rng).await
             }
             WsFrame::Text(text) => {
-                send_client_frame(&mut self.socket, WsFrameImpl::Text(text.into_bytes())).await
+                send_client_frame(
+                    &mut self.socket,
+                    WsFrameImpl::Text(text.into_bytes()),
+                    &mut self.rng,
+                )
+                .await
             }
         }
     }
@@ -132,23 +97,24 @@ impl<S: WebsocketIo> Websocket<S> {
         send_client_frame(
             &mut self.socket,
             WsFrameImpl::Text(data.as_bytes().to_vec()),
+            &mut self.rng,
         )
         .await
     }
 
     /// Sends binary data.
     pub async fn send_binary(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
-        send_client_frame(&mut self.socket, WsFrameImpl::Binary(data)).await
+        send_client_frame(&mut self.socket, WsFrameImpl::Binary(data), &mut self.rng).await
     }
 
     /// Sends a ping frame.
     pub async fn send_ping(&mut self) -> anyhow::Result<()> {
-        send_client_frame(&mut self.socket, WsFrameImpl::Ping).await
+        send_client_frame(&mut self.socket, WsFrameImpl::Ping, &mut self.rng).await
     }
 
     /// Sends a close frame.
     pub async fn send_close(&mut self) -> anyhow::Result<()> {
-        send_client_frame(&mut self.socket, WsFrameImpl::Close).await
+        send_client_frame(&mut self.socket, WsFrameImpl::Close, &mut self.rng).await
     }
 }
 
@@ -156,15 +122,21 @@ impl<S: WebsocketIo> Websocket<S> {
 // Client handshake
 // ---------------------------------------------------------------------------
 
-/// Writes a client-side WebSocket opening handshake and validates a 101 response.
-pub async fn client_handshake<S: WebsocketIo>(
+/// Writes a client handshake using a caller-provided random generator and
+/// validates the RFC 6455 `Sec-WebSocket-Accept` response.
+pub async fn client_handshake_with_rng<S, R>(
     socket: &mut S,
     host: &str,
     port: u16,
     path: &str,
-) -> anyhow::Result<()> {
+    rng: &mut R,
+) -> anyhow::Result<()>
+where
+    S: WebsocketIo,
+    R: FnMut(&mut [u8]),
+{
     let mut key_bytes = [0u8; 16];
-    simple_random_bytes(&mut key_bytes);
+    rng(&mut key_bytes);
     let key = base64_encode(&key_bytes);
 
     let host_header = if port != 80 {
@@ -221,6 +193,13 @@ pub async fn client_handshake<S: WebsocketIo>(
                     code
                 ));
             }
+            let response = core::str::from_utf8(&buf[..hdr_end])
+                .map_err(|_| anyhow::anyhow!("invalid UTF-8 in handshake response"))?;
+            let expected_accept = compute_ws_accept(&key);
+            if find_header_value(response, "Sec-WebSocket-Accept") != Some(&expected_accept) {
+                send_client_frame(socket, WsFrameImpl::Close, rng).await?;
+                return Err(anyhow::anyhow!("invalid Sec-WebSocket-Accept in handshake"));
+            }
             return Ok(());
         }
     }
@@ -268,8 +247,19 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
+fn find_header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case(name) {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Base64 and random seed helpers
+// Base64 helpers
 // ---------------------------------------------------------------------------
 
 const BASE64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -300,41 +290,6 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
         out.push('=');
     }
     out
-}
-
-fn simple_random_bytes(out: &mut [u8]) {
-    let mut state = seed_now();
-    if state == 0 {
-        state = 0x1234_5678_9ABC_DEF0;
-    }
-    for byte in out.iter_mut() {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        *byte = state as u8;
-    }
-}
-
-fn seed_now() -> u64 {
-    let mut hasher = SeedHasher(0x1234_5678_9ABC_DEF0);
-    <RuntimeInstant as agnostic_lite::time::Instant>::now().hash(&mut hasher);
-    hasher.finish()
-}
-
-struct SeedHasher(u64);
-
-impl Hasher for SeedHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.rotate_left(13);
-            self.0 = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +397,8 @@ pub async fn ws_recv<S: WebsocketIo>(socket: &mut S) -> anyhow::Result<WsFrame> 
             }
             WsFrameImpl::Text(data) => {
                 accum.extend(data);
-                let text = String::from_utf8(accum).unwrap_or_default();
+                let text = String::from_utf8(accum)
+                    .map_err(|_| anyhow::anyhow!("invalid UTF-8 in WebSocket text frame"))?;
                 return Ok(WsFrame::Text(text));
             }
             WsFrameImpl::PartData(data) => {
@@ -452,24 +408,26 @@ pub async fn ws_recv<S: WebsocketIo>(socket: &mut S) -> anyhow::Result<WsFrame> 
     }
 }
 
-async fn send_client_frame<S: WebsocketIo>(
+async fn send_client_frame<S: WebsocketIo, R: FnMut(&mut [u8])>(
     socket: &mut S,
     frame: WsFrameImpl,
+    rng: &mut R,
 ) -> anyhow::Result<()> {
-    send_frame(socket, frame, true).await
+    send_frame(socket, frame, true, rng).await
 }
 
 async fn send_server_frame<S: WebsocketIo>(
     socket: &mut S,
     frame: WsFrameImpl,
 ) -> anyhow::Result<()> {
-    send_frame(socket, frame, false).await
+    send_frame(socket, frame, false, &mut no_rng).await
 }
 
-async fn send_frame<S: WebsocketIo>(
+async fn send_frame<S: WebsocketIo, R: FnMut(&mut [u8])>(
     socket: &mut S,
     frame: WsFrameImpl,
     masked: bool,
+    rng: &mut R,
 ) -> anyhow::Result<()> {
     let (fin, opcode, payload) = match frame {
         WsFrameImpl::Close => (true, 0x8u8, Vec::new()),
@@ -497,7 +455,7 @@ async fn send_frame<S: WebsocketIo>(
 
     if masked {
         let mut mask_key = [0u8; 4];
-        simple_random_bytes(&mut mask_key);
+        rng(&mut mask_key);
         hdr.extend_from_slice(&mask_key);
         ws_write_all(socket, &hdr).await?;
 
@@ -517,6 +475,8 @@ async fn send_frame<S: WebsocketIo>(
 
     socket_flush(socket).await
 }
+
+fn no_rng(_bytes: &mut [u8]) {}
 
 pub async fn ws_send_text<S: WebsocketIo>(socket: &mut S, data: &str) -> anyhow::Result<()> {
     send_server_frame(socket, WsFrameImpl::Text(data.as_bytes().to_vec())).await

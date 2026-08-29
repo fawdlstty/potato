@@ -121,8 +121,8 @@ pub struct AcmeManager {
 }
 
 impl AcmeManager {
-    /// 创建或加载ACME账户
-    pub async fn new(opts: AcmeOptions) -> anyhow::Result<(Self, DynamicTlsAcceptor)> {
+    /// 创建或加载ACME账户；首次签发延迟到 HTTP-01 listener 启动后
+    pub async fn new(opts: AcmeOptions) -> anyhow::Result<Self> {
         let cert_dir = opts
             .cert_dir
             .clone()
@@ -153,24 +153,21 @@ impl AcmeManager {
             challenges: Arc::new(RwLock::new(Vec::new())),
         };
 
-        // 尝试加载已有证书
-        let cert_dir_clone = cert_dir.clone();
-        let cert_path = format!("{cert_dir_clone}/cert.pem");
-        let key_path = format!("{cert_dir_clone}/key.pem");
+        Ok(manager)
+    }
 
-        let acceptor = if std::path::Path::new(&cert_path).exists()
-            && std::path::Path::new(&key_path).exists()
-        {
-            let cert_pem = std::fs::read_to_string(&cert_path)?;
-            let key_pem = std::fs::read_to_string(&key_path)?;
-            DynamicTlsAcceptor::new(&cert_pem, &key_pem)?
-        } else {
-            // 申请新证书
-            let (cert_pem, key_pem) = manager.obtain_certificate().await?;
-            DynamicTlsAcceptor::new(&cert_pem, &key_pem)?
-        };
+    pub fn has_certificate(&self) -> bool {
+        std::path::Path::new(&format!("{}/cert.pem", self.cert_dir)).exists()
+            && std::path::Path::new(&format!("{}/key.pem", self.cert_dir)).exists()
+    }
 
-        Ok((manager, acceptor))
+    pub async fn load_tls_acceptor(&self) -> anyhow::Result<Option<DynamicTlsAcceptor>> {
+        if !self.has_certificate() {
+            return Ok(None);
+        }
+        let cert_pem = std::fs::read_to_string(format!("{}/cert.pem", self.cert_dir))?;
+        let key_pem = std::fs::read_to_string(format!("{}/key.pem", self.cert_dir))?;
+        Ok(Some(DynamicTlsAcceptor::new(&cert_pem, &key_pem)?))
     }
 
     async fn create_account(
@@ -196,7 +193,7 @@ impl AcmeManager {
 
         // 保存账户凭据
         let creds_str = serde_json::to_string_pretty(&credentials)?;
-        std::fs::write(account_path, creds_str)?;
+        Self::write_file_atomically(account_path, &creds_str, true)?;
 
         Ok(account)
     }
@@ -207,7 +204,7 @@ impl AcmeManager {
     }
 
     /// 申请证书（HTTP-01验证）
-    async fn obtain_certificate(&self) -> anyhow::Result<(String, String)> {
+    pub(crate) async fn obtain_certificate(&self) -> anyhow::Result<(String, String)> {
         println!(
             "[ACME] Starting certificate obtainment for domains: {:?}",
             self.domains
@@ -299,8 +296,8 @@ impl AcmeManager {
         // 保存证书到文件
         let cert_path = format!("{}/cert.pem", self.cert_dir);
         let key_path = format!("{}/key.pem", self.cert_dir);
-        std::fs::write(&cert_path, &cert_chain_pem)?;
-        std::fs::write(&key_path, &private_key_pem)?;
+        Self::write_file_atomically(&cert_path, &cert_chain_pem, false)?;
+        Self::write_file_atomically(&key_path, &private_key_pem, true)?;
 
         println!("[ACME] Certificate obtained and saved successfully");
         Ok((cert_chain_pem, private_key_pem))
@@ -412,5 +409,27 @@ impl AcmeManager {
             }
             Err(_) => None,
         }
+    }
+    fn write_file_atomically(path: &str, contents: &str, private: bool) -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let temp_path = format!("{path}.tmp");
+        let mut file = std::fs::File::create(&temp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&temp_path)?.permissions();
+            permissions.set_mode(if private { 0o600 } else { 0o644 });
+            std::fs::set_permissions(&temp_path, permissions)?;
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&temp_path, path)?;
+        Ok(())
     }
 }

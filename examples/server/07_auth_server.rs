@@ -12,7 +12,7 @@ async fn check(payload: String) -> potato::HttpResponse {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    potato::ServerConfig::set_jwt_secret("AAABBBCCC").await; // optional, otherwise random str
+    potato::ServerConfig::set_jwt_secret("AAABBBCCC").await;
     let mut server = potato::HttpServer::new("0.0.0.0:8080");
     server.configure(|ctx| {
         ctx.use_handlers();

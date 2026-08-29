@@ -1,5 +1,6 @@
+#![cfg(feature = "std")]
 /// 测试 Controller Swagger 鉴权标记
-use potato::{HttpRequest, HttpResponse, OnceCache, SessionCache};
+use potato::{HttpRequest, HttpResponse, SessionCache};
 
 #[potato::preprocess]
 fn my_preprocess(_req: &mut HttpRequest) -> anyhow::Result<()> {
@@ -58,7 +59,7 @@ mod tests {
 
         // 创建服务器并启用 OpenAPI
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_openapi("/doc/");
         });
 

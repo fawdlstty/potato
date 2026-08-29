@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 //! 测试 max_concurrency 标注功能
 //! 验证信号量限制并发请求数量的功能
 

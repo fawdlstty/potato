@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 测试 OnceCache 参数功能
 use std::time::Duration;
 use tokio::time::sleep;

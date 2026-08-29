@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// SessionCache 功能测试
 use potato::SessionCache;
 use std::time::Duration;
@@ -163,5 +164,31 @@ async fn test_session_cache_different_users() -> anyhow::Result<()> {
     assert_eq!(user2_id, 10002);
 
     println!("✅ Different users session isolation test passed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_session_cache_isolated_by_token_content() -> anyhow::Result<()> {
+    SessionCache::set_jwt_secret(b"test-secret-key").await;
+
+    let token1 = SessionCache::generate_token(10003, Duration::from_secs(3600)).await?;
+    let token2 = SessionCache::generate_token(10003, Duration::from_secs(3599)).await?;
+
+    let cache1 = SessionCache::from_token(&token1).await?;
+    cache1.set("token_state", "first".to_string());
+
+    let cache2 = SessionCache::from_token(&token2).await?;
+    assert_eq!(cache2.get::<String>("token_state"), None);
+
+    cache2.set("token_state", "second".to_string());
+    SessionCache::invalidate(&token1);
+
+    let recreated1 = SessionCache::from_token(&token1).await?;
+    let still2 = SessionCache::from_token(&token2).await?;
+    assert_eq!(recreated1.get::<String>("token_state"), None);
+    assert_eq!(
+        still2.get::<String>("token_state"),
+        Some("second".to_string())
+    );
     Ok(())
 }

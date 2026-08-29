@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 集成测试：验证 String 和 &'static str 返回类型在实际 HTTP 服务器中的工作
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;

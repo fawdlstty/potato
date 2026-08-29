@@ -86,7 +86,7 @@ pub async fn handler(&self) -> anyhow::Result<T> {
 - Return 401 on failure
 
 **No Auth Required**:
-- Struct without `SessionCache`: auto-creates temporary SessionCache, skips auth
+- Struct without `SessionCache`: skips auth and does not create a SessionCache
 - Static methods (no receiver): called directly, no instantiation needed
 
 ## Swagger Integration
@@ -102,7 +102,7 @@ pub async fn handler(&self) -> anyhow::Result<T> {
 async fn main() -> anyhow::Result<()> {
     let mut server = potato::HttpServer::new("0.0.0.0:8080");
     server.configure(|ctx| {
-        ctx.use_handlers(true);      // Enable macro-registered routes
+        ctx.use_handlers();          // The handler pipeline must be enabled explicitly
         ctx.use_openapi("/doc/");    // Optional: Swagger docs
     });
     server.serve_http().await

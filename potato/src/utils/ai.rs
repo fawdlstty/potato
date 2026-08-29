@@ -73,7 +73,7 @@ impl OpenAISender {
                 "finish_reason": finish_reason.into(),
             }]
         }))?;
-        let payload = format!("data: {}\n\n", serde_json::to_string(&root)?);
+        let payload = format!("data: {root}\n\n");
         self.tx.send(payload.into_bytes()).await?;
         self.tx.send(b"data: [DONE]\n\n".to_vec()).await?;
         Ok(())
@@ -212,5 +212,34 @@ impl OllamaSender {
         let payload = format!("{root}\n");
         self.tx.send(payload.into_bytes()).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenAISender;
+
+    #[tokio::test]
+    async fn openai_send_finish_emits_valid_json_sse() {
+        let (sender, mut response) = OpenAISender::new("id", "object", "model", "role", 3)
+            .await
+            .unwrap();
+        sender.send_finish("stop").await.unwrap();
+        drop(sender);
+
+        let mut stream = response.body.stream_data();
+        let mut payload = String::new();
+        while let Some(chunk) = stream.next().await {
+            payload.push_str(&String::from_utf8(chunk).unwrap());
+        }
+        let finish_event = payload
+            .split("\n\n")
+            .find(|event| event.contains("\"finish_reason\":\"stop\""))
+            .unwrap();
+        let root = finish_event.strip_prefix("data: ").unwrap();
+        let json: serde_json::Value = serde_json::from_str(root).unwrap();
+        assert_eq!(json["id"], "id");
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert!(payload.ends_with("data: [DONE]\n\n"));
     }
 }

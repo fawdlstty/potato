@@ -1,6 +1,7 @@
+#![cfg(feature = "std")]
 /// 测试 Controller 成员方法中 SessionCache 的鉴权验证
 /// 确保当缺少 Authorization header 时返回 401 错误
-use potato::{HttpServer, OnceCache, SessionCache};
+use potato::{HttpServer, SessionCache};
 
 // 定义 Controller 结构体
 #[potato::controller]
@@ -43,7 +44,7 @@ mod tests {
 
         // 创建服务器
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 

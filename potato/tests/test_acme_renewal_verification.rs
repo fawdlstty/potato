@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// ACME续签功能实际验证测试
 /// 验证续签逻辑在真实场景中的正确性
 #[cfg(feature = "acme")]

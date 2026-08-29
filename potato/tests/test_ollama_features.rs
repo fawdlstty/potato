@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 use potato::OllamaSender;
 
 #[tokio::test]

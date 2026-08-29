@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 测试 String 和 &'static str 返回类型支持
 
 #[test]

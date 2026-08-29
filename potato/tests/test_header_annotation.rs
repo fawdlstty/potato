@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 集成测试：验证 #[header(...)] 标注功能
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;

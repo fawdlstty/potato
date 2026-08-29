@@ -20,11 +20,12 @@ use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::UNIX_EPOCH;
 use tokio::net::TcpListener;
 use tokio::select;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Notify};
 use tokio::time::{interval, Duration};
 #[cfg(any(feature = "tls", feature = "http3"))]
 use tokio_rustls::rustls;
@@ -58,6 +59,146 @@ impl CorsConfig {
     }
 }
 
+impl PipeContext {
+    pub(crate) fn cors_config(&self) -> Option<&CorsConfig> {
+        self.items.iter().find_map(|item| match item {
+            PipeContextItem::Cors(config) => Some(config),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn request_limits(&self) -> Option<(usize, usize)> {
+        self.items.iter().find_map(|item| match item {
+            PipeContextItem::LimitSize(header, body) => Some((*header, *body)),
+            _ => None,
+        })
+    }
+
+    fn allowed_cors_origin<'a>(
+        &self,
+        config: &'a CorsConfig,
+        origin: Option<&'a str>,
+    ) -> Option<&'a str> {
+        let origin = origin?.trim();
+        if origin.is_empty() {
+            return None;
+        }
+        let configured = config.origin.as_deref()?.trim();
+        if configured == "*" {
+            return (!config.credentials).then_some("*");
+        }
+        list_contains(configured, origin).then_some(origin)
+    }
+
+    fn apply_cors_headers(&self, res: &mut HttpResponse, req: &HttpRequest) {
+        let Some(config) = self.cors_config() else {
+            return;
+        };
+        let Some(origin) = self.allowed_cors_origin(config, req.get_header("Origin")) else {
+            return;
+        };
+        res.add_header(
+            "Access-Control-Allow-Origin".into(),
+            origin.to_owned().into(),
+        );
+        if let Some(methods) = config.methods.as_deref() {
+            res.add_header(
+                "Access-Control-Allow-Methods".into(),
+                methods.to_owned().into(),
+            );
+        }
+        if let Some(headers) = config.headers.as_deref() {
+            res.add_header(
+                "Access-Control-Allow-Headers".into(),
+                headers.to_owned().into(),
+            );
+        }
+        if let Some(max_age) = config.max_age.as_deref() {
+            res.add_header("Access-Control-Max-Age".into(), max_age.to_owned().into());
+        }
+        if let Some(expose_headers) = config.expose_headers.as_deref() {
+            res.add_header(
+                "Access-Control-Expose-Headers".into(),
+                expose_headers.to_owned().into(),
+            );
+        }
+        if config.credentials {
+            res.add_header("Access-Control-Allow-Credentials".into(), "true".into());
+        }
+    }
+
+    fn cors_preflight(&self, req: &HttpRequest) -> Option<HttpResponse> {
+        let config = self.cors_config()?;
+        let origin = self.allowed_cors_origin(config, req.get_header("Origin"))?;
+        let method = req.get_header("Access-Control-Request-Method")?.trim();
+        if method.is_empty() {
+            return None;
+        }
+        if let Some(methods) = config.methods.as_deref().map(str::trim) {
+            if methods != "*" && !list_contains(methods, method) {
+                return None;
+            }
+        }
+        let requested_headers = req.get_header("Access-Control-Request-Headers");
+        if let Some(headers) = config.headers.as_deref().map(str::trim) {
+            if headers != "*" {
+                for header in requested_headers.into_iter().flat_map(split_header_list) {
+                    if !list_contains(headers, header) {
+                        return None;
+                    }
+                }
+            }
+        }
+
+        let mut res = HttpResponse::empty();
+        res.http_code = 204;
+        res.add_header(
+            "Access-Control-Allow-Origin".into(),
+            origin.to_owned().into(),
+        );
+        res.add_header(
+            "Access-Control-Allow-Methods".into(),
+            method.to_owned().into(),
+        );
+        if let Some(headers) = requested_headers.map(str::trim).filter(|v| !v.is_empty()) {
+            res.add_header(
+                "Access-Control-Allow-Headers".into(),
+                headers.to_owned().into(),
+            );
+        }
+        if let Some(max_age) = config.max_age.as_deref() {
+            res.add_header("Access-Control-Max-Age".into(), max_age.to_owned().into());
+        }
+        if config.credentials {
+            res.add_header("Access-Control-Allow-Credentials".into(), "true".into());
+        }
+        Some(res)
+    }
+}
+
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+static CONNECTIONS_DRAINED: LazyLock<Notify> = LazyLock::new(Notify::new);
+static CONNECTION_TASKS: LazyLock<StdMutex<tokio::task::JoinSet<()>>> =
+    LazyLock::new(|| StdMutex::new(tokio::task::JoinSet::new()));
+
+struct ConnectionGuard;
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            CONNECTIONS_DRAINED.notify_waiters();
+        }
+    }
+}
+
+fn split_header_list(value: &str) -> impl Iterator<Item = &str> {
+    value.split(',').map(str::trim).filter(|v| !v.is_empty())
+}
+
+fn list_contains(value: &str, expected: &str) -> bool {
+    split_header_list(value).any(|item| item.eq_ignore_ascii_case(expected))
+}
+
 type AsyncCustomHandler = dyn Fn(&mut HttpRequest) -> Pin<Box<dyn Future<Output = Option<HttpResponse>> + Send + '_>>
     + Send
     + Sync;
@@ -76,9 +217,9 @@ type GlobalPostprocessHandler =
         &'a mut HttpResponse,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
-// Re-export WebTransport types from http3 module
-#[cfg(feature = "http3")]
-pub use http3::{WebTransportConfig, WebTransportHandler, WebTransportSession, WebTransportStream};
+// WebTransport remains experimental until its session protocol is complete.
+#[cfg(feature = "webtransport")]
+pub use http3::{WebTransportHandler, WebTransportSession, WebTransportStream};
 
 #[derive(Clone)]
 pub enum CustomHandler {
@@ -122,6 +263,7 @@ pub enum PipeContextItem {
     LocationRoute((String, String, bool)),
     EmbeddedRoute(HashMap<String, Cow<'static, [u8]>>),
     FinalRoute(HttpResponse),
+    Cors(CorsConfig),
     Custom(CustomHandler),
     Preprocess(PreprocessHandler),
     Postprocess(PostprocessHandler),
@@ -132,10 +274,10 @@ pub enum PipeContextItem {
     Jemalloc(String),
     #[cfg(feature = "webdav")]
     Webdav((String, dav_server::DavHandler)),
-    #[cfg(feature = "http3")]
-    WebTransport((String, WebTransportConfig, WebTransportHandler)),
+    #[cfg(feature = "webtransport")]
+    WebTransport((String, Arc<WebTransportHandler>)),
     #[cfg(feature = "webrtc")]
-    WebRTC((crate::webrtc::WebRTCConfig, crate::webrtc::WebRTCEvents)),
+    WebRTC(Arc<crate::webrtc::WebRtcSignalingHandler>),
 }
 
 // 手动实现 Clone，因为 WebTransportHandler 不能 Clone
@@ -146,6 +288,7 @@ impl Clone for PipeContextItem {
             PipeContextItem::LocationRoute(v) => PipeContextItem::LocationRoute(v.clone()),
             PipeContextItem::EmbeddedRoute(v) => PipeContextItem::EmbeddedRoute(v.clone()),
             PipeContextItem::FinalRoute(v) => PipeContextItem::FinalRoute(v.clone()),
+            PipeContextItem::Cors(v) => PipeContextItem::Cors(v.clone()),
             PipeContextItem::Custom(v) => PipeContextItem::Custom(v.clone()),
             PipeContextItem::Preprocess(v) => PipeContextItem::Preprocess(v.clone()),
             PipeContextItem::Postprocess(v) => PipeContextItem::Postprocess(v.clone()),
@@ -158,21 +301,33 @@ impl Clone for PipeContextItem {
             PipeContextItem::Jemalloc(v) => PipeContextItem::Jemalloc(v.clone()),
             #[cfg(feature = "webdav")]
             PipeContextItem::Webdav(v) => PipeContextItem::Webdav(v.clone()),
-            #[cfg(feature = "http3")]
-            PipeContextItem::WebTransport(_) => {
-                // WebTransport handler cannot be cloned by design
-                // This should never happen in normal usage as WebTransport
-                // handlers are not meant to be cloned
-                unreachable!("WebTransport handler cannot be cloned. This is a programming error.")
-            }
+            #[cfg(feature = "webtransport")]
+            PipeContextItem::WebTransport(v) => PipeContextItem::WebTransport(v.clone()),
             #[cfg(feature = "webrtc")]
-            PipeContextItem::WebRTC(v) => PipeContextItem::WebRTC(v.clone()),
+            PipeContextItem::WebRTC(v) => PipeContextItem::WebRTC(Arc::clone(v)),
         }
     }
 }
 
 pub struct PipeContext {
     items: Vec<PipeContextItem>,
+}
+
+#[cfg(all(test, feature = "webtransport"))]
+mod pipe_context_tests {
+    use super::*;
+
+    #[cfg(feature = "webtransport")]
+    #[test]
+    fn webtransport_items_clone_without_panic() {
+        let mut ctx = PipeContext::empty();
+        ctx.use_webtransport("/wt", |_session| async {});
+        let cloned = ctx.clone_items();
+        assert!(matches!(
+            cloned.first(),
+            Some(PipeContextItem::WebTransport(_))
+        ));
+    }
 }
 
 impl Default for PipeContext {
@@ -455,6 +610,10 @@ impl PipeContext {
         self.items.clone()
     }
 
+    /// Enables macro-registered HTTP handlers in the request pipeline.
+    ///
+    /// Controller and OpenAPI routes register automatically; this call is only
+    /// needed to make normal `http_*` handlers part of request processing.
     pub fn use_handlers(&mut self) {
         self.items.push(PipeContextItem::Handlers);
     }
@@ -582,6 +741,11 @@ impl PipeContext {
             .push(PipeContextItem::Postprocess(PostprocessHandler::Fn(
                 handler,
             )));
+    }
+
+    /// Enables CORS handling for all HTTP responses and preflight requests.
+    pub fn use_cors(&mut self, config: CorsConfig) {
+        self.items.push(PipeContextItem::Cors(config));
     }
 
     /// 添加请求体大小限制中间件
@@ -941,7 +1105,7 @@ impl PipeContext {
             .push(PipeContextItem::Webdav((url_path.into(), dav_server)));
     }
 
-    #[cfg(feature = "http3")]
+    #[cfg(feature = "webtransport")]
     pub fn use_webtransport<F, Fut>(&mut self, url_path: impl Into<String>, handler: F)
     where
         F: Fn(WebTransportSession) -> Fut + Send + Sync + 'static,
@@ -949,8 +1113,7 @@ impl PipeContext {
     {
         self.items.push(PipeContextItem::WebTransport((
             url_path.into(),
-            WebTransportConfig::default(),
-            Box::new(move |session| Box::pin(handler(session))),
+            Arc::new(Box::new(move |session| Box::pin(handler(session)))),
         )));
     }
 
@@ -960,15 +1123,32 @@ impl PipeContext {
     }
 
     #[cfg(feature = "webrtc")]
-    pub(crate) fn add_webrtc(
-        &mut self,
-        config: crate::webrtc::WebRTCConfig,
-        events: crate::webrtc::WebRTCEvents,
-    ) {
-        self.items.push(PipeContextItem::WebRTC((config, events)));
+    pub(crate) fn add_webrtc(&mut self, handler: Arc<crate::webrtc::WebRtcSignalingHandler>) {
+        self.items.push(PipeContextItem::WebRTC(handler));
     }
 
     pub async fn handle_request(
+        self2: &PipeContext,
+        req: &mut HttpRequest,
+        skip: usize,
+    ) -> HttpResponse {
+        let mut response = if req.method == HttpMethod::OPTIONS
+            && req.get_header("Origin").is_some()
+            && req.get_header("Access-Control-Request-Method").is_some()
+        {
+            self2.cors_preflight(req).unwrap_or_else(|| {
+                let mut res = HttpResponse::text("CORS preflight rejected");
+                res.http_code = 403;
+                res
+            })
+        } else {
+            Self::handle_request_inner(self2, req, skip).await
+        };
+        self2.apply_cors_headers(&mut response, req);
+        response
+    }
+
+    async fn handle_request_inner(
         self2: &PipeContext,
         req: &mut HttpRequest,
         skip: usize,
@@ -1015,6 +1195,7 @@ impl PipeContext {
                     // Postprocess 已在函数开始时收集,在此跳过
                     continue;
                 }
+                PipeContextItem::Cors(_) => continue,
                 PipeContextItem::Handlers => {
                     let handler_ref = HANDLERS_FLAT
                         .get(&(&req.url_path[..], req.method))
@@ -1023,9 +1204,6 @@ impl PipeContext {
                         let mut res = match handler_ref {
                             HttpHandler::Async(handler) => handler(req).await,
                             HttpHandler::Sync(handler) => handler(req),
-                            HttpHandler::AsyncNoSend(_) => {
-                                unreachable!("AsyncNoSend handlers are not supported - all handlers must use Send")
-                            }
                         };
                         execute_postprocess(&postprocess_handlers, req, &mut res).await;
                         return res;
@@ -1039,9 +1217,6 @@ impl PipeContext {
                                 let mut res = match get_handler_ref {
                                     HttpHandler::Async(handler) => handler(req).await,
                                     HttpHandler::Sync(handler) => handler(req),
-                                    HttpHandler::AsyncNoSend(_) => {
-                                        unreachable!("AsyncNoSend handlers are not supported")
-                                    }
                                 };
                                 req.method = HttpMethod::HEAD;
                                 res.body = crate::HttpResponseBody::Data(vec![]);
@@ -1493,9 +1668,11 @@ impl PipeContext {
                             }
                         };
                         for (k, v) in req.headers.iter() {
-                            if let Ok(v) = http::HeaderValue::from_str(&v[..]) {
-                                let k: &'static str = unsafe { std::mem::transmute(k.to_str()) };
-                                new_req.headers_mut().append(k, v);
+                            if let (Ok(name), Ok(value)) = (
+                                http::HeaderName::from_bytes(k.to_str().as_bytes()),
+                                http::HeaderValue::from_str(&v[..]),
+                            ) {
+                                new_req.headers_mut().append(name, value);
                             }
                         }
                         new_req
@@ -1531,27 +1708,16 @@ impl PipeContext {
                     return res;
                 }
                 #[cfg(feature = "webrtc")]
-                PipeContextItem::WebRTC((config, _events)) => {
-                    // WebRTC信令处理
-                    // WebSocket信令在WebSocket upgrade时处理
-                    // REST信令在这里处理
-                    if req.url_path.starts_with(&config.rest_prefix) {
-                        // 处理REST信令请求
-                        // TODO: 实现完整的REST信令处理逻辑
-                        // 目前返回提示信息
-                        let host = req.get_header("Host").unwrap_or("127.0.0.1:8080");
-                        let json_response = serde_json::json!({
-                            "status": "WebRTC REST signaling endpoint",
-                            "ws_url": format!("ws://{host}{}", config.ws_path),
-                            "rest_prefix": config.rest_prefix,
-                        });
-                        let mut res = HttpResponse::json(json_response.to_string());
-                        res.add_header("Content-Type".into(), "application/json".into());
-                        execute_postprocess(&postprocess_handlers, req, &mut res).await;
-                        return res;
+                PipeContextItem::WebRTC(handler) => {
+                    if req.method == HttpMethod::GET && req.url_path == handler.ws_path() {
+                        handler
+                            .handle_websocket(req)
+                            .await
+                            .unwrap_or_else(|err| eprintln!("WebRTC signaling error: {err}"));
+                        return HttpResponse::empty();
                     }
                 }
-                #[cfg(feature = "http3")]
+                #[cfg(feature = "webtransport")]
                 PipeContextItem::WebTransport(_) => {
                     // WebTransport 在 HTTP/3 层处理，这里不会到达
                     // CONNECT 请求已经在 serve_http3_impl 中处理
@@ -1566,23 +1732,100 @@ impl PipeContext {
 pub struct HttpServer {
     addr: String,
     pipe_ctx: Arc<PipeContext>,
+    serving: bool,
+    shutdown_grace: Duration,
     shutdown_signal: Option<oneshot::Receiver<()>>,
     #[cfg(feature = "acme")]
     acme_manager: Option<crate::acme::AcmeManager>,
     #[cfg(feature = "acme")]
     acme_acceptor: Option<crate::acme::DynamicTlsAcceptor>,
+    #[cfg(feature = "acme")]
+    acme_challenge_listener: Option<TcpListener>,
 }
 
 impl HttpServer {
+    pub(crate) fn spawn_connection<F>(future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
+        let mut tasks = CONNECTION_TASKS.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let _connection_guard = ConnectionGuard;
+            future.await;
+        });
+    }
+
+    async fn drain_connections(grace: Duration) {
+        let deadline = tokio::time::Instant::now() + grace;
+        while ACTIVE_CONNECTIONS.load(Ordering::Acquire) > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = CONNECTIONS_DRAINED.notified() => {}
+            }
+        }
+
+        {
+            let mut tasks = CONNECTION_TASKS.lock().unwrap();
+            tasks.abort_all();
+            while tasks.try_join_next().is_some() {}
+        }
+        while ACTIVE_CONNECTIONS.load(Ordering::Acquire) > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = CONNECTIONS_DRAINED.notified() => {}
+            }
+        }
+        let mut tasks = CONNECTION_TASKS.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+    }
+
+    pub fn set_shutdown_grace(&mut self, grace: Duration) {
+        self.shutdown_grace = grace;
+    }
+
+    async fn finish_serve<F>(
+        serve: F,
+        shutdown_signal: Option<oneshot::Receiver<()>>,
+        grace: Duration,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<()>>,
+    {
+        match shutdown_signal {
+            Some(shutdown_signal) => {
+                select! {
+                    result = serve => result,
+                    _ = shutdown_signal => {
+                        Self::drain_connections(grace).await;
+                        Ok(())
+                    }
+                }
+            }
+            None => serve.await,
+        }
+    }
+
     pub fn new(addr: impl Into<String>) -> Self {
         HttpServer {
             addr: addr.into(),
             pipe_ctx: Arc::new(PipeContext::new()),
+            serving: false,
+            shutdown_grace: Duration::from_secs(30),
             shutdown_signal: None,
             #[cfg(feature = "acme")]
             acme_manager: None,
             #[cfg(feature = "acme")]
             acme_acceptor: None,
+            #[cfg(feature = "acme")]
+            acme_challenge_listener: None,
         }
     }
 
@@ -1607,10 +1850,14 @@ impl HttpServer {
         });
     }
 
-    pub fn configure(&mut self, callback: impl Fn(&mut PipeContext)) {
+    pub fn configure(&mut self, callback: impl Fn(&mut PipeContext)) -> anyhow::Result<()> {
+        if self.serving {
+            anyhow::bail!("server configuration cannot be changed while serving");
+        }
         let mut ctx = PipeContext::empty();
         callback(&mut ctx);
         self.pipe_ctx = Arc::new(ctx);
+        Ok(())
     }
 
     pub fn shutdown_signal(&mut self) -> anyhow::Result<oneshot::Sender<()>> {
@@ -1623,88 +1870,79 @@ impl HttpServer {
     }
 
     pub async fn serve_http(&mut self) -> anyhow::Result<()> {
+        self.serving = true;
         let shutdown_signal = self.shutdown_signal.take();
-        match shutdown_signal {
-            Some(shutdown_signal) => {
-                select! {
-                    result = self.serve_http_impl() => result,
-                    _ = shutdown_signal => Ok(()),
-                }
-            }
-            None => self.serve_http_impl().await,
-        }
+        let grace = self.shutdown_grace;
+        let result = Self::finish_serve(self.serve_http_impl(), shutdown_signal, grace).await;
+        self.serving = false;
+        result
     }
 
     #[cfg(feature = "tls")]
     pub async fn serve_https(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
+        self.serving = true;
         let shutdown_signal = self.shutdown_signal.take();
-        match shutdown_signal {
-            Some(shutdown_signal) => {
-                select! {
-                    result = self.serve_https_impl(cert_file, key_file) => result,
-                    _ = shutdown_signal => Ok(()),
-                }
-            }
-            None => self.serve_https_impl(cert_file, key_file).await,
-        }
+        let grace = self.shutdown_grace;
+        let result = Self::finish_serve(
+            self.serve_https_impl(cert_file, key_file),
+            shutdown_signal,
+            grace,
+        )
+        .await;
+        self.serving = false;
+        result
     }
 
     #[cfg(feature = "http2")]
     pub async fn serve_http2(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
+        self.serving = true;
         let shutdown_signal = self.shutdown_signal.take();
         let pipe_ctx = Arc::clone(&self.pipe_ctx);
         let addr = self.addr.clone();
-        match shutdown_signal {
-            Some(shutdown_signal) => {
-                select! {
-                    result = http2::serve_http2_impl(&addr, cert_file, key_file, pipe_ctx) => result,
-                    _ = shutdown_signal => Ok(()),
-                }
-            }
-            None => {
-                http2::serve_http2_impl(&self.addr, cert_file, key_file, Arc::clone(&self.pipe_ctx))
-                    .await
-            }
-        }
+        let grace = self.shutdown_grace;
+        let result = Self::finish_serve(
+            http2::serve_http2_impl(&addr, cert_file, key_file, pipe_ctx),
+            shutdown_signal,
+            grace,
+        )
+        .await;
+        self.serving = false;
+        result
     }
 
     #[cfg(feature = "http3")]
     pub async fn serve_http3(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
+        self.serving = true;
         let shutdown_signal = self.shutdown_signal.take();
         let pipe_ctx = Arc::clone(&self.pipe_ctx);
         let addr = self.addr.clone();
-        match shutdown_signal {
-            Some(shutdown_signal) => {
-                select! {
-                    result = http3::serve_http3_impl(&addr, cert_file, key_file, pipe_ctx) => result,
-                    _ = shutdown_signal => Ok(()),
-                }
-            }
-            None => {
-                http3::serve_http3_impl(&self.addr, cert_file, key_file, Arc::clone(&self.pipe_ctx))
-                    .await
-            }
-        }
+        let grace = self.shutdown_grace;
+        let result = Self::finish_serve(
+            http3::serve_http3_impl(&addr, cert_file, key_file, pipe_ctx),
+            shutdown_signal,
+            grace,
+        )
+        .await;
+        self.serving = false;
+        result
     }
 
     /// 启动 HTTP/3 服务器（无加密模式，使用 http:// 协议）
     #[cfg(feature = "http3")]
     pub async fn serve_http3_without_encrypt(&mut self) -> anyhow::Result<()> {
+        self.serving = true;
         let shutdown_signal = self.shutdown_signal.take();
         let pipe_ctx = Arc::clone(&self.pipe_ctx);
         let addr = self.addr.clone();
-        match shutdown_signal {
-            Some(shutdown_signal) => {
-                select! {
-                    result = http3::serve_http3_without_encrypt_impl(&addr, pipe_ctx) => result,
-                    _ = shutdown_signal => Ok(()),
-                }
-            }
-            None => {
-                http3::serve_http3_without_encrypt_impl(&self.addr, Arc::clone(&self.pipe_ctx))
-                    .await
-            }
-        }
+        let grace = self.shutdown_grace;
+        let result = Self::finish_serve(
+            http3::serve_http3_without_encrypt_impl(&addr, pipe_ctx),
+            shutdown_signal,
+            grace,
+        )
+        .await;
+        self.serving = false;
+        result
     }
 
     #[cfg(feature = "acme")]
@@ -1722,9 +1960,20 @@ impl HttpServer {
         &mut self,
         opts: crate::acme::AcmeOptions,
     ) -> anyhow::Result<()> {
-        let (acme_manager, acme_acceptor) = crate::acme::AcmeManager::new(opts).await?;
+        let acme_manager = crate::acme::AcmeManager::new(opts).await?;
+        let challenge_listener = TcpListener::bind("0.0.0.0:80").await?;
+        self.acme_manager = Some(acme_manager.clone());
+        self.acme_challenge_listener = Some(challenge_listener);
 
-        // 启动后台续期循环
+        // HTTP-01 challenge responses are now reachable before the first signing request.
+        let acme_acceptor = match acme_manager.load_tls_acceptor().await? {
+            Some(acceptor) => acceptor,
+            None => {
+                let (cert_pem, key_pem) = acme_manager.obtain_certificate().await?;
+                crate::acme::DynamicTlsAcceptor::new(&cert_pem, &key_pem)?
+            }
+        };
+
         let manager_clone = acme_manager.clone();
         let acceptor_clone = acme_acceptor.clone();
         tokio::spawn(async move {
@@ -1733,19 +1982,14 @@ impl HttpServer {
             }
         });
 
-        self.acme_manager = Some(acme_manager);
         self.acme_acceptor = Some(acme_acceptor);
 
+        self.serving = true;
         let shutdown_signal = self.shutdown_signal.take();
-        match shutdown_signal {
-            Some(shutdown_signal) => {
-                select! {
-                    result = self.serve_acme_impl() => result,
-                    _ = shutdown_signal => Ok(()),
-                }
-            }
-            None => self.serve_acme_impl().await,
-        }
+        let grace = self.shutdown_grace;
+        let result = Self::finish_serve(self.serve_acme_impl(), shutdown_signal, grace).await;
+        self.serving = false;
+        result
     }
 
     pub(crate) fn spawn_http1_connection(
@@ -1774,18 +2018,31 @@ impl HttpServer {
         };
 
         let mut stream = Arc::new(Mutex::new(stream));
-        _ = tokio::task::spawn(async move {
+        let request_limits = pipe_ctx.request_limits();
+        Self::spawn_connection(async move {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
             loop {
                 let (mut req, n) = {
-                    match HttpRequest::from_stream(&mut buf, Arc::clone(&stream)).await {
+                    match HttpRequest::from_stream_with_limits(
+                        &mut buf,
+                        Arc::clone(&stream),
+                        request_limits.map(|(header, _)| header),
+                        request_limits.map(|(_, body)| body),
+                    )
+                    .await
+                    {
                         Ok((req, n)) => (req, n),
                         Err(err) => {
                             let err_msg = err.to_string();
                             if err_msg.contains("conflicting duplicate Content-Length headers") {
                                 break;
                             }
-                            let mut res = if err_msg.contains("Expect header") {
+                            let mut res = if err_msg.contains("request body too large") {
+                                let mut res =
+                                    HttpResponse::text(format!("Payload Too Large: {err_msg}"));
+                                res.http_code = 413;
+                                res
+                            } else if err_msg.contains("Expect header") {
                                 let mut res = HttpResponse::html(err_msg);
                                 res.http_code = 417;
                                 res
@@ -1908,7 +2165,7 @@ impl HttpServer {
             _ = stream.set_nodelay(true);
             let acceptor = acceptor.clone();
             let pipe_ctx2 = Arc::clone(&pipe_ctx);
-            _ = tokio::task::spawn(async move {
+            Self::spawn_connection(async move {
                 let stream = match acceptor.accept(stream).await {
                     Ok(stream) => stream,
                     Err(_) => return,
@@ -1929,6 +2186,10 @@ impl HttpServer {
 
         let addr: SocketAddr = self.addr.parse()?;
         let listener = TcpListener::bind(&addr).await?;
+        let challenge_listener = self
+            .acme_challenge_listener
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("ACME HTTP-01 listener not initialized"))?;
         let acme_acceptor = self
             .acme_acceptor
             .as_ref()
@@ -1941,29 +2202,81 @@ impl HttpServer {
         let acme_manager_clone = acme_manager.clone();
 
         loop {
-            let (stream, client_addr) = listener.accept().await?;
-            _ = stream.set_nodelay(true);
-            let acceptor = acme_acceptor.get_acceptor().await;
-            let pipe_ctx2 = Arc::clone(&pipe_ctx);
-            let acme_manager2 = acme_manager_clone.clone();
-            let acceptor_clone = acceptor.clone();
+            tokio::select! {
+                accepted = challenge_listener.accept() => {
+                    let (stream, _) = accepted?;
+                    _ = stream.set_nodelay(true);
+                    let acme_manager2 = acme_manager_clone.clone();
+                    Self::spawn_connection(async move {
+                        Self::handle_acme_challenge_only(acme_manager2, stream).await;
+                    });
+                }
+                accepted = listener.accept() => {
+                    let (stream, client_addr) = accepted?;
+                    _ = stream.set_nodelay(true);
+                    let acceptor = acme_acceptor.get_acceptor().await;
+                    let pipe_ctx2 = Arc::clone(&pipe_ctx);
+                    let acme_manager2 = acme_manager_clone.clone();
+                    let acceptor_clone = acceptor.clone();
 
-            _ = tokio::task::spawn(async move {
-                let stream = match acceptor_clone.accept(stream).await {
-                    Ok(stream) => stream,
-                    Err(_) => return,
-                };
+                    Self::spawn_connection(async move {
+                        let stream = match acceptor_clone.accept(stream).await {
+                            Ok(stream) => stream,
+                            Err(_) => return,
+                        };
 
-                // 直接处理ACME挑战请求
-                Self::handle_acme_or_normal(
-                    pipe_ctx2,
-                    client_addr,
-                    HttpStream::from_server_tls(stream),
-                    &acme_manager2,
-                )
-                .await;
-            });
+                        Self::handle_acme_or_normal(
+                            pipe_ctx2,
+                            client_addr,
+                            HttpStream::from_server_tls(stream),
+                            &acme_manager2,
+                        )
+                        .await;
+                    });
+                }
+            }
         }
+    }
+
+    #[cfg(feature = "acme")]
+    async fn handle_acme_challenge_only(
+        acme_manager: crate::acme::AcmeManager,
+        mut stream: tokio::net::TcpStream,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buf = vec![0u8; 4096];
+        if stream.read(&mut buf).await.unwrap_or(0) == 0 {
+            return;
+        }
+        let request = String::from_utf8_lossy(&buf);
+        let token = request
+            .split_whitespace()
+            .nth(1)
+            .and_then(|target| target.strip_prefix("/.well-known/acme-challenge/"))
+            .unwrap_or_default()
+            .split(['?', ' '])
+            .next()
+            .unwrap_or_default();
+
+        if let Some(challenge) = acme_manager
+            .get_challenges()
+            .await
+            .into_iter()
+            .find(|challenge| challenge.token == token)
+        {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                challenge.key_authorization.len(),
+                challenge.key_authorization
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            return;
+        }
+
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
     }
 
     #[cfg(feature = "acme")]

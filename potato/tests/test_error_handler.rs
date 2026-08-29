@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 use potato::*;
 
 /// 测试自定义错误处理器（异步版本）

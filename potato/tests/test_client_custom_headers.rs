@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 测试客户端宏的 Custom header 支持
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;

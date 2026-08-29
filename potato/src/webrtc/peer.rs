@@ -4,20 +4,20 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::peer_connection::PeerConnection;
 
 /// Peer连接
 pub struct Peer {
     pub peer_id: String,
     pub room_id: String,
-    pub peer_connection: Arc<RTCPeerConnection>,
+    pub peer_connection: Arc<dyn PeerConnection>,
     pub publishing: bool,
     pub subscribing: Vec<String>, // 订阅的peer_id列表
 }
 
 impl Peer {
     /// 创建新Peer
-    pub fn new(peer_id: &str, room_id: &str, pc: Arc<RTCPeerConnection>) -> Self {
+    pub fn new(peer_id: &str, room_id: &str, pc: Arc<dyn PeerConnection>) -> Self {
         Self {
             peer_id: peer_id.to_string(),
             room_id: room_id.to_string(),

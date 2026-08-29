@@ -86,7 +86,7 @@ pub async fn handler(&self) -> anyhow::Result<T> {
 - 验证失败返回 401
 
 **无需鉴权的情况**：
-- 结构体不包含 `SessionCache` 字段：自动创建临时 SessionCache，跳过鉴权
+- 结构体不包含 `SessionCache` 字段：直接跳过鉴权，也不创建 SessionCache
 - 方法无 receiver（静态方法）：直接调用，无需实例化
 
 ## Swagger集成
@@ -102,7 +102,7 @@ pub async fn handler(&self) -> anyhow::Result<T> {
 async fn main() -> anyhow::Result<()> {
     let mut server = potato::HttpServer::new("0.0.0.0:8080");
     server.configure(|ctx| {
-        ctx.use_handlers(true);      // 启用宏注册的路由
+        ctx.use_handlers();          // handler pipeline需要显式启用
         ctx.use_openapi("/doc/");    // 可选：Swagger文档
     });
     server.serve_http().await

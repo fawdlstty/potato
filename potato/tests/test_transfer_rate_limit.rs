@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 use potato::{HttpResponse, HttpServer};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Instant;
@@ -38,7 +39,7 @@ async fn test_transfer_rate_limit() -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let mut server = HttpServer::new(&addr);
 
-    server.configure(|ctx| {
+    let _ = server.configure(|ctx| {
         // 入站 10 Mbps，出站 1 Mbps 速率限制
         ctx.use_transfer_limit(10_000_000, 1_000_000);
         ctx.use_handlers();
@@ -90,7 +91,7 @@ async fn test_no_rate_limit() -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let mut server = HttpServer::new(&addr);
 
-    server.configure(|ctx| {
+    let _ = server.configure(|ctx| {
         ctx.use_handlers();
     });
 

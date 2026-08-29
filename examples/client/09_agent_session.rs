@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
     while let Some(chunk) = stream.recv().await {
         match chunk {
             potato::StreamChunk::Content(text) => print!("{}", text),
+            potato::StreamChunk::Error(error) => eprintln!("stream error: {error}"),
             potato::StreamChunk::Done => break,
         }
     }

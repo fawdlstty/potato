@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 集成测试：验证 serde_json::Value 返回类型在实际 HTTP 服务中的工作
 use std::time::Duration;
 use tokio::time::sleep;

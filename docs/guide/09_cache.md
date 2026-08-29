@@ -122,7 +122,7 @@ async fn cookie_delete(cache: &mut SessionCache) -> HttpResponse {
 #### 会话管理
 - `SessionCache::set_jwt_secret(secret)` - 设置JWT密钥（全局）
 - `SessionCache::generate_token(user_id, duration)` - 签发token
-- `SessionCache::invalidate(user_id)` - 使session失效
+- `SessionCache::invalidate(token)` - 使指定token的session失效
 
 #### 数据存储
 - `cache.get::<T>(key)` - 获取值（需Clone）

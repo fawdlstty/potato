@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 #[cfg(feature = "http2")]
 use std::sync::atomic::{AtomicU16, Ordering};
 #[cfg(feature = "http2")]

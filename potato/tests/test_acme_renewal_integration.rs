@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// ACME 续签流程集成测试
 /// 模拟完整的证书申请、保存、续签流程
 #[cfg(feature = "acme")]

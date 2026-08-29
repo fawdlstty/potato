@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use webrtc::rtp::packet::Packet as RtpPacket;
+use rtc::rtp::Packet as RtpPacket;
 
 /// 媒体类型
 #[derive(Debug, Clone, PartialEq)]

@@ -1,8 +1,9 @@
 #![allow(non_camel_case_types)]
 #![cfg(feature = "http3")]
 
+use super::SERVER_STR;
 use crate::utils::refstr::Headers;
-use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody, SERVER_STR};
+use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody};
 use anyhow::anyhow;
 use bytes::Buf;
 use h3_quinn::quinn;
@@ -490,21 +491,24 @@ define_h3_client_method!(patch);
 define_h3_client_method!(connect);
 define_h3_client_method!(trace);
 
-/// WebTransport 客户端
+/// 实验性 WebTransport 客户端；会话协议尚未完整实现。
+#[cfg(feature = "webtransport")]
 pub struct WebTransport {
     connection: quinn::Connection,
     driver_handle: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(feature = "webtransport")]
 impl Drop for WebTransport {
     fn drop(&mut self) {
         self.driver_handle.abort();
     }
 }
 
+#[cfg(feature = "webtransport")]
 impl WebTransport {
     /// 连接到 WebTransport 服务器
-    pub async fn connect(url: &str, _headers: Vec<Headers>) -> anyhow::Result<Self> {
+    pub async fn connect(url: &str) -> anyhow::Result<Self> {
         // 解析 URL
         let uri: http::Uri = url.parse()?;
         let host = uri

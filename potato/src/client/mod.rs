@@ -5,10 +5,11 @@ pub mod http2;
 #[cfg(feature = "http3")]
 pub mod http3;
 
+use super::SERVER_STR;
 use crate::utils::bytes::CompressExt;
 use crate::utils::refstr::{HeaderItem, Headers};
 use crate::utils::tcp_stream::HttpStream;
-use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody, SERVER_STR};
+use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody};
 use anyhow::anyhow;
 use std::collections::HashMap;
 use tokio::net::TcpStream;
@@ -1083,9 +1084,17 @@ impl TransferSession {
         use std::sync::Arc;
         let config = Arc::new(russh::client::Config::default());
 
-        let mut handle =
-            russh::client::connect(config, (&jumpbox.host[..], jumpbox.port), AuthHandler {})
-                .await?;
+        let parsed_public_key = jumpbox
+            .host_public_key
+            .parse::<russh::keys::PublicKey>()
+            .map_err(|err| anyhow!("Invalid SSH jumpbox host public key: {err}"))?;
+        let host_public_key = russh::keys::PublicKey::new(parsed_public_key.key_data().clone(), "");
+        let mut handle = russh::client::connect(
+            config,
+            (&jumpbox.host[..], jumpbox.port),
+            AuthHandler { host_public_key },
+        )
+        .await?;
 
         let auth_result = handle
             .authenticate_password(jumpbox.username.clone(), jumpbox.password.clone())
@@ -1485,16 +1494,22 @@ impl TransferSession {
 }
 
 #[cfg(feature = "ssh")]
-pub struct AuthHandler {}
+pub struct AuthHandler {
+    host_public_key: russh::keys::PublicKey,
+}
 #[cfg(feature = "ssh")]
 impl russh::client::Handler for AuthHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        Ok(matches!(
+            server_public_key,
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. }
+                if *key == self.host_public_key
+        ))
     }
 }
 
@@ -1504,17 +1519,62 @@ pub struct SshJumpboxInfo {
     pub port: u16,
     pub username: String,
     pub password: String,
+    pub host_public_key: String,
 }
 
 // WebTransport 客户端实现 - 完整的实现在 crate::webtransport 模块中
 // webtransport 类型已通过 lib.rs 中的 `pub use webtransport::*;` 导出
 
-#[cfg(feature = "http3")]
+#[cfg(feature = "webtransport")]
 pub use http3::WebTransport;
 
 #[cfg(test)]
 mod tests {
     use super::format_host_header_value;
+    #[cfg(feature = "ssh")]
+    use super::{AuthHandler, SshJumpboxInfo};
+    #[cfg(feature = "ssh")]
+    use russh::client::Handler;
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn ssh_jumpbox_info_requires_host_public_key() {
+        let jumpbox = SshJumpboxInfo {
+            host: "jump.example".to_string(),
+            port: 22,
+            username: "user".to_string(),
+            password: "password".to_string(),
+            host_public_key:
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILfVeAL+lhYAjKCcZXMwe4/zvdtyvBzCZNDZgvY/Co05 test"
+                    .to_string(),
+        };
+        assert_eq!(jumpbox.port, 22);
+    }
+
+    #[cfg(feature = "ssh")]
+    #[tokio::test]
+    async fn ssh_host_key_check_is_exact() {
+        let expected =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILfVeAL+lhYAjKCcZXMwe4/zvdtyvBzCZNDZgvY/Co05"
+                .parse::<russh::keys::PublicKey>()
+                .unwrap();
+        let mut handler = AuthHandler {
+            host_public_key: expected,
+        };
+        let matching: russh::keys::PublicKeyOrCertificate =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILfVeAL+lhYAjKCcZXMwe4/zvdtyvBzCZNDZgvY/Co05"
+                .parse::<russh::keys::PublicKey>()
+                .unwrap()
+                .into();
+        let different =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILfVeAL+lhYAjKCcZXMwe4/zvdtyvBzCZNDZgvY/Co04"
+                .parse::<russh::keys::PublicKey>()
+                .map(russh::keys::PublicKeyOrCertificate::from);
+        assert!(handler.check_server_key(&matching).await.unwrap());
+        assert!(
+            different.is_err() || !handler.check_server_key(&different.unwrap()).await.unwrap()
+        );
+    }
 
     #[test]
     fn host_header_formatter_handles_domain() {

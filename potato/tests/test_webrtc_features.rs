@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 //! WebRTC Features编译测试
 //!
 //! 验证webrtc feature可以正确编译
@@ -17,9 +18,6 @@ fn test_webrtc_feature_compilation() {
         // 验证配置可以创建
         let config = WebRTCConfig::default();
         assert_eq!(config.max_peers, 100);
-        assert_eq!(config.udp_port_start, 50000);
-        assert_eq!(config.udp_port_end, 60000);
-
         // 验证SFU可以创建
         let _sfu = WebRTCSFU::new(config);
     }
@@ -44,12 +42,19 @@ fn test_webrtc_config_defaults() {
         assert!(config
             .ice_servers
             .contains(&"stun:stun.l.google.com:19302".to_string()));
-        assert_eq!(config.udp_port_start, 50000);
-        assert_eq!(config.udp_port_end, 60000);
-        assert!(config.enable_datachannel);
         assert_eq!(config.ws_path, "/ws");
-        assert_eq!(config.rest_prefix, "/api/webrtc");
-        assert!(config.auto_reconnect);
-        assert_eq!(config.log_level, "info");
+    }
+}
+
+#[test]
+fn webrtc_builder_installs_websocket_signaling_route() {
+    #[cfg(feature = "webrtc")]
+    {
+        let mut server = potato::HttpServer::new("127.0.0.1:0");
+        server
+            .configure(|ctx| {
+                ctx.use_webrtc().ws_path("/rtc").finish();
+            })
+            .unwrap();
     }
 }

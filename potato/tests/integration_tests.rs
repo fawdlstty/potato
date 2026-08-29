@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 集成测试 - 测试实际的HTTP客户端-服务器交互
 /// 这些测试演示了如何使用实际的potato框架进行集成测试
 use std::sync::atomic::{AtomicU16, Ordering};

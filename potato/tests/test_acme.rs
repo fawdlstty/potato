@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// ACME自动证书功能测试
 /// 仅在启用acme特性时运行
 #[cfg(feature = "acme")]

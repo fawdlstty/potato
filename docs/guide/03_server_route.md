@@ -4,11 +4,11 @@
 
 ```rust
 server.configure(|ctx| {
-    ctx.use_handlers(false);
+    ctx.use_handlers();
 });
 ```
 
-此处 `use_handlers` 函数即代表对于请求路径搜索匹配的处理函数，如果有，则转到对应处理函数。
+控制器和 OpenAPI 路由会默认注册。`use_handlers()` 是显式启用的 handler pipeline，用于把 `http_*` 处理函数接入请求路径匹配。
 
 路由除了上述处理函数外，还有下面几个：
 

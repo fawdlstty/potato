@@ -1,8 +1,9 @@
 #![allow(non_camel_case_types)]
 #![cfg(feature = "http2")]
 
+use super::SERVER_STR;
 use crate::utils::refstr::Headers;
-use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody, SERVER_STR};
+use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody};
 use anyhow::anyhow;
 use bytes::Bytes;
 use std::str::FromStr;

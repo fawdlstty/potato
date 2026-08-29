@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 集成测试：验证 Custom(key) = value 宏语法
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;

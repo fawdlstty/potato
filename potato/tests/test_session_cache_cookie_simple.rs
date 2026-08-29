@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// SessionCache Cookie 功能简单测试
 use potato::SessionCache;
 

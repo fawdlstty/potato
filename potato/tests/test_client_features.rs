@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 客户端特性的综合测试
 /// 基于 examples/client 中的示例
 use std::sync::atomic::{AtomicU16, Ordering};

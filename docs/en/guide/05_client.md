@@ -32,7 +32,7 @@ let mut res = potato::post!(http3("https://api.example.com"), body, Custom("X-Ke
 - **HTTP/2**: Requires TLS, use `http2("https://...")`
 - **HTTP/3**: Requires TLS (QUIC-based), use `http3("https://...")`
 
-Full example: `examples/05_http2_http3_client.rs`
+Full example: `examples/client/05_http2_http3_client.rs`
 
 ## Sessions and Streaming
 
@@ -80,13 +80,18 @@ let res = potato::get!(
 - **Custom Headers**: `Custom(key) = value`, key/value can be strings or variables
 - Mix freely, comma-separated, trailing comma supported
 
-Full example: `examples/01_client_with_arg.rs`
+Full example: `examples/client/01_client_with_arg.rs`
 
 ## Other Features
 
 **Jemalloc memory profiling** (requires `jemalloc` feature):
 
 ```rust
+use potato::JemallocAllocator;
+
+#[global_allocator]
+static ALLOC: JemallocAllocator = JemallocAllocator;
+
 potato::init_jemalloc()?;  // At start of main
 // ... run program ...
 let pdf_data = potato::dump_jemalloc_profile()?;  // Get PDF report
@@ -130,6 +135,7 @@ let mut stream = agent.chat_stream("Tell me a story.").await?;
 while let Some(chunk) = stream.recv().await {
     match chunk {
         potato::StreamChunk::Content(text) => print!("{}", text),
+        potato::StreamChunk::Error(error) => eprintln!("stream error: {error}"),
         potato::StreamChunk::Done => break,
     }
 }

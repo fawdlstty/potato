@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// ACME续期功能专项测试
 /// 测试续期循环、续期判断和续期失败处理
 #[cfg(feature = "acme")]

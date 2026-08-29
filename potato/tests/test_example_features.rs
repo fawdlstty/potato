@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 示例功能综合测试
 /// 覆盖 examples/server 和 examples/client 中的示例功能
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -134,7 +135,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 
@@ -572,7 +573,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 
@@ -606,7 +607,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 
@@ -641,7 +642,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 
@@ -689,7 +690,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
             ctx.use_openapi("/doc/");
         });
@@ -735,7 +736,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             // 使用当前目录作为静态文件目录
             ctx.use_location_route("/", ".", false);
         });
@@ -779,7 +780,7 @@ mod tests {
 
         // 测试 embedded route 配置能正常调用（资源路径可能不存在）
         // 实际使用需要 embed_dir! 宏
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             // 这里使用 embed_dir! 宏生成嵌入资源
             // 由于测试环境限制，我们使用占位符测试 API 可用性
             // ctx.use_embedded_route("/", embed_dir!("../swagger_res"));
@@ -819,7 +820,7 @@ mod tests {
         potato::ServerConfig::set_jwt_secret("test_secret_key_12345").await;
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 
@@ -864,7 +865,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 
@@ -939,7 +940,7 @@ mod tests {
         let middleware_called = Arc::new(Mutex::new(false));
         let middleware_called_clone = middleware_called.clone();
 
-        server.configure(move |ctx| {
+        let _ = server.configure(move |ctx| {
             let called = middleware_called_clone.clone();
             ctx.use_custom_sync(move |req| {
                 if req.url_path == "/sync" {
@@ -1018,7 +1019,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 
@@ -1084,7 +1085,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 
@@ -1132,7 +1133,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
 
         let mut server = HttpServer::new(&server_addr);
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 

@@ -105,9 +105,10 @@ async fn logout(req: &mut HttpRequest, cache: &mut SessionCache) -> HttpResponse
     if let Some(auth_header) = req.headers.get(&potato::utils::refstr::HeaderOrHipStr::from_str("Authorization")) {
         let header_value = auth_header.to_str();
         if header_value.starts_with("Bearer ") {
-            if let Ok((user_id, _)) = SessionCache::parse_token(&header_value[7..]).await {
+            let token = &header_value[7..];
+            if SessionCache::parse_token(token).await.is_ok() {
                 // 使session失效
-                SessionCache::invalidate(user_id);
+                SessionCache::invalidate(token);
             }
         }
     }

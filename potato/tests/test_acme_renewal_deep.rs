@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// ACME 续签逻辑深度测试
 /// 测试续签流程的正确性和边界条件
 #[cfg(feature = "acme")]

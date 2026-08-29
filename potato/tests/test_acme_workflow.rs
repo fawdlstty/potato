@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// ACME完整工作流程测试
 /// 测试ACME功能的端到端流程
 #[cfg(feature = "acme")]

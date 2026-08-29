@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 //! 测试编译时检查：preprocess 使用 SessionCache 但 handler 没有声明
 //! 这个文件应该编译失败
 

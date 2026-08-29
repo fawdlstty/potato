@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 服务器特性的综合测试
 /// 测试可以不依赖特定路由实现的功能
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -249,7 +250,7 @@ mod tests {
         let mut server = HttpServer::new(&server_addr);
 
         // 测试 configure 方法
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             // 这个配置可以成功应用
             ctx.use_handlers();
         });
@@ -323,7 +324,7 @@ mod tests {
         let mut server = HttpServer::new(&server_addr);
 
         // 配置选项1: 禁用处理器
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 
@@ -331,7 +332,7 @@ mod tests {
 
         // 配置选项2: OpenAPI (如果启用)
         let mut server2 = HttpServer::new(format!("127.0.0.1:{}", get_test_port()));
-        server2.configure(|ctx| {
+        let _ = server2.configure(|ctx| {
             ctx.use_handlers();
             // ctx.use_openapi("/doc/"); // 仅在 openapi 特性启用时
         });
@@ -1053,7 +1054,7 @@ mod tests {
         let proxy_port = get_test_port();
         let proxy_addr = format!("127.0.0.1:{}", proxy_port);
         let mut proxy_server = HttpServer::new(&proxy_addr);
-        proxy_server.configure(|ctx| {
+        let _ = proxy_server.configure(|ctx| {
             ctx.use_reverse_proxy("/proxy", format!("http://{}", backend_addr), false);
         });
         let proxy_handle = tokio::spawn(async move {
@@ -1122,7 +1123,7 @@ mod tests {
         let proxy_port = get_test_port();
         let proxy_addr = format!("127.0.0.1:{}", proxy_port);
         let mut proxy_server = HttpServer::new(&proxy_addr);
-        proxy_server.configure(|ctx| {
+        let _ = proxy_server.configure(|ctx| {
             ctx.use_reverse_proxy("/proxy", format!("http://{}", backend_addr), false);
         });
         let proxy_handle = tokio::spawn(async move {
@@ -1176,7 +1177,7 @@ mod tests {
         let proxy_port = get_test_port();
         let proxy_addr = format!("127.0.0.1:{}", proxy_port);
         let mut proxy_server = HttpServer::new(&proxy_addr);
-        proxy_server.configure(|ctx| {
+        let _ = proxy_server.configure(|ctx| {
             ctx.use_reverse_proxy("/proxy", format!("http://{}", backend_addr), false);
         });
         let proxy_handle = tokio::spawn(async move {
@@ -1584,7 +1585,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         let static_root = temp_dir.canonicalize()?.to_string_lossy().to_string();
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_location_route("/static/", static_root.clone(), false);
         });
 
@@ -1626,7 +1627,7 @@ mod tests {
 
         let mut server = HttpServer::new(&server_addr);
         let static_root = temp_dir.canonicalize()?.to_string_lossy().to_string();
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_location_route("/static/", static_root.clone(), false);
         });
 
@@ -1776,7 +1777,7 @@ mod tests {
         let mut server = HttpServer::new(&server_addr);
         let mut assets: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
         assets.insert("sample.txt".to_string(), Cow::Borrowed(b"HelloRangeWorld"));
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_embedded_route("/embed", assets.clone());
         });
 
@@ -1812,7 +1813,7 @@ mod tests {
         let mut server = HttpServer::new(&server_addr);
         let mut assets: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
         assets.insert("etag.txt".to_string(), Cow::Borrowed(b"etag-body"));
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_embedded_route("/embed", assets.clone());
         });
 
@@ -1851,7 +1852,7 @@ mod tests {
         let mut server = HttpServer::new(&server_addr);
         let mut assets: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
         assets.insert("sample.txt".to_string(), Cow::Borrowed(b"short"));
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_embedded_route("/embed", assets.clone());
         });
 

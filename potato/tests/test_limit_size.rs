@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 请求体大小限制功能测试
 #[cfg(test)]
 mod tests {
@@ -32,7 +33,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             // 设置限制: 1MB
             ctx.use_limit_size(1024 * 1024, 1024 * 1024);
             ctx.use_handlers();
@@ -67,9 +68,8 @@ mod tests {
         assert!(response_text.contains("upload success"));
         println!("✅ Small body request succeeded");
 
-        // 测试大 body (应该返回 413) - 发送完整的 body
+        // 测试大 body (应该返回 413) - 校验发生在读取 body 前
         let mut stream2 = connect_with_retry(&server_addr).await?;
-        let large_body = vec![b'x'; 2 * 1024 * 1024]; // 2MB
         let request2 = format!(
             "POST /upload HTTP/1.1\r\n\
              Host: 127.0.0.1:{}\r\n\
@@ -77,12 +77,9 @@ mod tests {
              Connection: close\r\n\
              \r\n",
             port,
-            large_body.len()
+            2 * 1024 * 1024
         );
         stream2.write_all(request2.as_bytes()).await?;
-        // 发送完整的 body
-        stream2.write_all(&large_body).await?;
-        stream2.shutdown().await?;
 
         let mut response2 = Vec::new();
         stream2.read_to_end(&mut response2).await?;
@@ -116,7 +113,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_limit_size(10 * 1024 * 1024, 10 * 1024 * 1024); // 全局 10MB
             ctx.use_handlers();
         });
@@ -200,7 +197,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 
@@ -247,7 +244,7 @@ mod tests {
         let server_addr = format!("127.0.0.1:{port}");
         let mut server = HttpServer::new(&server_addr);
 
-        server.configure(|ctx| {
+        let _ = server.configure(|ctx| {
             ctx.use_handlers();
         });
 

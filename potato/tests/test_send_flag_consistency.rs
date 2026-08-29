@@ -1,10 +1,11 @@
+#![cfg(feature = "std")]
 //! 测试HTTP handler宏中Send标志的一致性
 //!
 //! 测试覆盖以下场景：
 //! 1. 直接使用http_get等宏，带Send标志
 //! 2. 直接使用http_get等宏，不带Send标志（默认为Send）
 
-use potato::{HttpResponse, HttpServer, OnceCache};
+use potato::{HttpResponse, HttpServer};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;

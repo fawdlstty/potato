@@ -12,6 +12,7 @@ async fn main() {
                         port: 22,
                         username: "root".to_string(),
                         password: "root".to_string(),
+                        host_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleReplaceMe host".to_string(),
                     })
                     .await
                     {

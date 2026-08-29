@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 //! 测试 preprocess/postprocess 使用 SessionCache 时的编译时检查
 
 // 测试1: preprocess 使用 SessionCache，handler 也使用 - 应该编译成功

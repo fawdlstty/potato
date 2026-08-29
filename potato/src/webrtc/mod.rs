@@ -1,11 +1,6 @@
 //! WebRTC模块
 //!
-//! 提供完整的WebRTC支持,包括:
-//! - SFU媒体服务器
-//! - 客户端推流/拉流
-//! - WebSocket和REST双信令协议
-//! - DataChannel支持
-//! - 自动化媒体流处理
+//! 提供 WebSocket 信令、SFU、PeerConnection 与媒体/DataChannel 转发支持。
 
 #![cfg(feature = "webrtc")]
 
@@ -30,26 +25,12 @@ pub use signaling_handler::*;
 use crate::PipeContext;
 use std::sync::Arc;
 
-// 类型别名，简化复杂类型定义
-type WebRTCCallback1 = dyn Fn(&str) + Send + Sync;
-type WebRTCCallback2 = dyn Fn(&str, &str) + Send + Sync;
-type WebRTCCallback3 = dyn Fn(&str, &str, &str) + Send + Sync;
-type WebRTCCallback4 = dyn Fn(&str, &str, &str, &[u8]) + Send + Sync;
-
-/// WebRTC配置
+/// WebRTC运行时配置
 #[derive(Clone)]
 pub struct WebRTCConfig {
     pub max_peers: u32,
     pub ice_servers: Vec<String>,
-    pub udp_port_start: u16,
-    pub udp_port_end: u16,
-    pub enable_datachannel: bool,
     pub ws_path: String,
-    pub rest_prefix: String,
-    pub auto_reconnect: bool,
-    pub log_level: String,
-    // 事件回调（需要在创建SFU时传递）
-    pub events: std::sync::Arc<WebRTCEvents>,
 }
 
 impl Default for WebRTCConfig {
@@ -57,38 +38,7 @@ impl Default for WebRTCConfig {
         Self {
             max_peers: 100,
             ice_servers: vec!["stun:stun.l.google.com:19302".to_string()],
-            udp_port_start: 50000,
-            udp_port_end: 60000,
-            enable_datachannel: true,
             ws_path: "/ws".to_string(),
-            rest_prefix: "/api/webrtc".to_string(),
-            auto_reconnect: true,
-            log_level: "info".to_string(),
-            events: std::sync::Arc::new(WebRTCEvents::default()),
-        }
-    }
-}
-
-/// WebRTC事件回调
-#[derive(Default)]
-pub struct WebRTCEvents {
-    pub on_room_created: Option<Arc<WebRTCCallback1>>,
-    pub on_peer_joined: Option<Arc<WebRTCCallback2>>,
-    pub on_peer_left: Option<Arc<WebRTCCallback2>>,
-    pub on_publish_started: Option<Arc<WebRTCCallback2>>,
-    pub on_subscribe_started: Option<Arc<WebRTCCallback3>>,
-    pub on_datachannel_message: Option<Arc<WebRTCCallback4>>,
-}
-
-impl Clone for WebRTCEvents {
-    fn clone(&self) -> Self {
-        Self {
-            on_room_created: self.on_room_created.clone(),
-            on_peer_joined: self.on_peer_joined.clone(),
-            on_peer_left: self.on_peer_left.clone(),
-            on_publish_started: self.on_publish_started.clone(),
-            on_subscribe_started: self.on_subscribe_started.clone(),
-            on_datachannel_message: self.on_datachannel_message.clone(),
         }
     }
 }
@@ -97,7 +47,6 @@ impl Clone for WebRTCEvents {
 pub struct WebRTCBuilder<'a> {
     ctx: &'a mut PipeContext,
     config: WebRTCConfig,
-    events: WebRTCEvents,
 }
 
 impl<'a> WebRTCBuilder<'a> {
@@ -106,7 +55,6 @@ impl<'a> WebRTCBuilder<'a> {
         Self {
             ctx,
             config: WebRTCConfig::default(),
-            events: WebRTCEvents::default(),
         }
     }
 
@@ -122,100 +70,17 @@ impl<'a> WebRTCBuilder<'a> {
         self
     }
 
-    /// 设置UDP端口范围
-    pub fn udp_port_range(mut self, start: u16, end: u16) -> Self {
-        self.config.udp_port_start = start;
-        self.config.udp_port_end = end;
-        self
-    }
-
-    /// 启用DataChannel
-    pub fn enable_datachannel(mut self, enabled: bool) -> Self {
-        self.config.enable_datachannel = enabled;
-        self
-    }
-
     /// 设置WebSocket路径
     pub fn ws_path(mut self, path: &str) -> Self {
         self.config.ws_path = path.to_string();
         self
     }
 
-    /// 设置REST API前缀
-    pub fn rest_prefix(mut self, prefix: &str) -> Self {
-        self.config.rest_prefix = prefix.to_string();
-        self
-    }
-
-    /// 设置自动重连
-    pub fn auto_reconnect(mut self, enabled: bool) -> Self {
-        self.config.auto_reconnect = enabled;
-        self
-    }
-
-    /// 设置日志级别
-    pub fn log_level(mut self, level: &str) -> Self {
-        self.config.log_level = level.to_string();
-        self
-    }
-
-    /// 房间创建事件
-    pub fn on_room_created<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str) + Send + Sync + 'static,
-    {
-        self.events.on_room_created = Some(Arc::new(f));
-        self
-    }
-
-    /// Peer加入事件
-    pub fn on_peer_joined<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str, &str) + Send + Sync + 'static,
-    {
-        self.events.on_peer_joined = Some(Arc::new(f));
-        self
-    }
-
-    /// Peer离开事件
-    pub fn on_peer_left<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str, &str) + Send + Sync + 'static,
-    {
-        self.events.on_peer_left = Some(Arc::new(f));
-        self
-    }
-
-    /// 推流开始事件
-    pub fn on_publish_started<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str, &str) + Send + Sync + 'static,
-    {
-        self.events.on_publish_started = Some(Arc::new(f));
-        self
-    }
-
-    /// 订阅开始事件
-    pub fn on_subscribe_started<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str, &str, &str) + Send + Sync + 'static,
-    {
-        self.events.on_subscribe_started = Some(Arc::new(f));
-        self
-    }
-
-    /// DataChannel消息事件
-    pub fn on_datachannel_message<F>(mut self, f: F) -> Self
-    where
-        F: Fn(&str, &str, &str, &[u8]) + Send + Sync + 'static,
-    {
-        self.events.on_datachannel_message = Some(Arc::new(f));
-        self
-    }
-
     /// 完成配置并注册到PipeContext
     pub fn finish(self) {
         // 将WebRTC配置添加到PipeContext
-        self.ctx.add_webrtc(self.config, self.events);
+        let sfu = Arc::new(crate::webrtc::WebRTCSFU::new(self.config));
+        let handler = Arc::new(crate::webrtc::WebRtcSignalingHandler::new(sfu));
+        self.ctx.add_webrtc(handler);
     }
 }

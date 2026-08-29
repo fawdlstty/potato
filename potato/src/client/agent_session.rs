@@ -2,6 +2,7 @@ use crate::Session;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::process::Stdio;
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
@@ -364,6 +365,8 @@ impl ProviderSession {
 pub enum StreamChunk {
     /// 文本内容块
     Content(String),
+    /// 流式传输或协议处理失败
+    Error(String),
     /// 流结束
     Done,
 }
@@ -396,7 +399,7 @@ pub struct AgentClientSession {
     api_key: Option<String>,
     model: Option<String>,
     session: Session,
-    messages: Vec<ChatMessage>,
+    messages: Arc<RwLock<Vec<ChatMessage>>>,
     /// 思考等级（推理强度），仅部分提供商的推理模型支持
     reasoning_effort: ReasoningEffort,
     /// 工作目录路径（源代码路径），仅 Agent 类 provider 使用
@@ -428,7 +431,7 @@ impl AgentClientSession {
             api_key,
             model: None,
             session: Session::new(),
-            messages: Vec::new(),
+            messages: Arc::new(RwLock::new(Vec::new())),
             reasoning_effort: ReasoningEffort::Medium,
             working_directory: None,
             provider_session,
@@ -438,6 +441,8 @@ impl AgentClientSession {
     /// 添加系统提示词
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
         self.messages
+            .write()
+            .unwrap()
             .push(ChatMessage::new(MessageRole::System, prompt));
     }
 
@@ -682,25 +687,41 @@ impl AgentClientSession {
             .ok_or_else(|| anyhow::anyhow!("Model not set. Call set_model() first."))
     }
 
+    fn last_message_content(&self) -> anyhow::Result<String> {
+        self.messages
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .map(|message| message.content.clone())
+            .ok_or_else(|| anyhow::anyhow!("No message to send"))
+    }
+
     /// 获取当前会话历史
-    pub fn messages(&self) -> &[ChatMessage] {
-        &self.messages
+    pub fn messages(&self) -> Vec<ChatMessage> {
+        self.messages
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// 设置会话历史消息（覆盖现有消息，保留 system prompt）
     pub fn set_messages(&mut self, messages: Vec<ChatMessage>) {
-        self.messages = self
+        let mut messages = messages;
+        let mut history = self
             .messages
-            .drain(..)
-            .filter(|m| m.role == MessageRole::System)
-            .collect();
-        self.messages.extend(messages);
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        history.retain(|m| m.role == MessageRole::System);
+        history.append(&mut messages);
     }
 
     /// 发送消息并获取完整响应（非流式）
     pub async fn chat(&mut self, message: impl Into<String>) -> anyhow::Result<String> {
         let user_msg = ChatMessage::new(MessageRole::User, message);
-        self.messages.push(user_msg);
+        self.messages
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(user_msg);
 
         // OpenCode provider 需要特殊处理：先创建 session，再发送消息
         if self.provider == LlmProvider::OpenCode {
@@ -738,6 +759,8 @@ impl AgentClientSession {
         let content = self.parse_response(&response_text)?;
 
         self.messages
+            .write()
+            .unwrap()
             .push(ChatMessage::new(MessageRole::Assistant, content.clone()));
         Ok(content)
     }
@@ -799,13 +822,7 @@ impl AgentClientSession {
         let url = format!("{}/session/{}/message", self.base_url, session_id);
 
         // 构建 parts：当前用户消息
-        let last_msg_content = {
-            let last_msg = self
-                .messages
-                .last()
-                .ok_or_else(|| anyhow::anyhow!("No message to send"))?;
-            last_msg.content.clone()
-        };
+        let last_msg_content = self.last_message_content()?;
         let parts = serde_json::json!([{"type": "text", "text": last_msg_content}]);
 
         // 解析 model 为 providerID 和 modelID
@@ -872,6 +889,8 @@ impl AgentClientSession {
         }
 
         self.messages
+            .write()
+            .unwrap()
             .push(ChatMessage::new(MessageRole::Assistant, content.clone()));
         Ok(content)
     }
@@ -1306,9 +1325,14 @@ impl AgentClientSession {
         };
 
         // 构建输入：如果有历史消息（除了最后一条），将历史作为上下文附加
-        let input_text = if self.messages.len() > 1 {
+        let messages = self
+            .messages
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let input_text = if messages.len() > 1 {
             let mut context = String::new();
-            for msg in &self.messages[..self.messages.len() - 1] {
+            for msg in &messages[..messages.len() - 1] {
                 match msg.role {
                     MessageRole::System => {
                         context.push_str(&format!("[系统提示]\n{}\n\n", msg.content));
@@ -1321,14 +1345,13 @@ impl AgentClientSession {
                     }
                 }
             }
-            let last_msg = self
-                .messages
+            let last_msg = messages
                 .last()
                 .ok_or_else(|| anyhow::anyhow!("No message to send"))?;
             context.push_str(&format!("[用户]\n{}\n", last_msg.content));
             context
         } else {
-            self.messages
+            messages
                 .last()
                 .ok_or_else(|| anyhow::anyhow!("No message to send"))?
                 .content
@@ -1445,6 +1468,8 @@ impl AgentClientSession {
         }
 
         self.messages
+            .write()
+            .unwrap()
             .push(ChatMessage::new(MessageRole::Assistant, agent_text.clone()));
         Ok(agent_text)
     }
@@ -1462,8 +1487,7 @@ impl AgentClientSession {
             .ok_or_else(|| anyhow::anyhow!("Expected Codex provider session"))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(64);
-        let messages =
-            std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut self.messages)));
+        let messages = self.messages.clone();
 
         // 启动后台任务监听 WebSocket 通知并实时转发
         tokio::spawn(async move {
@@ -1488,7 +1512,7 @@ impl AgentClientSession {
                                 if let Some(delta) = notification["params"]["delta"].as_str() {
                                     assistant_content.push_str(delta);
                                     // 实时更新历史记录
-                                    if let Ok(mut msgs) = messages.lock() {
+                                    if let Ok(mut msgs) = messages.write() {
                                         if msgs
                                             .last()
                                             .is_some_and(|m| m.role == MessageRole::Assistant)
@@ -1520,7 +1544,7 @@ impl AgentClientSession {
                             "turn/started" | "item/started" | "thread/started" => {}
                             "error" => {
                                 let _ = tx
-                                    .send(StreamChunk::Content(format!(
+                                    .send(StreamChunk::Error(format!(
                                         "\n[Codex error: {}]",
                                         notification["params"]
                                     )))
@@ -1533,7 +1557,7 @@ impl AgentClientSession {
                     }
                     Err(e) => {
                         let _ = tx
-                            .send(StreamChunk::Content(format!(
+                            .send(StreamChunk::Error(format!(
                                 "\n[Codex WebSocket error: {}]",
                                 e
                             )))
@@ -1546,7 +1570,7 @@ impl AgentClientSession {
 
             // 流结束时确保历史记录中已存在 Assistant 消息
             if !error_occurred {
-                if let Ok(mut msgs) = messages.lock() {
+                if let Ok(mut msgs) = messages.write() {
                     if msgs.last().is_none_or(|m| m.role != MessageRole::Assistant) {
                         msgs.push(ChatMessage::new(MessageRole::Assistant, assistant_content));
                     }
@@ -1886,12 +1910,7 @@ impl AgentClientSession {
         let session_id = self.ensure_zcode_session().await?;
         self.ensure_zcode_subscribed(&session_id).await?;
 
-        let content = self
-            .messages
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("No message to send"))?
-            .content
-            .clone();
+        let content = self.last_message_content()?;
         let zcode_arc = self
             .provider_session
             .as_zcode_arc()
@@ -1932,10 +1951,13 @@ impl AgentClientSession {
                 _ => {}
             }
         }
-        self.messages.push(ChatMessage::new(
-            MessageRole::Assistant,
-            assistant_text.clone(),
-        ));
+        self.messages
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ChatMessage::new(
+                MessageRole::Assistant,
+                assistant_text.clone(),
+            ));
         Ok(assistant_text)
     }
 
@@ -1948,8 +1970,7 @@ impl AgentClientSession {
             .as_zcode_arc()
             .ok_or_else(|| anyhow::anyhow!("Expected ZCode provider session"))?;
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(64);
-        let messages =
-            std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut self.messages)));
+        let messages = self.messages.clone();
 
         tokio::spawn(async move {
             let mut assistant_content = String::new();
@@ -1960,10 +1981,7 @@ impl AgentClientSession {
                         Ok(event) => event,
                         Err(e) => {
                             let _ = tx
-                                .send(StreamChunk::Content(format!(
-                                    "\n[ZCode stdio error: {}]",
-                                    e
-                                )))
+                                .send(StreamChunk::Error(format!("\n[ZCode stdio error: {}]", e)))
                                 .await;
                             let _ = tx.send(StreamChunk::Done).await;
                             return;
@@ -1973,7 +1991,7 @@ impl AgentClientSession {
                 match Self::parse_zcode_event_action(&event) {
                     AgentStreamAction::Content(text) => {
                         assistant_content.push_str(&text);
-                        if let Ok(mut msgs) = messages.lock() {
+                        if let Ok(mut msgs) = messages.write() {
                             if msgs
                                 .last()
                                 .is_some_and(|m| m.role == MessageRole::Assistant)
@@ -1993,7 +2011,7 @@ impl AgentClientSession {
                         }
                     }
                     AgentStreamAction::Done => {
-                        if let Ok(mut msgs) = messages.lock() {
+                        if let Ok(mut msgs) = messages.write() {
                             if msgs.last().is_none_or(|m| m.role != MessageRole::Assistant) {
                                 msgs.push(ChatMessage::new(
                                     MessageRole::Assistant,
@@ -2006,7 +2024,7 @@ impl AgentClientSession {
                     }
                     AgentStreamAction::Error(message) => {
                         let _ = tx
-                            .send(StreamChunk::Content(format!("\n[ZCode error: {message}]")))
+                            .send(StreamChunk::Error(format!("\n[ZCode error: {message}]")))
                             .await;
                         let _ = tx.send(StreamChunk::Done).await;
                         return;
@@ -2208,12 +2226,7 @@ impl AgentClientSession {
     }
 
     async fn send_dsf_prompt(&mut self, session_id: &str) -> anyhow::Result<()> {
-        let content = self
-            .messages
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("No message to send"))?
-            .content
-            .clone();
+        let content = self.last_message_content()?;
         let result = self
             .call_dsf(
                 "session.prompt",
@@ -2375,10 +2388,13 @@ impl AgentClientSession {
                 AgentStreamAction::Ignore => {}
             }
         }
-        self.messages.push(ChatMessage::new(
-            MessageRole::Assistant,
-            assistant_text.clone(),
-        ));
+        self.messages
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ChatMessage::new(
+                MessageRole::Assistant,
+                assistant_text.clone(),
+            ));
         Ok(assistant_text)
     }
 
@@ -2389,8 +2405,7 @@ impl AgentClientSession {
         let base_url = self.base_url.clone();
         let api_key = self.api_key.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(64);
-        let messages =
-            std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut self.messages)));
+        let messages = self.messages.clone();
 
         tokio::spawn(async move {
             let mut respond_session = Session::new();
@@ -2401,7 +2416,7 @@ impl AgentClientSession {
                     Ok(envelope) => envelope,
                     Err(e) => {
                         let _ = tx
-                            .send(StreamChunk::Content(format!(
+                            .send(StreamChunk::Error(format!(
                                 "\n[DSF WebSocket error: {}]",
                                 e
                             )))
@@ -2414,7 +2429,7 @@ impl AgentClientSession {
                     AgentStreamAction::Content(text) => {
                         saw_delta = true;
                         assistant_text.push_str(&text);
-                        if let Ok(mut msgs) = messages.lock() {
+                        if let Ok(mut msgs) = messages.write() {
                             if msgs
                                 .last()
                                 .is_some_and(|m| m.role == MessageRole::Assistant)
@@ -2436,7 +2451,7 @@ impl AgentClientSession {
                     AgentStreamAction::FinalContent(text) => {
                         if !saw_delta && assistant_text.is_empty() {
                             assistant_text.push_str(&text);
-                            if let Ok(mut msgs) = messages.lock() {
+                            if let Ok(mut msgs) = messages.write() {
                                 msgs.push(ChatMessage::new(
                                     MessageRole::Assistant,
                                     assistant_text.clone(),
@@ -2458,7 +2473,7 @@ impl AgentClientSession {
                         .await;
                     }
                     AgentStreamAction::Done => {
-                        if let Ok(mut msgs) = messages.lock() {
+                        if let Ok(mut msgs) = messages.write() {
                             if msgs.last().is_none_or(|m| m.role != MessageRole::Assistant) {
                                 msgs.push(ChatMessage::new(
                                     MessageRole::Assistant,
@@ -2471,7 +2486,7 @@ impl AgentClientSession {
                     }
                     AgentStreamAction::Error(message) => {
                         let _ = tx
-                            .send(StreamChunk::Content(format!("\n[DSF error: {message}]")))
+                            .send(StreamChunk::Error(format!("\n[DSF error: {message}]")))
                             .await;
                         let _ = tx.send(StreamChunk::Done).await;
                         return;
@@ -2493,7 +2508,10 @@ impl AgentClientSession {
         message: impl Into<String>,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<StreamChunk>> {
         let user_msg = ChatMessage::new(MessageRole::User, message);
-        self.messages.push(user_msg);
+        self.messages
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(user_msg);
 
         // OpenCode provider 暂不支持流式响应，使用非流式方式模拟
         if self.provider == LlmProvider::OpenCode {
@@ -2543,8 +2561,7 @@ impl AgentClientSession {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(64);
         let provider = self.provider.clone();
-        let messages =
-            std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut self.messages)));
+        let messages = self.messages.clone();
 
         // 启动后台任务解析流式响应
         tokio::spawn(async move {
@@ -2602,7 +2619,7 @@ impl AgentClientSession {
                 for content in contents {
                     assistant_content.push_str(&content);
                     // 更新历史记录最后一项（Assistant 消息）
-                    if let Ok(mut msgs) = messages.lock() {
+                    if let Ok(mut msgs) = messages.write() {
                         if msgs
                             .last()
                             .is_some_and(|m| m.role == MessageRole::Assistant)
@@ -2623,7 +2640,7 @@ impl AgentClientSession {
                 }
             }
             // 流结束时确保历史记录中已存在 Assistant 消息
-            if let Ok(mut msgs) = messages.lock() {
+            if let Ok(mut msgs) = messages.write() {
                 if msgs.last().is_none_or(|m| m.role != MessageRole::Assistant) {
                     msgs.push(ChatMessage::new(MessageRole::Assistant, assistant_content));
                 }
@@ -2637,6 +2654,8 @@ impl AgentClientSession {
     /// 完成一轮流式对话后，将助手回复追加到历史
     pub fn append_assistant_message(&mut self, content: impl Into<String>) {
         self.messages
+            .write()
+            .unwrap()
             .push(ChatMessage::new(MessageRole::Assistant, content));
     }
 
@@ -2663,7 +2682,11 @@ impl AgentClientSession {
             "base_url": self.base_url,
             "api_key": self.api_key,
             "model": self.model,
-            "messages": self.messages,
+            "messages": self
+                .messages
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             "reasoning_effort": self.reasoning_effort,
             "working_directory": self.working_directory,
             "opencode_session_id": opencode.and_then(|s| s.session_id.as_ref()),
@@ -2773,7 +2796,7 @@ impl AgentClientSession {
             api_key,
             model,
             session: Session::new(),
-            messages,
+            messages: Arc::new(RwLock::new(messages)),
             reasoning_effort,
             working_directory,
             provider_session,
@@ -2789,8 +2812,12 @@ impl AgentClientSession {
         match self.provider {
             LlmProvider::OpenAI => {
                 let url = format!("{}/chat/completions", self.base_url);
-                let messages: Vec<serde_json::Value> = self
+                let history = self
                     .messages
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let messages: Vec<serde_json::Value> = history
                     .iter()
                     .map(|m| {
                         serde_json::json!({
@@ -2814,13 +2841,16 @@ impl AgentClientSession {
             }
             LlmProvider::Anthropic => {
                 let url = format!("{}/messages", self.base_url);
-                let system_msg = self
+                let history = self
                     .messages
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let system_msg = history
                     .iter()
                     .find(|m| m.role == MessageRole::System)
                     .map(|m| m.content.clone());
-                let messages: Vec<serde_json::Value> = self
-                    .messages
+                let messages: Vec<serde_json::Value> = history
                     .iter()
                     .filter(|m| m.role != MessageRole::System)
                     .map(|m| {
@@ -2855,8 +2885,12 @@ impl AgentClientSession {
             }
             LlmProvider::Ollama => {
                 let url = format!("{}/api/chat", self.base_url);
-                let messages: Vec<serde_json::Value> = self
+                let history = self
                     .messages
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let messages: Vec<serde_json::Value> = history
                     .iter()
                     .map(|m| {
                         serde_json::json!({

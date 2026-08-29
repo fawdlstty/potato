@@ -1,9 +1,16 @@
+// The std generator intentionally remains in the source graph when emitting lite macros.
+#![cfg_attr(not(feature = "std"), allow(dead_code))]
+
+#[cfg(not(feature = "std"))]
+mod lite;
 mod utils;
 
+#[cfg(not(feature = "std"))]
+use lite::lite_http_handler;
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::{format_ident, quote, ToTokens};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::json;
 use std::{collections::HashSet, sync::LazyLock};
 use syn::Token;
@@ -167,8 +174,8 @@ fn parse_header_attr(tokens: &proc_macro2::TokenStream) -> Result<(String, Strin
 }
 
 fn random_ident() -> Ident {
-    let mut rng = rand::thread_rng();
-    let value = format!("__potato_id_{}", rng.r#gen::<u64>());
+    let mut rng = rand::rng();
+    let value = format!("__potato_id_{}", rng.random::<u64>());
     Ident::new(&value, Span::call_site())
 }
 
@@ -701,7 +708,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         false
     };
 
-    let (route_path, is_send) = {
+    let (route_path, _is_send) = {
         let mut oroute_path: Option<String> = None;
         let mut is_send = true; // 默认使用Send
 
@@ -1837,17 +1844,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
     };
 
-    let (wrapper_sig, handler_variant) = if is_send {
-        (
-            quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> },
-            quote! { potato::HttpHandler::Async },
-        )
-    } else {
-        (
-            quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + '_>> },
-            quote! { potato::HttpHandler::AsyncNoSend },
-        )
-    };
+    let wrapper_sig = quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> };
+    let handler_variant = quote! { potato::HttpHandler::Async };
     quote! {
         #root_fn
 
@@ -1951,34 +1949,88 @@ fn generate_response_handler(
     }
 }
 
+#[cfg(feature = "std")]
 #[proc_macro_attribute]
 pub fn http_get(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "GET")
 }
 
+#[cfg(not(feature = "std"))]
+#[proc_macro_attribute]
+pub fn http_get(attr: TokenStream, input: TokenStream) -> TokenStream {
+    lite_http_handler(attr.into(), input.into(), "GET").into()
+}
+
+#[cfg(feature = "std")]
 #[proc_macro_attribute]
 pub fn http_post(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "POST")
 }
 
+#[cfg(not(feature = "std"))]
+#[proc_macro_attribute]
+pub fn http_post(attr: TokenStream, input: TokenStream) -> TokenStream {
+    lite_http_handler(attr.into(), input.into(), "POST").into()
+}
+
+#[cfg(feature = "std")]
 #[proc_macro_attribute]
 pub fn http_put(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "PUT")
 }
 
+#[cfg(not(feature = "std"))]
+#[proc_macro_attribute]
+pub fn http_put(attr: TokenStream, input: TokenStream) -> TokenStream {
+    lite_http_handler(attr.into(), input.into(), "PUT").into()
+}
+
+#[cfg(feature = "std")]
 #[proc_macro_attribute]
 pub fn http_delete(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "DELETE")
 }
 
+#[cfg(not(feature = "std"))]
+#[proc_macro_attribute]
+pub fn http_delete(attr: TokenStream, input: TokenStream) -> TokenStream {
+    lite_http_handler(attr.into(), input.into(), "DELETE").into()
+}
+
+#[cfg(feature = "std")]
 #[proc_macro_attribute]
 pub fn http_options(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "OPTIONS")
 }
 
+#[cfg(not(feature = "std"))]
+#[proc_macro_attribute]
+pub fn http_options(attr: TokenStream, input: TokenStream) -> TokenStream {
+    lite_http_handler(attr.into(), input.into(), "OPTIONS").into()
+}
+
+#[cfg(feature = "std")]
 #[proc_macro_attribute]
 pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
     http_handler_macro(attr, input, "HEAD")
+}
+
+#[cfg(feature = "std")]
+#[proc_macro_attribute]
+pub fn http_patch(attr: TokenStream, input: TokenStream) -> TokenStream {
+    http_handler_macro(attr, input, "PATCH")
+}
+
+#[cfg(not(feature = "std"))]
+#[proc_macro_attribute]
+pub fn http_patch(attr: TokenStream, input: TokenStream) -> TokenStream {
+    lite_http_handler(attr.into(), input.into(), "PATCH").into()
+}
+
+#[cfg(not(feature = "std"))]
+#[proc_macro_attribute]
+pub fn http_head(attr: TokenStream, input: TokenStream) -> TokenStream {
+    lite_http_handler(attr.into(), input.into(), "HEAD").into()
 }
 
 /// Controller 属性宏 - 定义控制器结构体
@@ -2057,6 +2109,51 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
         .map(|field| quote! { #field: session_cache })
         .collect();
 
+    // 生成的 controller 字段直接持有缓存 Arc，避免请求结束后泄漏堆分配。
+    let mut generated_struct = item_struct.clone();
+    if let syn::Fields::Named(fields) = &mut generated_struct.fields {
+        for field in fields.named.iter_mut() {
+            let field_type = field.ty.to_token_stream().to_string().type_simplify();
+            if field_type.contains("OnceCache") {
+                field.ty = syn::parse_quote!(std::sync::Arc<potato::OnceCache>);
+            } else if field_type.contains("SessionCache") {
+                field.ty = syn::parse_quote!(std::sync::Arc<potato::SessionCache>);
+            }
+        }
+    }
+    let lifetime_markers = generated_struct
+        .generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            syn::GenericParam::Lifetime(lifetime) => Some(lifetime.lifetime.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let lifetime_marker_types = lifetime_markers
+        .iter()
+        .map(|lifetime| quote! { std::marker::PhantomData<&#lifetime ()> })
+        .collect::<Vec<_>>();
+    let lifetime_marker_values = lifetime_markers
+        .iter()
+        .map(|_| quote! { std::marker::PhantomData })
+        .collect::<Vec<_>>();
+    let lifetime_marker_init = if lifetime_markers.is_empty() {
+        quote! {}
+    } else {
+        quote! { __potato_lifetime_markers: (#(#lifetime_marker_values,)*), }
+    };
+    if !lifetime_markers.is_empty() {
+        if let syn::Fields::Named(fields) = &mut generated_struct.fields {
+            fields.named.push(syn::parse_quote! {
+                #[doc(hidden)]
+                __potato_lifetime_markers: (
+                    #(#lifetime_marker_types,)*
+                )
+            });
+        }
+    }
+
     // 生成结构体定义、常量和 inventory 提交
     // 同时生成隐藏的 controller 创建辅助函数
     let controller_creation_fn = if has_session_cache {
@@ -2066,8 +2163,7 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
             #[doc(hidden)]
             #[allow(dead_code)]
             async fn __potato_create_controller(req: &potato::HttpRequest) -> Result<Box<Self>, potato::HttpResponse> {
-                // 在堆上分配缓存
-                let once_cache = Box::leak(Box::new(potato::OnceCache::new()));
+                let once_cache = std::sync::Arc::new(potato::OnceCache::new());
 
                 // 从 Authorization header 中提取 Bearer token 并加载 session
                 let session_cache = {
@@ -2091,12 +2187,13 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
                         return Err(resp);
                     }
                 };
-                let session_cache = Box::leak(Box::new(session_cache));
+                let session_cache = std::sync::Arc::new(session_cache);
 
                 // 创建 controller 实例
                 let controller = Self {
                     #(#once_cache_inits,)*
                     #(#session_cache_inits,)*
+                    #lifetime_marker_init
                 };
 
                 Ok(Box::new(controller))
@@ -2109,15 +2206,12 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
             #[doc(hidden)]
             #[allow(dead_code)]
             async fn __potato_create_controller(_req: &potato::HttpRequest) -> Result<Box<Self>, potato::HttpResponse> {
-                // 在堆上分配缓存
-                let once_cache = Box::leak(Box::new(potato::OnceCache::new()));
-
-                // 创建临时的 SessionCache（不需要鉴权，也不使用）
-                let _temp_session_cache = Box::leak(Box::new(potato::SessionCache::new()));
+                let once_cache = std::sync::Arc::new(potato::OnceCache::new());
 
                 // 创建 controller 实例（不包含 sess_cache 字段）
                 let controller = Self {
                     #(#once_cache_inits,)*
+                    #lifetime_marker_init
                 };
 
                 Ok(Box::new(controller))
@@ -2134,7 +2228,7 @@ fn controller_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
         quote::format_ident!("__POTATO_CONTROLLER_NAME_{}", struct_name_str);
 
     let output = quote! {
-        #item_struct
+        #generated_struct
 
         #base_path
 
@@ -2271,7 +2365,7 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                         };
 
                         // 提取 path 参数和 Send 标志
-                        let (method_path, is_send) = match &attr.meta {
+                        let (method_path, _is_send) = match &attr.meta {
                             syn::Meta::List(list) => {
                                 let tokens: Vec<_> = list.tokens.clone().into_iter().collect();
                                 let mut path = String::new();
@@ -2485,12 +2579,20 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                                 } else {
                                     quote! { None }
                                 };
+                                let session_cache_binding = if needs_session_cache {
+                                    quote! {
+                                        let mut __potato_session_cache =
+                                            #session_cache_init.unwrap_or_else(|| potato::SessionCache::new());
+                                    }
+                                } else {
+                                    quote! {}
+                                };
 
                                 if is_async {
                                     quote! {
                                         {
                                             let mut __potato_once_cache = potato::OnceCache::new();
-                                            let mut __potato_session_cache = #session_cache_init.unwrap_or_else(|| potato::SessionCache::new());
+                                            #session_cache_binding
                                             #(#param_bindings)*
                                             #self_type_name::#fn_name(#(#param_names),*).await
                                         }
@@ -2499,7 +2601,7 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                                     quote! {
                                         {
                                             let mut __potato_once_cache = potato::OnceCache::new();
-                                            let mut __potato_session_cache = #session_cache_init.unwrap_or_else(|| potato::SessionCache::new());
+                                            #session_cache_binding
                                             #(#param_bindings)*
                                             #self_type_name::#fn_name(#(#param_names),*)
                                         }
@@ -2535,31 +2637,18 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
 
                         generated_code.push(wrapper_fn);
 
-                        // 生成路由注册（根据 is_send 标志选择 Async 或 AsyncNoSend）
+                        // 生成路由注册
                         let http_method_ident = quote::format_ident!("{}", http_method);
 
-                        let route_register = if is_send {
-                            quote! {
+                        let route_register = quote! {
                                 potato::inventory::submit! {
                                     potato::RequestHandlerFlag::new(
                                         potato::HttpMethod::#http_method_ident,
                                         #final_path_lit,
                                         potato::HttpHandler::Async(#wrapper_fn_name),
                                         potato::RequestHandlerFlagDoc::new(true, #doc_auth, "", "", "", #self_type_tag)
-                                    )
-                                }
-                            }
-                        } else {
-                            quote! {
-                                potato::inventory::submit! {
-                                    potato::RequestHandlerFlag::new(
-                                        potato::HttpMethod::#http_method_ident,
-                                        #final_path_lit,
-                                        potato::HttpHandler::AsyncNoSend(#wrapper_fn_name),
-                                        potato::RequestHandlerFlagDoc::new(true, #doc_auth, "", "", "", #self_type_tag)
-                                    )
-                                }
-                            }
+                                        )
+                                    }
                         };
 
                         generated_code.push(route_register);

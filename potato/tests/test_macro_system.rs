@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 /// 宏系统综合测试
 /// 测试所有 HTTP 方法宏、属性宏和功能
 use std::sync::atomic::{AtomicU16, Ordering};

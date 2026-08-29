@@ -32,7 +32,7 @@ let mut res = potato::post!(http3("https://api.example.com"), body, Custom("X-Ke
 - **HTTP/2**: 需 TLS，使用 `http2("https://...")`
 - **HTTP/3**: 需 TLS（基于 QUIC），使用 `http3("https://...")`
 
-完整示例：`examples/05_http2_http3_client.rs`
+完整示例：`examples/client/05_http2_http3_client.rs`
 
 ## 会话与流式
 
@@ -80,13 +80,18 @@ let res = potato::get!(
 - **Custom Header**: `Custom(key) = value`，key/value 可为字符串或变量
 - 混合使用，逗号分隔，支持尾随逗号
 
-完整示例：`examples/01_client_with_arg.rs`
+完整示例：`examples/client/01_client_with_arg.rs`
 
 ## 其他功能
 
 **Jemalloc 内存分析**（需启用 `jemalloc` feature）：
 
 ```rust
+use potato::JemallocAllocator;
+
+#[global_allocator]
+static ALLOC: JemallocAllocator = JemallocAllocator;
+
 potato::init_jemalloc()?;  // main 函数开始处
 // ... 运行程序 ...
 let pdf_data = potato::dump_jemalloc_profile()?;  // 获取 PDF 报告
@@ -130,6 +135,7 @@ let mut stream = agent.chat_stream("Tell me a story.").await?;
 while let Some(chunk) = stream.recv().await {
     match chunk {
         potato::StreamChunk::Content(text) => print!("{}", text),
+        potato::StreamChunk::Error(error) => eprintln!("stream error: {error}"),
         potato::StreamChunk::Done => break,
     }
 }

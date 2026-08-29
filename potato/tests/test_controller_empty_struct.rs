@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 use potato::HttpServer;
 
 #[potato::controller]
@@ -17,7 +18,7 @@ async fn test_controller_empty_struct() {
     let server_addr = format!("127.0.0.1:{port}");
 
     let mut server = HttpServer::new(&server_addr);
-    server.configure(|ctx| {
+    let _ = server.configure(|ctx| {
         ctx.use_handlers();
     });
 

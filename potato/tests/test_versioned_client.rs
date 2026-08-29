@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 //! 测试 HTTP 协议版本选择功能
 
 #[cfg(test)]

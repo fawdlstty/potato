@@ -34,7 +34,7 @@ pub async fn serve_http2_impl(
         _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
         let pipe_ctx2 = Arc::clone(&pipe_ctx);
-        _ = tokio::task::spawn(async move {
+        super::HttpServer::spawn_connection(async move {
             let stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
                 Err(_) => return,
@@ -69,7 +69,7 @@ pub async fn serve_http2_impl(
                     Err(_) => break,
                 };
                 let pipe_ctx3 = Arc::clone(&pipe_ctx2);
-                _ = tokio::task::spawn(async move {
+                super::HttpServer::spawn_connection(async move {
                     let _ = handle_h2_request(req_head, respond, pipe_ctx3, client_addr).await;
                 });
             }
