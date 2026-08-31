@@ -9,8 +9,8 @@ use rtc::rtp_transceiver::rtp_sender::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
+use webrtc::media_stream::track_local::TrackLocal;
 
 pub type TrackLocalHandle = Arc<dyn TrackLocal>;
 pub type RoomTracks = HashMap<String, Vec<TrackLocalHandle>>;
@@ -147,10 +147,7 @@ impl Room {
 
     /// 添加Peer的轨道
     pub async fn add_tracks(&self, peer_id: &str, tracks: Vec<TrackLocalHandle>) -> Result<()> {
-        self.tracks
-            .lock()
-            .await
-            .insert(peer_id.to_string(), tracks);
+        self.tracks.lock().await.insert(peer_id.to_string(), tracks);
         Ok(())
     }
 

@@ -298,7 +298,7 @@ fn validate_preprocess_signature(root_fn: &syn::ItemFn) -> (String, bool, bool) 
 }
 
 fn validate_postprocess_signature(root_fn: &syn::ItemFn) -> (String, bool, bool) {
-    if root_fn.sig.inputs.len() < 2 && root_fn.sig.inputs.len() > 4 {
+    if !(2..=4).contains(&root_fn.sig.inputs.len()) {
         panic!("`postprocess` function must accept two to four arguments");
     }
     let mut arg_types = vec![];
@@ -1844,8 +1844,47 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         }
     };
 
-    let wrapper_sig = quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> };
-    let handler_variant = quote! { potato::HttpHandler::Async };
+    let handler_definition = if !is_async
+        && max_concurrency.is_none()
+        && !need_once_cache
+        && !need_session_cache
+        && preprocess_adapters.is_empty()
+        && postprocess_adapters.is_empty()
+    {
+        quote! {
+            #[doc(hidden)]
+            fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+                let mut __potato_response = #handler_wrap_func_body.unwrap();
+                #add_headers_code
+                #cors_headers_code
+                __potato_response
+            }
+        }
+    } else {
+        let wrapper_sig = quote! { fn #wrap_func_name(req: &mut potato::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = potato::HttpResponse> + Send + '_>> };
+        quote! {
+            #[doc(hidden)]
+            async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+                #wrap_func_body
+            }
+
+            #[doc(hidden)]
+            #wrapper_sig {
+                Box::pin(#wrap_func_name2(req))
+            }
+        }
+    };
+    let handler_call = if !is_async
+        && max_concurrency.is_none()
+        && !need_once_cache
+        && !need_session_cache
+        && preprocess_adapters.is_empty()
+        && postprocess_adapters.is_empty()
+    {
+        quote! { potato::HttpHandler::Sync(#wrap_func_name2) }
+    } else {
+        quote! { potato::HttpHandler::Async(#wrap_func_name) }
+    };
     quote! {
         #root_fn
 
@@ -1853,20 +1892,12 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
 
         #semaphore_static
 
-        #[doc(hidden)]
-        async fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
-            #wrap_func_body
-        }
-
-        #[doc(hidden)]
-        #wrapper_sig {
-            Box::pin(#wrap_func_name2(req))
-        }
+        #handler_definition
 
         potato::inventory::submit!{potato::RequestHandlerFlag::new(
             potato::HttpMethod::#req_name,
             #final_path_expr,
-            #handler_variant(#wrap_func_name),
+            #handler_call,
             potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args, #tag_expr)
         )}
     }
@@ -2947,7 +2978,7 @@ pub fn embed_dir(input: TokenStream) -> TokenStream {
 pub fn standard_header_derive(input: TokenStream) -> TokenStream {
     let root_enum = syn::parse_macro_input!(input as syn::ItemEnum);
     let enum_name = root_enum.ident;
-    let mut try_from_str_items = vec![];
+    let mut try_from_str_dispatch_items = Vec::new();
     let mut to_str_items = vec![];
     let mut headers_items = vec![];
     let mut headers_apply_items = vec![];
@@ -2958,21 +2989,33 @@ pub fn standard_header_derive(input: TokenStream) -> TokenStream {
         }
         let str_name = name.to_string().replace("_", "-");
         let len = str_name.len();
-        try_from_str_items
-            .push(quote! { #len if value.eq_ignore_ascii_case(#str_name) => Some(Self::#name), });
+        let first_char = str_name.chars().next().unwrap().to_ascii_lowercase();
+        try_from_str_dispatch_items.push((
+            first_char,
+            len,
+            quote! { if value.eq_ignore_ascii_case(#str_name) => Some(Self::#name), },
+        ));
         to_str_items.push(quote! { Self::#name => #str_name, });
         headers_items.push(quote! { #name(String), });
         headers_apply_items
             .push(quote! { Headers::#name(s) => self.set_header(HeaderItem::#name.to_str(), s), });
     }
+    let try_from_str_dispatch_items = try_from_str_dispatch_items
+        .into_iter()
+        .map(|(first, len, item)| quote! { (#first, #len) #item });
     let r = quote! {
-        impl #enum_name {
-            pub fn try_from_str(value: &str) -> Option<Self> {
-                match value.len() {
-                    #( #try_from_str_items )*
-                    _ => None,
+            impl #enum_name {
+                pub fn try_from_str(value: &str) -> Option<Self> {
+                    let bytes = value.as_bytes();
+                    if bytes.is_empty() {
+                        return None;
+                    }
+                    let first = bytes[0].to_ascii_lowercase() as char;
+                    match (first, bytes.len()) {
+                        #( #try_from_str_dispatch_items )*
+                        _ => None,
+                    }
                 }
-            }
 
             pub fn to_str(&self) -> &'static str {
                 match self {
@@ -2996,4 +3039,46 @@ pub fn standard_header_derive(input: TokenStream) -> TokenStream {
         }
     };
     r.into()
+}
+
+#[cfg(test)]
+mod postprocess_signature_tests {
+    use super::*;
+
+    fn validate_signature(source: &str) -> (String, bool, bool) {
+        validate_postprocess_signature(&syn::parse_str(source).unwrap())
+    }
+
+    #[test]
+    fn accepts_two_to_four_arguments() {
+        validate_signature(
+            "async fn post(_req: &mut potato::HttpRequest, _res: &mut potato::HttpResponse) {}",
+        );
+        validate_signature(
+            "async fn post(_req: &mut potato::HttpRequest, _res: &mut potato::HttpResponse, _cache: &mut potato::OnceCache) {}",
+        );
+        validate_signature(
+            "async fn post(_req: &mut potato::HttpRequest, _res: &mut potato::HttpResponse, _once: &mut potato::OnceCache, _session: &mut potato::SessionCache) {}",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "`postprocess` function must accept two to four arguments")]
+    fn rejects_zero_arguments() {
+        validate_signature("async fn post() {}");
+    }
+
+    #[test]
+    #[should_panic(expected = "`postprocess` function must accept two to four arguments")]
+    fn rejects_one_argument() {
+        validate_signature("async fn post(_req: &mut potato::HttpRequest) {}");
+    }
+
+    #[test]
+    #[should_panic(expected = "`postprocess` function must accept two to four arguments")]
+    fn rejects_five_arguments() {
+        validate_signature(
+            "async fn post(_req: &mut potato::HttpRequest, _res: &mut potato::HttpResponse, _once: &mut potato::OnceCache, _session: &mut potato::SessionCache, _extra: ()) {}",
+        );
+    }
 }

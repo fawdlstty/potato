@@ -45,6 +45,10 @@ enum WsFrameImpl {
     PartData(Vec<u8>),
 }
 
+enum WebsocketRole {
+    Client,
+    Server,
+}
 // ---------------------------------------------------------------------------
 // Websocket
 // ---------------------------------------------------------------------------
@@ -72,7 +76,7 @@ impl<S, R> Websocket<S, R> {
 impl<S: WebsocketIo, R: FnMut(&mut [u8])> Websocket<S, R> {
     /// Receives a complete WebSocket message.
     pub async fn recv(&mut self) -> anyhow::Result<WsFrame> {
-        ws_recv(&mut self.socket).await
+        ws_recv_with_role(&mut self.socket, WebsocketRole::Client, &mut self.rng).await
     }
 
     /// Sends a WebSocket frame.
@@ -383,13 +387,22 @@ async fn recv_impl<S: WebsocketIo>(socket: &mut S) -> anyhow::Result<WsFrameImpl
 }
 
 pub async fn ws_recv<S: WebsocketIo>(socket: &mut S) -> anyhow::Result<WsFrame> {
+    ws_recv_with_role(socket, WebsocketRole::Server, &mut no_rng).await
+}
+
+async fn ws_recv_with_role<S: WebsocketIo, R: FnMut(&mut [u8])>(
+    socket: &mut S,
+    role: WebsocketRole,
+    rng: &mut R,
+) -> anyhow::Result<WsFrame> {
     let mut accum: Vec<u8> = Vec::new();
     loop {
         match recv_impl(socket).await? {
             WsFrameImpl::Close => return Err(anyhow::anyhow!("WebSocket close frame received")),
-            WsFrameImpl::Ping => {
-                send_server_frame(socket, WsFrameImpl::Pong).await?;
-            }
+            WsFrameImpl::Ping => match role {
+                WebsocketRole::Client => send_client_frame(socket, WsFrameImpl::Pong, rng).await?,
+                WebsocketRole::Server => send_server_frame(socket, WsFrameImpl::Pong).await?,
+            },
             WsFrameImpl::Pong => {}
             WsFrameImpl::Binary(data) => {
                 accum.extend(data);

@@ -7,6 +7,7 @@ pub mod http3;
 
 use super::SERVER_STR;
 use crate::utils::bytes::CompressExt;
+use crate::utils::path::strip_path_prefix;
 use crate::utils::refstr::{HeaderItem, Headers};
 use crate::utils::tcp_stream::HttpStream;
 use crate::{HttpMethod, HttpRequest, HttpResponse, HttpResponseBody};
@@ -1123,10 +1124,7 @@ impl TransferSession {
 
             if self.req_path_prefix != "/" {
                 let orig_path = req.url_path.to_string();
-                if orig_path.starts_with(&self.req_path_prefix) {
-                    let new_path = orig_path
-                        .strip_prefix(&self.req_path_prefix)
-                        .unwrap_or(&orig_path);
+                if let Some(new_path) = strip_path_prefix(&orig_path, &self.req_path_prefix) {
                     req.url_path = new_path.to_string().into();
                 }
             }
@@ -1399,14 +1397,9 @@ impl TransferSession {
             let uri = dest_url_str.parse::<http::Uri>()?;
             let path = if self.req_path_prefix != "/" {
                 let orig_path = req.url_path.to_string();
-                if orig_path.starts_with(&self.req_path_prefix) {
-                    orig_path
-                        .strip_prefix(&self.req_path_prefix)
-                        .unwrap_or(&orig_path)
-                        .to_string()
-                } else {
-                    orig_path
-                }
+                strip_path_prefix(&orig_path, &self.req_path_prefix)
+                    .unwrap_or(&orig_path)
+                    .to_string()
             } else {
                 req.url_path.to_string()
             };

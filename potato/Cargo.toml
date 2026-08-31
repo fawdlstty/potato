@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.3.27"
+version = "0.3.28"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -24,9 +24,10 @@ http = { version = "1.5.0", optional = true }
 httparse = { version = "1.10.1", optional = true }
 inventory = { version = "0.3.24", optional = true }
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"], optional = true }
-potato-macro = { version = "0.3.27", path = "../potato-macro" }
+potato-macro = { version = "0.3.28", path = "../potato-macro" }
 linkme = { version = "0.3.37" }
 rand = { version = "0.10.2", optional = true }
+rustc-hash = { version = "2.1.1", optional = true }
 regex = { version = "1.13.1", optional = true }
 rust-embed = { version = "8.12.0", optional = true }
 rustls-pki-types = { version = "1.15.1", optional = true }
@@ -102,6 +103,7 @@ std = [
     "dep:inventory",
     "dep:jsonwebtoken",
     "dep:rand",
+    "dep:rustc-hash",
     "dep:regex",
     "dep:rust-embed",
     "dep:serde",

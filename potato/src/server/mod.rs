@@ -4,6 +4,7 @@ mod http2;
 mod http3;
 
 use crate::utils::enums::HttpConnection;
+use crate::utils::path::strip_path_prefix;
 use crate::utils::refstr::HeaderItem;
 use crate::utils::tcp_stream::HttpStream;
 use crate::CompressMode;
@@ -11,7 +12,7 @@ use crate::{
     HttpHandler, HttpMethod, HttpRequest, HttpRequestTargetForm, HttpResponse, PreflightResult,
 };
 use crate::{RequestHandlerFlag, TransferSession};
-use std::any::TypeId;
+use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
@@ -249,9 +250,9 @@ static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static Req
         handlers
     });
 
-static HANDLERS_FLAT: LazyLock<HashMap<(&'static str, HttpMethod), &'static RequestHandlerFlag>> =
+static HANDLERS_FLAT: LazyLock<FxHashMap<(&'static str, HttpMethod), &'static RequestHandlerFlag>> =
     LazyLock::new(|| {
-        let mut handlers = HashMap::with_capacity(64);
+        let mut handlers = FxHashMap::with_capacity_and_hasher(64, Default::default());
         for flag in inventory::iter::<RequestHandlerFlag> {
             handlers.insert((flag.path, flag.method), flag);
         }
@@ -1159,30 +1160,32 @@ impl PipeContext {
             return res;
         }
 
-        // 收集所有 Postprocess handlers
-        let postprocess_handlers: Vec<&PostprocessHandler> = self2
-            .items
+        let postprocess_handlers = self2.items.as_slice();
+        let has_postprocess = postprocess_handlers
             .iter()
-            .filter_map(|item| {
-                if let PipeContextItem::Postprocess(handler) = item {
-                    Some(handler)
-                } else {
-                    None
+            .any(|item| matches!(item, PipeContextItem::Postprocess(_)));
+
+        macro_rules! maybe_execute_postprocess {
+            ($response:expr) => {
+                if has_postprocess {
+                    execute_postprocess(&postprocess_handlers, req, &mut $response).await;
                 }
-            })
-            .collect();
+            };
+        }
 
         // 执行 Postprocess 的辅助函数
         async fn execute_postprocess(
-            handlers: &[&PostprocessHandler],
+            handlers: &[PipeContextItem],
             req: &mut HttpRequest,
             res: &mut HttpResponse,
         ) {
             for handler in handlers {
-                match handler {
-                    PostprocessHandler::Fn(fn_handler) => {
-                        if let Err(e) = fn_handler(req, res).await {
-                            eprintln!("[Postprocess] Error: {}", e);
+                if let PipeContextItem::Postprocess(handler) = handler {
+                    match handler {
+                        PostprocessHandler::Fn(fn_handler) => {
+                            if let Err(e) = fn_handler(req, res).await {
+                                eprintln!("[Postprocess] Error: {}", e);
+                            }
                         }
                     }
                 }
@@ -1205,7 +1208,7 @@ impl PipeContext {
                             HttpHandler::Async(handler) => handler(req).await,
                             HttpHandler::Sync(handler) => handler(req),
                         };
-                        execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                        maybe_execute_postprocess!(res);
                         return res;
                     } else {
                         if req.method == HttpMethod::HEAD {
@@ -1220,7 +1223,7 @@ impl PipeContext {
                                 };
                                 req.method = HttpMethod::HEAD;
                                 res.body = crate::HttpResponseBody::Data(vec![]);
-                                execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                                maybe_execute_postprocess!(res);
                                 return res;
                             }
 
@@ -1255,7 +1258,7 @@ impl PipeContext {
                             };
 
                             res2.add_header("Allow".into(), methods_str);
-                            execute_postprocess(&postprocess_handlers, req, &mut res2).await;
+                            maybe_execute_postprocess!(res2);
                             return res2;
                         } else {
                             continue;
@@ -1263,20 +1266,20 @@ impl PipeContext {
                     }
                 }
                 PipeContextItem::LocationRoute((url_path, loc_path, allow_symlink_escape)) => {
-                    if !req.url_path.starts_with(url_path) {
+                    let Some(req_suffix) = strip_path_prefix(&req.url_path, url_path) else {
                         continue;
-                    }
+                    };
                     let canonical_root = if *allow_symlink_escape {
                         None
                     } else {
                         std::fs::canonicalize(loc_path).ok()
                     };
-                    let req_suffix = req.url_path[url_path.len()..].trim_start_matches('/');
+                    let req_suffix = req_suffix.trim_start_matches('/');
                     let path = match Self::sanitize_location_route_path(loc_path, req_suffix) {
                         Some(path) => path,
                         None => {
                             let mut res = HttpResponse::error("url path over directory");
-                            execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                            maybe_execute_postprocess!(res);
                             return res;
                         }
                     };
@@ -1285,20 +1288,20 @@ impl PipeContext {
                             if let Some(root) = canonical_root.as_ref() {
                                 if !Self::path_stays_inside_root(&path, root) {
                                     let mut res = HttpResponse::error("url path over directory");
-                                    execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                                    maybe_execute_postprocess!(res);
                                     return res;
                                 }
                             }
                             if let Some(path) = path.to_str() {
                                 let mut res = Self::from_static_file(req, path, &meta);
-                                execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                                maybe_execute_postprocess!(res);
                                 return res;
                             }
                         } else if meta.is_dir() {
                             if let Some(root) = canonical_root.as_ref() {
                                 if !Self::path_stays_inside_root(&path, root) {
                                     let mut res = HttpResponse::error("url path over directory");
-                                    execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                                    maybe_execute_postprocess!(res);
                                     return res;
                                 }
                             }
@@ -1310,19 +1313,13 @@ impl PipeContext {
                                         if !Self::path_stays_inside_root(&tmp_path, root) {
                                             let mut res =
                                                 HttpResponse::error("url path over directory");
-                                            execute_postprocess(
-                                                &postprocess_handlers,
-                                                req,
-                                                &mut res,
-                                            )
-                                            .await;
+                                            maybe_execute_postprocess!(res);
                                             return res;
                                         }
                                     }
                                     if let Some(path) = tmp_path.to_str() {
                                         let mut res = Self::from_static_file(req, path, &tmp_meta);
-                                        execute_postprocess(&postprocess_handlers, req, &mut res)
-                                            .await;
+                                        maybe_execute_postprocess!(res);
                                         return res;
                                     }
                                 }
@@ -1335,19 +1332,13 @@ impl PipeContext {
                                         if !Self::path_stays_inside_root(&tmp_path, root) {
                                             let mut res =
                                                 HttpResponse::error("url path over directory");
-                                            execute_postprocess(
-                                                &postprocess_handlers,
-                                                req,
-                                                &mut res,
-                                            )
-                                            .await;
+                                            maybe_execute_postprocess!(res);
                                             return res;
                                         }
                                     }
                                     if let Some(path) = tmp_path.to_str() {
                                         let mut res = Self::from_static_file(req, path, &tmp_meta);
-                                        execute_postprocess(&postprocess_handlers, req, &mut res)
-                                            .await;
+                                        maybe_execute_postprocess!(res);
                                         return res;
                                     }
                                 }
@@ -1382,7 +1373,7 @@ impl PipeContext {
                                     meta.as_ref(),
                                     etag.as_str(),
                                 );
-                                execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                                maybe_execute_postprocess!(res);
                                 return res;
                             }
                             PreflightResult::PreconditionFailed => {
@@ -1393,7 +1384,7 @@ impl PipeContext {
                                     meta.as_ref(),
                                     etag.as_str(),
                                 );
-                                execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                                maybe_execute_postprocess!(res);
                                 return res;
                             }
                             PreflightResult::Proceed => {
@@ -1428,8 +1419,7 @@ impl PipeContext {
                                             meta.as_ref(),
                                             etag.as_str(),
                                         );
-                                        execute_postprocess(&postprocess_handlers, req, &mut res)
-                                            .await;
+                                        maybe_execute_postprocess!(res);
                                         return res;
                                     }
                                     None => {
@@ -1445,8 +1435,7 @@ impl PipeContext {
                                             meta.as_ref(),
                                             etag.as_str(),
                                         );
-                                        execute_postprocess(&postprocess_handlers, req, &mut res)
-                                            .await;
+                                        maybe_execute_postprocess!(res);
                                         return res;
                                     }
                                 }
@@ -1457,14 +1446,14 @@ impl PipeContext {
                             HttpResponse::from_mem_file(&req.url_path, item.to_vec(), false, None);
                         ret.add_header("Accept-Ranges".into(), "bytes".into());
                         Self::add_embedded_validators(&mut ret, meta.as_ref(), etag.as_str());
-                        execute_postprocess(&postprocess_handlers, req, &mut ret).await;
+                        maybe_execute_postprocess!(ret);
                         return ret;
                     }
                     continue;
                 }
                 PipeContextItem::FinalRoute(res) => {
                     let mut res = res.clone();
-                    execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                    maybe_execute_postprocess!(res);
                     return res;
                 }
                 PipeContextItem::LimitSize(_max_header, max_body) => {
@@ -1476,7 +1465,7 @@ impl PipeContext {
                             body_len, max_body
                         ));
                         res.http_code = 413;
-                        execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                        maybe_execute_postprocess!(res);
                         return res;
                     }
                     // Header 大小已在解析阶段检查，此处为双重保险
@@ -1489,14 +1478,14 @@ impl PipeContext {
                 PipeContextItem::Custom(handler) => match handler {
                     CustomHandler::Sync(handler) => match handler.as_ref()(req) {
                         Some(mut res) => {
-                            execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                            maybe_execute_postprocess!(res);
                             return res;
                         }
                         None => continue,
                     },
                     CustomHandler::Async(handler) => match handler.as_ref()(req).await {
                         Some(mut res) => {
-                            execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                            maybe_execute_postprocess!(res);
                             return res;
                         }
                         None => continue,
@@ -1507,15 +1496,14 @@ impl PipeContext {
                         PreprocessHandler::Fn(fn_handler) => {
                             match fn_handler(req).await {
                                 Ok(Some(mut response)) => {
-                                    execute_postprocess(&postprocess_handlers, req, &mut response)
-                                        .await;
+                                    maybe_execute_postprocess!(response);
                                     return response;
                                 }
                                 Ok(None) => {} // 继续处理
                                 Err(e) => {
                                     let mut res =
                                         HttpResponse::error(format!("Preprocess error: {e}"));
-                                    execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                                    maybe_execute_postprocess!(res);
                                     return res;
                                 }
                             }
@@ -1523,7 +1511,7 @@ impl PipeContext {
                     }
                 }
                 PipeContextItem::ReverseProxy(path, proxy_url, modify_content) => {
-                    if !req.url_path.starts_with(path) {
+                    if strip_path_prefix(&req.url_path, path).is_none() {
                         continue;
                     }
 
@@ -1532,12 +1520,12 @@ impl PipeContext {
 
                     match transfer_session.transfer(req, *modify_content).await {
                         Ok(mut response) => {
-                            execute_postprocess(&postprocess_handlers, req, &mut response).await;
+                            maybe_execute_postprocess!(response);
                             return response;
                         }
                         Err(err) => {
                             let mut res = HttpResponse::error(format!("{err}"));
-                            execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                            maybe_execute_postprocess!(res);
                             return res;
                         }
                     }
@@ -1580,7 +1568,7 @@ impl PipeContext {
                             }
                             Err(err) => HttpResponse::error(format!("{err}")),
                         };
-                        execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                        maybe_execute_postprocess!(res);
                         return res;
                     }
                 }
@@ -1588,9 +1576,9 @@ impl PipeContext {
                 PipeContextItem::Webdav((path, dav_server)) => {
                     use crate::utils::string::StringExt;
                     use futures_util::StreamExt;
-                    if !req.url_path.starts_with(path) {
+                    let Some(adjusted_path) = strip_path_prefix(&req.url_path, path) else {
                         continue;
-                    }
+                    };
                     let new_req = {
                         let mut new_req = http::Request::new(match req.body.len() {
                             0 => dav_server::body::Body::empty(),
@@ -1613,14 +1601,6 @@ impl PipeContext {
                             30 => http::Version::HTTP_3,
                             _ => http::Version::HTTP_11,
                         };
-                        // Modify URI to remove the specified path prefix and preserve original scheme and authority
-                        let adjusted_path = if req.url_path.starts_with(path) {
-                            // Remove the path prefix from the original path
-                            &req.url_path[path.len()..]
-                        } else {
-                            &req.url_path[..]
-                        };
-
                         // Ensure the path starts with / for valid URI
                         let final_path = if adjusted_path.is_empty() {
                             "/"
@@ -1694,7 +1674,7 @@ impl PipeContext {
                             res.add_header(k.into(), v.into());
                         }
                         res.http_code = new_res.status().as_u16();
-                        res.version = format!("{:?}", new_res.version());
+                        res.version = format!("{:?}", new_res.version()).into();
                         let body = new_res.body_mut();
                         let mut body_data = Vec::new();
                         while let Some(Ok(part)) = body.next().await {
@@ -1704,7 +1684,7 @@ impl PipeContext {
                         res
                     };
                     let mut res = res;
-                    execute_postprocess(&postprocess_handlers, req, &mut res).await;
+                    maybe_execute_postprocess!(res);
                     return res;
                 }
                 #[cfg(feature = "webrtc")]
@@ -2007,7 +1987,7 @@ impl HttpServer {
         });
 
         // 如果有速率限制，使用 RateLimitedStream 包装
-        let stream: HttpStream = if let Some((inbound_rate, outbound_rate)) = rate_limit {
+        let mut stream: HttpStream = if let Some((inbound_rate, outbound_rate)) = rate_limit {
             HttpStream::RateLimited(crate::utils::tcp_stream::RateLimitedStream::new(
                 stream,
                 inbound_rate,
@@ -2017,21 +1997,22 @@ impl HttpServer {
             stream
         };
 
-        let mut stream = Arc::new(Mutex::new(stream));
         let request_limits = pipe_ctx.request_limits();
         Self::spawn_connection(async move {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
+            let mut req = HttpRequest::new();
             loop {
-                let (mut req, n) = {
-                    match HttpRequest::from_stream_with_limits(
+                let n = {
+                    match HttpRequest::from_stream_with_limits_into(
                         &mut buf,
-                        Arc::clone(&stream),
+                        &mut stream,
                         request_limits.map(|(header, _)| header),
                         request_limits.map(|(_, body)| body),
+                        &mut req,
                     )
                     .await
                     {
-                        Ok((req, n)) => (req, n),
+                        Ok(n) => n,
                         Err(err) => {
                             let err_msg = err.to_string();
                             if err_msg.contains("conflicting duplicate Content-Length headers") {
@@ -2054,48 +2035,51 @@ impl HttpServer {
                                 HttpResponse::bad_request(err_msg)
                             };
                             res.add_header("Connection".into(), "close".into());
-                            let mut stream_guard = stream.lock().await;
                             let _ = res
-                                .write_to_stream(&mut stream_guard, CompressMode::None, None)
+                                .write_to_stream(&mut stream, CompressMode::None, None)
                                 .await;
                             break;
                         }
                     }
                 };
                 req.client_addr = Some(client_addr);
-                req.add_ext(Arc::clone(&stream));
                 let cmode = req.get_header_accept_encoding();
                 let conn = req.get_header_connection();
+                if conn == HttpConnection::Upgrade && req.is_websocket() {
+                    let stream = Arc::new(Mutex::new(stream));
+                    req.stream = Some(Arc::clone(&stream));
+                    let mut res = PipeContext::handle_request(pipe_ctx.as_ref(), &mut req, 0).await;
+                    if conn != HttpConnection::KeepAlive {
+                        res.add_header("Connection".into(), "close".into());
+                    }
+                    let mut stream_guard = stream.lock().await;
+                    if res
+                        .write_to_stream(&mut stream_guard, cmode, Some(req.method))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    break;
+                }
                 let mut res = PipeContext::handle_request(pipe_ctx.as_ref(), &mut req, 0).await;
                 if conn != HttpConnection::KeepAlive {
                     res.add_header("Connection".into(), "close".into());
                 }
-                let stream_for_write = req.exts.remove(&TypeId::of::<Mutex<HttpStream>>());
-                match stream_for_write {
-                    Some(stream_in_req) => {
-                        drop(stream_in_req);
-                        let write_res = if let Some(stream_mutex) = Arc::get_mut(&mut stream) {
-                            res.write_to_stream(stream_mutex.get_mut(), cmode, Some(req.method))
-                                .await
-                        } else {
-                            let mut stream = stream.lock().await;
-                            res.write_to_stream(&mut stream, cmode, Some(req.method))
-                                .await
-                        };
-                        match write_res {
-                            Ok(()) => {
-                                if n > 0 {
-                                    let remain = buf.len().saturating_sub(n);
-                                    if remain > 0 {
-                                        buf.copy_within(n.., 0);
-                                    }
-                                    buf.truncate(remain);
-                                }
+                let write_res = res
+                    .write_to_stream(&mut stream, cmode, Some(req.method))
+                    .await;
+                match write_res {
+                    Ok(()) => {
+                        if n > 0 {
+                            let remain = buf.len().saturating_sub(n);
+                            if remain > 0 {
+                                buf.copy_within(n.., 0);
                             }
-                            Err(_) => break,
+                            buf.truncate(remain);
                         }
                     }
-                    None => break,
+                    Err(_) => break,
                 }
                 if conn != HttpConnection::KeepAlive {
                     break;

@@ -107,8 +107,10 @@ mod tests {
         let token =
             ServerAuth::jwt_issue("test-user".to_string(), Duration::from_secs(3600)).await?;
 
-        let mut validation = Validation::default();
-        validation.validate_exp = false;
+        let mut validation = Validation {
+            validate_exp: false,
+            ..Default::default()
+        };
         validation.required_spec_claims.clear();
         let claims = decode::<Claims>(
             &token,

@@ -78,7 +78,9 @@ mod pending_route {
 
 #[cfg(all(not(feature = "std"), feature = "websocket"))]
 mod websocket_handshake {
-    use potato::{block_on, client_handshake_with_rng, compute_ws_accept, Websocket, WebsocketIo};
+    use potato::{
+        block_on, client_handshake_with_rng, compute_ws_accept, ws_recv, Websocket, WebsocketIo,
+    };
     use std::cell::Cell;
 
     struct TestSocket {
@@ -88,9 +90,10 @@ mod websocket_handshake {
     }
 
     impl TestSocket {
-        fn new(input: String) -> Self {
+        fn new(input: impl Into<Vec<u8>>) -> Self {
+            let input = input.into();
             Self {
-                input: input.into_bytes(),
+                input,
                 read_pos: 0,
                 output: Vec::new(),
             }
@@ -205,6 +208,29 @@ mod websocket_handshake {
 
         // The handshake used zero bytes; the next RNG state masks this frame.
         assert!(output.ends_with(&[0x81, 0x82, 1, 1, 1, 1, ('a' as u8) ^ 1, ('b' as u8) ^ 1]));
+    }
+
+    #[test]
+    fn websocket_client_pong_is_masked() {
+        let rng = counter_rng();
+        let mut websocket =
+            Websocket::from_socket(TestSocket::new(vec![0x89, 0x00, 0x82, 0x00]), rng);
+
+        block_on(websocket.recv()).unwrap();
+
+        let output = websocket.into_inner().output;
+        assert_eq!(&output[..2], &[0x8a, 0x80]);
+    }
+
+    #[test]
+    fn websocket_server_pong_is_unmasked() {
+        let mut socket = TestSocket::new(vec![
+            0x89, 0x80, 0x11, 0x22, 0x33, 0x44, 0x82, 0x80, 0x55, 0x66, 0x77, 0x88,
+        ]);
+
+        block_on(ws_recv(&mut socket)).unwrap();
+
+        assert_eq!(&socket.output[..2], &[0x8a, 0x00]);
     }
 }
 

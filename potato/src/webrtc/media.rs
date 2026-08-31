@@ -3,10 +3,10 @@
 //! 自动处理RTP包的接收、解析和分发
 
 use anyhow::Result;
+use rtc::rtp::Packet as RtpPacket;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use rtc::rtp::Packet as RtpPacket;
 
 /// 媒体类型
 #[derive(Debug, Clone, PartialEq)]

@@ -10,8 +10,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceServer, RTCIceCandidateInit, RTCSessionDescription, RTCPeerConnectionIceEvent,
+    MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+    RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer, RTCPeerConnectionIceEvent,
+    RTCSessionDescription,
 };
 
 pub type PeerSenderMap = HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>;
@@ -154,6 +155,8 @@ impl WebRTCSFU {
                 ..Default::default()
             }])
             .build();
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_default_codecs()?;
         let handler = Arc::new(ServerPeerHandler {
             room,
             context: ServerPeerContext {
@@ -167,6 +170,7 @@ impl WebRTCSFU {
         Ok(Arc::new(
             PeerConnectionBuilder::new()
                 .with_configuration(config)
+                .with_media_engine(media_engine)
                 .with_handler(handler)
                 .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
                 .build()
@@ -240,13 +244,23 @@ impl WebRTCSFU {
             .await?;
         let offer = RTCSessionDescription::offer(offer_sdp.to_string())?;
         pc.set_remote_description(offer).await?;
-        room.forward_track(publisher_id, subscriber_id).await?;
-        let answer = pc.create_answer(None).await?;
-        pc.set_local_description(answer.clone()).await?;
-
-        let mut peer = Peer::new(subscriber_id, room_id, pc);
+        let mut peer = Peer::new(subscriber_id, room_id, pc.clone());
         peer.add_subscription(publisher_id.to_string());
         room.add_peer(subscriber_id, Arc::new(peer)).await?;
-        Ok(answer.sdp)
+
+        let result = async {
+            room.forward_track(publisher_id, subscriber_id).await?;
+            let answer = pc.create_answer(None).await?;
+            pc.set_local_description(answer.clone()).await?;
+            Ok(answer.sdp)
+        }
+        .await;
+
+        if result.is_err() {
+            if let Err(e) = room.remove_peer(subscriber_id).await {
+                eprintln!("清理订阅失败 Peer {subscriber_id}: {e}");
+            }
+        }
+        result
     }
 }

@@ -42,10 +42,12 @@ use hipstr::{LocalHipByt, LocalHipStr};
 use http::uri::Scheme;
 use http::Uri;
 use rust_embed::Embed;
+use rustc_hash::FxHashMap;
 use sha1::{Digest, Sha1};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::fmt;
 use std::fs::{File, Metadata};
 use std::io::{ErrorKind, Read};
 use std::net::SocketAddr;
@@ -1153,24 +1155,43 @@ pub struct PostFile {
 
 unsafe impl Send for PostFile {}
 
-#[derive(Debug)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub target_form: HttpRequestTargetForm,
     pub url_path: LocalHipStr<'static>,
     pub url_query: HashMap<LocalHipStr<'static>, LocalHipStr<'static>>,
     pub version: u8,
-    pub headers: HashMap<HeaderOrHipStr, LocalHipStr<'static>>,
-    pub trailers: HashMap<HeaderOrHipStr, LocalHipStr<'static>>,
+    pub headers: FxHashMap<HeaderOrHipStr, LocalHipStr<'static>>,
+    pub trailers: FxHashMap<HeaderOrHipStr, LocalHipStr<'static>>,
     pub body: LocalHipByt<'static>,
     pub body_pairs: HashMap<LocalHipStr<'static>, LocalHipStr<'static>>,
     pub body_files: HashMap<LocalHipStr<'static>, PostFile>,
     pub client_addr: Option<SocketAddr>,
     pub exts: HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>>,
+    stream: Option<Arc<Mutex<HttpStream>>>,
 }
 
 unsafe impl Send for HttpRequest {}
 unsafe impl Sync for HttpRequest {}
+
+impl fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("target_form", &self.target_form)
+            .field("url_path", &self.url_path)
+            .field("url_query", &self.url_query)
+            .field("version", &self.version)
+            .field("headers", &self.headers)
+            .field("trailers", &self.trailers)
+            .field("body", &self.body)
+            .field("body_pairs", &self.body_pairs)
+            .field("body_files", &self.body_files)
+            .field("client_addr", &self.client_addr)
+            .field("exts", &self.exts)
+            .finish()
+    }
+}
 
 impl Default for HttpRequest {
     fn default() -> Self {
@@ -1221,19 +1242,40 @@ impl HttpRequest {
     }
 
     pub fn new() -> Self {
+        Self::with_header_capacity(8)
+    }
+
+    fn clear_for_reuse(&mut self) {
+        self.method = HttpMethod::GET;
+        self.target_form = HttpRequestTargetForm::Origin;
+        self.url_path = "".into();
+        self.url_query.clear();
+        self.version = 11;
+        self.headers.clear();
+        self.trailers.clear();
+        self.body = LocalHipByt::new();
+        self.body_pairs.clear();
+        self.body_files.clear();
+        self.client_addr = None;
+        self.exts.clear();
+        self.stream = None;
+    }
+
+    fn with_header_capacity(header_capacity: usize) -> Self {
         Self {
             method: HttpMethod::GET,
             target_form: HttpRequestTargetForm::Origin,
             url_path: LocalHipStr::from("/"),
-            url_query: HashMap::with_capacity(16),
+            url_query: HashMap::new(),
             version: 11,
-            headers: HashMap::with_capacity(16),
-            trailers: HashMap::with_capacity(4),
+            headers: FxHashMap::with_capacity_and_hasher(header_capacity, Default::default()),
+            trailers: FxHashMap::default(),
             body: LocalHipByt::new(),
-            body_pairs: HashMap::with_capacity(16),
-            body_files: HashMap::with_capacity(4),
+            body_pairs: HashMap::new(),
+            body_files: HashMap::new(),
             client_addr: None,
-            exts: HashMap::with_capacity(2),
+            exts: HashMap::new(),
+            stream: None,
         }
     }
 
@@ -1249,20 +1291,9 @@ impl HttpRequest {
         q
     }
 
-    fn add_ext<T: Any + Send + Sync + 'static>(&mut self, item: Arc<T>) {
-        let type_id = TypeId::of::<T>();
-        self.exts.insert(type_id, item);
-    }
-
     fn get_ext<T: Any + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
         self.exts
             .get(&TypeId::of::<T>())
-            .and_then(|any| any.clone().downcast().ok())
-    }
-
-    fn remove_ext<T: Any + Send + Sync + 'static>(&mut self) -> Option<Arc<T>> {
-        self.exts
-            .remove(&TypeId::of::<T>())
             .and_then(|any| any.clone().downcast().ok())
     }
 
@@ -1573,12 +1604,12 @@ impl HttpRequest {
         max_body_bytes: Option<usize>,
     ) -> anyhow::Result<(
         LocalHipByt<'static>,
-        HashMap<HeaderOrHipStr, LocalHipStr<'static>>,
+        FxHashMap<HeaderOrHipStr, LocalHipStr<'static>>,
         usize,
     )> {
         let mut cursor = hdr_len;
         let mut body = Vec::new();
-        let mut trailers = HashMap::with_capacity(4);
+        let mut trailers = FxHashMap::with_capacity_and_hasher(4, Default::default());
         let mut tmp_buf = [0u8; 4096];
 
         loop {
@@ -1705,7 +1736,7 @@ impl HttpRequest {
             .unwrap_or("")
             .to_string();
         // let ws_ext = req.get_header("Sec-WebSocket-Extensions").unwrap_or("".to_string());
-        let stream = match self.remove_ext::<Mutex<HttpStream>>() {
+        let stream = match self.stream.take() {
             Some(stream) => stream,
             None => Err(anyhow!("connot get stream"))?,
         };
@@ -1727,20 +1758,22 @@ impl HttpRequest {
         }
     }
 
-    async fn from_stream_impl(
+    async fn from_stream_impl_into(
         buf: &mut Vec<u8>,
         stream: &mut HttpStream,
         limits: (Option<usize>, Option<usize>),
-    ) -> anyhow::Result<(Self, usize)> {
+        req: &mut HttpRequest,
+    ) -> anyhow::Result<usize> {
         let mut tmp_buf = [0u8; 4096];
         let max_header_bytes = limits
             .0
             .map(|limit| limit.min(ServerConfig::get_max_header_bytes()))
             .unwrap_or_else(ServerConfig::get_max_header_bytes);
-        let (mut req, hdr_len) = loop {
+        let hdr_len = loop {
             Self::ensure_header_section_size(buf, max_header_bytes)?;
-            match HttpRequest::from_headers_part_with_limits(&buf[..], max_header_bytes)? {
-                Some((req, hdr_len)) => break (req, hdr_len),
+            match HttpRequest::from_headers_part_with_limits_into(&buf[..], max_header_bytes, req)?
+            {
+                Some(hdr_len) => break hdr_len,
                 None => {
                     let n = stream.read(&mut tmp_buf).await?;
                     if n == 0 {
@@ -1871,7 +1904,7 @@ impl HttpRequest {
                 None => {}
             }
         }
-        Ok((req, hdr_len + bdy_len))
+        Ok(hdr_len + bdy_len)
     }
 
     pub async fn from_stream(
@@ -1879,7 +1912,10 @@ impl HttpRequest {
         stream: Arc<Mutex<HttpStream>>,
     ) -> anyhow::Result<(Self, usize)> {
         let mut stream = stream.lock().await;
-        Self::from_stream_impl(buf, &mut stream, (None, None)).await
+        let mut req = Self::new();
+        let consumed =
+            Self::from_stream_impl_into(buf, &mut stream, (None, None), &mut req).await?;
+        Ok((req, consumed))
     }
 
     pub async fn from_stream_with_limits(
@@ -1889,23 +1925,49 @@ impl HttpRequest {
         max_body_bytes: Option<usize>,
     ) -> anyhow::Result<(Self, usize)> {
         let mut stream = stream.lock().await;
-        Self::from_stream_impl(buf, &mut stream, (max_header_bytes, max_body_bytes)).await
+        let mut req = Self::new();
+        let consumed = Self::from_stream_impl_into(
+            buf,
+            &mut stream,
+            (max_header_bytes, max_body_bytes),
+            &mut req,
+        )
+        .await?;
+        Ok((req, consumed))
+    }
+
+    pub(crate) async fn from_stream_with_limits_into(
+        buf: &mut Vec<u8>,
+        stream: &mut HttpStream,
+        max_header_bytes: Option<usize>,
+        max_body_bytes: Option<usize>,
+        req: &mut HttpRequest,
+    ) -> anyhow::Result<usize> {
+        Self::from_stream_impl_into(buf, stream, (max_header_bytes, max_body_bytes), req).await
     }
 
     pub fn from_headers_part(buf: &[u8]) -> anyhow::Result<Option<(Self, usize)>> {
         Self::from_headers_part_with_limits(buf, ServerConfig::get_max_header_bytes())
     }
 
-    fn from_headers_part_with_limits(
+    fn from_headers_part_with_limits_into(
         buf: &[u8],
         max_header_bytes: usize,
-    ) -> anyhow::Result<Option<(Self, usize)>> {
+        req: &mut HttpRequest,
+    ) -> anyhow::Result<Option<usize>> {
         let max_header_count = ServerConfig::get_max_header_count();
         Self::ensure_header_section_size(buf, max_header_bytes)?;
 
-        let mut headers = vec![httparse::EMPTY_HEADER; max_header_count];
+        let mut stack_headers = [httparse::EMPTY_HEADER; 48];
+        let mut heap_headers: Vec<httparse::Header<'_>>;
+        let headers: &mut [httparse::Header<'_>] = if max_header_count <= stack_headers.len() {
+            &mut stack_headers
+        } else {
+            heap_headers = vec![httparse::EMPTY_HEADER; max_header_count];
+            &mut heap_headers
+        };
         let (rreq, n) = {
-            let mut req = httparse::Request::new(&mut headers);
+            let mut req = httparse::Request::new(headers);
             let n = match httparse::ParserConfig::default().parse_request(&mut req, buf) {
                 Ok(httparse::Status::Complete(n)) => n,
                 Ok(httparse::Status::Partial) => return Ok(None),
@@ -1924,7 +1986,8 @@ impl HttpRequest {
                 "too many request headers: {parsed_header_count} exceeds {max_header_count}"
             );
         }
-        let mut req = HttpRequest::new();
+        req.clear_for_reuse();
+        req.headers.reserve(parsed_header_count);
         let mut content_length_seen: Option<String> = None;
         let mut host_header_count = 0usize;
         let mut has_valid_host = false;
@@ -2013,7 +2076,16 @@ impl HttpRequest {
         if req.version >= 11 && !has_valid_host {
             anyhow::bail!("missing required Host header");
         }
-        Ok(Some((req, n)))
+        Ok(Some(n))
+    }
+
+    fn from_headers_part_with_limits(
+        buf: &[u8],
+        max_header_bytes: usize,
+    ) -> anyhow::Result<Option<(Self, usize)>> {
+        let mut req = Self::new();
+        let consumed = Self::from_headers_part_with_limits_into(buf, max_header_bytes, &mut req)?;
+        Ok(consumed.map(|consumed| (req, consumed)))
     }
 
     /// Check HTTP conditional preflight headers to determine if special status codes should be returned
@@ -2272,10 +2344,10 @@ impl HttpResponseBodyStream<'_> {
 
 #[derive(Debug)]
 pub struct HttpResponse {
-    pub version: String,
+    pub version: Cow<'static, str>,
     pub http_code: u16,
-    pub headers: HashMap<Cow<'static, str>, Cow<'static, str>>,
-    pub trailers: HashMap<Cow<'static, str>, Cow<'static, str>>,
+    pub headers: FxHashMap<Cow<'static, str>, Cow<'static, str>>,
+    pub trailers: FxHashMap<Cow<'static, str>, Cow<'static, str>>,
     pub body: HttpResponseBody,
 }
 unsafe impl Send for HttpResponse {}
@@ -2300,11 +2372,11 @@ macro_rules! make_resp_by_text {
         pub fn $fn_name(body: impl Into<String>) -> Self {
             let body = body.into();
             Self {
-                version: "HTTP/1.1".into(),
+                version: Cow::Borrowed("HTTP/1.1"),
                 http_code: 200,
                 headers: Self::default_headers($cnt_type),
-                trailers: HashMap::with_capacity(4),
-                body: HttpResponseBody::Data(body.as_bytes().to_vec()),
+                trailers: FxHashMap::default(),
+                body: HttpResponseBody::Data(body.into_bytes()),
             }
         }
     };
@@ -2314,10 +2386,10 @@ macro_rules! make_resp_by_binary {
     ($fn_name:ident, $cnt_type:expr) => {
         pub fn $fn_name(body: &[u8]) -> Self {
             Self {
-                version: "HTTP/1.1".into(),
+                version: Cow::Borrowed("HTTP/1.1"),
                 http_code: 200,
                 headers: Self::default_headers($cnt_type),
-                trailers: HashMap::with_capacity(4),
+                trailers: FxHashMap::default(),
                 body: HttpResponseBody::Data(body.to_vec()),
             }
         }
@@ -2341,38 +2413,44 @@ impl HttpResponse {
     make_resp_by_binary!(png, "image/png");
 
     fn default_headers(
-        cnt_type: impl Into<String>,
-    ) -> HashMap<Cow<'static, str>, Cow<'static, str>> {
-        let now = Utc::now();
-        let current_ts = now.timestamp();
+        cnt_type: impl Into<Cow<'static, str>>,
+    ) -> FxHashMap<Cow<'static, str>, Cow<'static, str>> {
+        let current_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|timestamp| timestamp.as_secs() as i64)
+            .unwrap_or_default();
 
         static TL_TIMESTAMP: ThreadLocal<RefCell<(i64, Cow<'static, str>)>> = ThreadLocal::new();
         let mut tl_timestamp = TL_TIMESTAMP.get_or_default().borrow_mut();
         let date_str = if current_ts == tl_timestamp.0 {
             tl_timestamp.1.clone()
         } else {
-            let new_date: Cow<'_, str> = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string().into();
+            let new_date: Cow<'_, str> = Utc::now()
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string()
+                .into();
             *tl_timestamp = (current_ts, new_date.clone());
             new_date
         };
 
         [
             ("Date".into(), date_str),
-            ("Server".into(), SERVER_STR.clone().into()),
+            ("Server".into(), Cow::Borrowed(SERVER_STR.as_str())),
             ("Connection".into(), "keep-alive".into()),
-            ("Content-Type".into(), cnt_type.into().into()),
+            ("Content-Type".into(), cnt_type.into()),
             ("Pragma".into(), "no-cache".into()),
             ("Cache-Control".into(), "no-cache".into()),
         ]
-        .into()
+        .into_iter()
+        .collect()
     }
 
     pub fn new() -> Self {
         Self {
-            version: "".into(),
+            version: Cow::Borrowed(""),
             http_code: 0,
-            headers: HashMap::with_capacity(16),
-            trailers: HashMap::with_capacity(4),
+            headers: FxHashMap::with_capacity_and_hasher(6, Default::default()),
+            trailers: FxHashMap::default(),
             body: HttpResponseBody::Data(vec![]),
         }
     }
@@ -2405,7 +2483,7 @@ impl HttpResponse {
 
     pub fn chunked(rx: Receiver<Vec<u8>>) -> Self {
         Self {
-            version: "HTTP/1.1".into(),
+            version: Cow::Borrowed("HTTP/1.1"),
             http_code: 200,
             headers: [
                 ("Transfer-Encoding".into(), "chunked".into()),
@@ -2413,8 +2491,9 @@ impl HttpResponse {
                 ("Cache-Control".into(), "no-cache".into()),
                 ("Connection".into(), "keep-alive".into()),
             ]
-            .into(),
-            trailers: HashMap::with_capacity(4),
+            .into_iter()
+            .collect(),
+            trailers: FxHashMap::default(),
             body: HttpResponseBody::Stream(rx),
         }
     }
@@ -2526,7 +2605,7 @@ impl HttpResponse {
             base64::encode(sha1.finalize())
         };
         Self {
-            version: "HTTP/1.1".into(),
+            version: Cow::Borrowed("HTTP/1.1"),
             http_code: 101,
             headers: [
                 (
@@ -2541,8 +2620,9 @@ impl HttpResponse {
                 ("Upgrade".into(), "websocket".into()),
                 ("Sec-WebSocket-Accept".into(), ws_accept.into()),
             ]
-            .into(),
-            trailers: HashMap::with_capacity(4),
+            .into_iter()
+            .collect(),
+            trailers: FxHashMap::default(),
             body: HttpResponseBody::Data(vec![]),
         }
     }
@@ -2583,12 +2663,12 @@ impl HttpResponse {
         allowed_trailers: &HashSet<String>,
     ) -> anyhow::Result<(
         Vec<u8>,
-        HashMap<Cow<'static, str>, Cow<'static, str>>,
+        FxHashMap<Cow<'static, str>, Cow<'static, str>>,
         usize,
     )> {
         let mut cursor = hdr_len;
         let mut body = Vec::new();
-        let mut trailers = HashMap::with_capacity(4);
+        let mut trailers = FxHashMap::with_capacity_and_hasher(4, Default::default());
         let mut tmp_buf = [0u8; 4096];
 
         loop {
@@ -2689,29 +2769,22 @@ impl HttpResponse {
                     cmode = CompressMode::None;
                     payload_ref = &[];
                 }
-                //
-                let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
+                use std::io::Write as _;
+                let mut ret = Vec::with_capacity(payload_ref.len().saturating_add(512));
                 let status_str = self.http_code.http_code_to_desp();
-                ret.push_str(&ssformat!(
-                    64,
-                    "{} {} {status_str}\r\n",
-                    self.version,
-                    self.http_code
-                ));
+                let _ = write!(ret, "{} {} {status_str}\r\n", self.version, self.http_code);
                 for (key, value) in self.headers.iter() {
                     if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
                         continue;
                     }
-                    ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
+                    let _ = write!(ret, "{key}: {value}\r\n");
                 }
                 if !suppress_body {
-                    ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
+                    let _ = write!(ret, "Content-Length: {}\r\n", payload_ref.len());
                 }
                 if cmode == CompressMode::Gzip && !suppress_body {
-                    ret.push_str("Content-Encoding: gzip\r\n");
+                    ret.extend_from_slice(b"Content-Encoding: gzip\r\n");
                 }
-                ret.push_str("\r\n");
-                let mut ret: Vec<u8> = ret.as_bytes().to_vec();
                 ret.extend(payload_ref);
                 ret
             }
@@ -2791,12 +2864,13 @@ impl HttpResponse {
                         self.headers.get("Pragma"),
                         self.headers.get("Cache-Control"),
                     ) {
-                        ret.push_str(&ssformat!(512, "Date: {date}\r\n"));
-                        ret.push_str(&ssformat!(512, "Server: {server}\r\n"));
-                        ret.push_str(&ssformat!(512, "Connection: {connection}\r\n"));
-                        ret.push_str(&ssformat!(512, "Content-Type: {content_type}\r\n"));
-                        ret.push_str(&ssformat!(512, "Pragma: {pragma}\r\n"));
-                        ret.push_str(&ssformat!(512, "Cache-Control: {cache_control}\r\n"));
+                        use std::fmt::Write as _;
+                        let _ = write!(ret, "Date: {date}\r\n");
+                        let _ = write!(ret, "Server: {server}\r\n");
+                        let _ = write!(ret, "Connection: {connection}\r\n");
+                        let _ = write!(ret, "Content-Type: {content_type}\r\n");
+                        let _ = write!(ret, "Pragma: {pragma}\r\n");
+                        let _ = write!(ret, "Cache-Control: {cache_control}\r\n");
                     } else {
                         for (key, value) in self.headers.iter() {
                             if key == "Content-Length"
@@ -2966,7 +3040,7 @@ impl HttpResponse {
         let mut req = HttpResponse::new();
         let mut content_length_seen: Option<String> = None;
         let mut transfer_encoding_seen = false;
-        req.version = format!("HTTP/1.{}", rres.version.unwrap_or(0));
+        req.version = format!("HTTP/1.{}", rres.version.unwrap_or(0)).into();
         req.http_code = rres.code.unwrap_or(0);
         for h in rres.headers.iter() {
             if h.name.is_empty() {

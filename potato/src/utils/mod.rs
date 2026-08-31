@@ -4,6 +4,7 @@ pub mod enums;
 #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 pub mod jemalloc_helper;
 pub mod number;
+pub mod path;
 pub mod process;
 pub mod refstr;
 pub mod smap;

@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceServer, RTCSessionDescription, RTCPeerConnectionIceEvent,
+    RTCIceServer, RTCPeerConnectionIceEvent, RTCSessionDescription,
 };
 
 /// 房间信息
@@ -208,10 +208,7 @@ impl WebRTCClient {
     pub async fn exit_room(&mut self) -> Result<()> {
         let (room_id, peer_id) = {
             let context = self.context.read().await;
-            (
-                context.room_id.clone(),
-                context.peer_id.clone(),
-            )
+            (context.room_id.clone(), context.peer_id.clone())
         };
 
         if let (Some(room_id), Some(peer_id)) = (room_id, peer_id) {
@@ -251,7 +248,10 @@ impl WebRTCClient {
         let (room_id, peer_id) = {
             let context = self.context.read().await;
             (
-                context.room_id.clone().ok_or_else(|| anyhow::anyhow!("Not in a room"))?,
+                context
+                    .room_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Not in a room"))?,
                 context
                     .peer_id
                     .clone()
@@ -343,7 +343,10 @@ impl<'a> SubscriptionBuilder<'a> {
         let response = self
             .client
             .signaling
-            .request(SignalingMethod::Subscribe, SignalingParams::Subscribe(params))
+            .request(
+                SignalingMethod::Subscribe,
+                SignalingParams::Subscribe(params),
+            )
             .await?;
 
         if let SignalingParams::Answer(answer_params) = response.params {

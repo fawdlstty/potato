@@ -3,7 +3,7 @@
 use anyhow::Result;
 use bytes::BytesMut;
 use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{broadcast, Mutex};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelMessage};
 
 pub type DataChannelCallback = Arc<dyn Fn(RTCDataChannelMessage) + Send + Sync>;
@@ -35,10 +35,8 @@ impl DataChannelWrapper {
                         if let Some(callback) = callback {
                             callback(msg);
                         }
-                    } else if matches!(
-                        event,
-                        DataChannelEvent::OnClose | DataChannelEvent::OnError
-                    ) {
+                    } else if matches!(event, DataChannelEvent::OnClose | DataChannelEvent::OnError)
+                    {
                         break;
                     }
                 }

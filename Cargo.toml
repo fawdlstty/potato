@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
-members = [
-    "potato",
-    "potato-macro",
-]
+members = ["potato", "potato-macro"]
 default-members = ["potato"]
+
+[profile.release]
+codegen-units = 1
+lto = true
