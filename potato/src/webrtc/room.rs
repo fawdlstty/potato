@@ -91,9 +91,13 @@ impl Room {
     pub async fn forward_track(&self, from_peer: &str, to_peer: &str) -> Result<()> {
         let (to_peer_pc, broadcast_sender) = {
             let peers = self.peers.lock().await;
-            peers
+            let from_peer_obj = peers
                 .get(from_peer)
                 .ok_or_else(|| anyhow!("Publisher peer not found: {from_peer}"))?;
+            // 只转发真正处于推流状态的 peer，未推流的 peer 没有可转发的媒体
+            if !from_peer_obj.publishing {
+                return Err(anyhow!("Publisher peer is not publishing: {from_peer}"));
+            }
             let to_peer_obj = peers
                 .get(to_peer)
                 .ok_or_else(|| anyhow!("Subscriber peer not found: {to_peer}"))?;

@@ -326,7 +326,13 @@ pub fn build_ws_upgrade_response(ws_key: &str) -> Vec<u8> {
 // Frame I/O
 // ---------------------------------------------------------------------------
 
-async fn recv_impl<S: WebsocketIo>(socket: &mut S) -> anyhow::Result<WsFrameImpl> {
+/// Hard caps for no_std targets where `ServerConfig` is unavailable:
+/// a single frame may claim up to 16 MiB and one assembled message at most
+/// 64 MiB before the connection is failed.
+const LITE_WS_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const LITE_WS_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
+async fn recv_impl<S: WebsocketIo>(socket: &mut S, role: &WebsocketRole) -> anyhow::Result<WsFrameImpl> {
     let mut hdr = [0u8; 2];
     ws_read_exact(socket, &mut hdr).await?;
 
@@ -334,6 +340,13 @@ async fn recv_impl<S: WebsocketIo>(socket: &mut S) -> anyhow::Result<WsFrameImpl
     let opcode = hdr[0] & 0b0000_1111;
     let masked = hdr[1] & 0b1000_0000 != 0;
     let mut payload_len: usize = (hdr[1] & 0b0111_1111) as usize;
+
+    // RFC 6455 §5.1: client frames MUST be masked, server frames MUST NOT be
+    if masked == matches!(role, WebsocketRole::Client) {
+        return Err(anyhow::anyhow!(
+            "WebSocket frame masking violates RFC 6455 direction rules"
+        ));
+    }
 
     match payload_len {
         126 => {
@@ -344,9 +357,17 @@ async fn recv_impl<S: WebsocketIo>(socket: &mut S) -> anyhow::Result<WsFrameImpl
         127 => {
             let mut ext = [0u8; 8];
             ws_read_exact(socket, &mut ext).await?;
-            payload_len = u64::from_be_bytes(ext) as usize;
+            let declared = u64::from_be_bytes(ext);
+            payload_len = usize::try_from(declared)
+                .map_err(|_| anyhow::anyhow!("WebSocket frame length exceeds address space"))?;
         }
         _ => {}
+    }
+
+    if payload_len > LITE_WS_MAX_FRAME_SIZE {
+        return Err(anyhow::anyhow!(
+            "WebSocket frame too large: {payload_len} bytes exceeds {LITE_WS_MAX_FRAME_SIZE}"
+        ));
     }
 
     let mask_key = if masked {
@@ -397,7 +418,7 @@ async fn ws_recv_with_role<S: WebsocketIo, R: FnMut(&mut [u8])>(
 ) -> anyhow::Result<WsFrame> {
     let mut accum: Vec<u8> = Vec::new();
     loop {
-        match recv_impl(socket).await? {
+        match recv_impl(socket, &role).await? {
             WsFrameImpl::Close => return Err(anyhow::anyhow!("WebSocket close frame received")),
             WsFrameImpl::Ping => match role {
                 WebsocketRole::Client => send_client_frame(socket, WsFrameImpl::Pong, rng).await?,
@@ -416,6 +437,11 @@ async fn ws_recv_with_role<S: WebsocketIo, R: FnMut(&mut [u8])>(
             }
             WsFrameImpl::PartData(data) => {
                 accum.extend(data);
+                if accum.len() > LITE_WS_MAX_MESSAGE_SIZE {
+                    return Err(anyhow::anyhow!(
+                        "WebSocket message too large: exceeds {LITE_WS_MAX_MESSAGE_SIZE} bytes"
+                    ));
+                }
             }
         }
     }

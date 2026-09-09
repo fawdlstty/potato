@@ -86,10 +86,16 @@ impl H3SessionImpl {
         ));
         endpoint.set_default_client_config(client_config);
 
-        // 连接到服务器
-        let quic_conn = endpoint
-            .connect(format!("{host}:{port}").parse()?, &host)?
+        // 连接到服务器（域名先做 DNS 解析，quinn 需要 SocketAddr）
+        let socket_addr = tokio::net::lookup_host((host.as_str(), port))
+            .await?
+            .next()
+            .ok_or_else(|| anyhow!("DNS resolution returned no address for {host}"))?;
+        // 与无加密路径一致：连接阶段加 10s 超时
+        let connecting = endpoint.connect(socket_addr, &host)?;
+        let quic_conn = tokio::time::timeout(std::time::Duration::from_secs(10), connecting)
             .await
+            .map_err(|e| anyhow!("QUIC connection timeout: {e}"))?
             .map_err(|e| anyhow!("QUIC connection failed: {e}"))?;
 
         // 初始化 HTTP/3 客户端
@@ -239,6 +245,29 @@ impl H3Session {
         url.starts_with("https://")
     }
 
+    /// HTTP/3 always runs over TLS, so an `http://` URL silently selects the
+    /// "skip certificate verification" session. Accept that dangerous default
+    /// only for loopback targets (local development); anything else must opt
+    /// in explicitly via `H3SessionImpl::new_without_encrypt`.
+    fn ensure_insecure_target_allowed(host: &str) -> anyhow::Result<()> {
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        let loopback = host == "localhost"
+            || host == "::1"
+            || host.starts_with("127.")
+            || host.ends_with(".localhost");
+        if loopback {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "refusing HTTP/3 request to '{host}' over http:// (no certificate verification); \
+                 use https:// or an explicit H3SessionImpl::new_without_encrypt connection"
+            ))
+        }
+    }
+
     async fn new_request(
         &mut self,
         method: HttpMethod,
@@ -253,6 +282,10 @@ impl H3Session {
             .host()
             .unwrap_or("127.0.0.1")
             .to_string();
+
+        if !use_encrypt {
+            Self::ensure_insecure_target_allowed(&host)?;
+        }
 
         let mut is_same_host = false;
         if let Some(sess_impl) = &mut self.sess_impl {
@@ -415,11 +448,17 @@ impl H3Session {
             Ok(res)
         } else {
             // 处理普通响应
+            let max_body_bytes = crate::global_config::ServerConfig::get_max_body_bytes();
             let mut body_data = Vec::new();
             loop {
                 match stream.recv_data().await {
                     Ok(Some(mut chunk)) => {
                         body_data.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+                        if body_data.len() > max_body_bytes {
+                            return Err(anyhow!(
+                                "response body too large: exceeds {max_body_bytes} bytes"
+                            ));
+                        }
                     }
                     Ok(None) => break,
                     Err(e) => return Err(anyhow!("Failed to read response body: {e}")),

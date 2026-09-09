@@ -294,4 +294,98 @@ mod http2_tests {
         server_handle.abort();
         Ok(())
     }
+
+    #[potato::http_post("/http2_post_echo_len")]
+    async fn http2_post_echo_len(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+        potato::HttpResponse::text(format!("len={}", req.body.len()))
+    }
+
+    #[potato::http_post("/http2_post_form")]
+    async fn http2_post_form(req: &mut potato::HttpRequest) -> potato::HttpResponse {
+        let name = req
+            .body_pairs
+            .get("name")
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        potato::HttpResponse::text(format!("got={name}"))
+    }
+
+    #[tokio::test]
+    async fn test_http2_post_body_over_default_window() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let addr = format!("127.0.0.1:{port}");
+        let (cert_file, key_file, cert) = create_test_cert_files()?;
+
+        let mut server = potato::HttpServer::new(&addr);
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http2(&cert_file, &key_file).await;
+        });
+        sleep(Duration::from_millis(350)).await;
+
+        let tls_stream = connect_tls_with_alpn(&addr, &cert, vec![b"h2".to_vec()]).await?;
+        let (mut sender, connection) = client::handshake(tls_stream).await?;
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // 70KB > 默认 65535 窗口：缺少 release_capacity 时会死锁直至超时
+        let payload = vec![b'a'; 70 * 1024];
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/http2_post_echo_len")
+            .body(())?;
+        let (response_future, mut request_stream) = sender.send_request(request, false)?;
+        request_stream.send_data(bytes::Bytes::from(payload), true)?;
+        let response = response_future.await?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+        assert_eq!(bytes, format!("len={}", 70 * 1024).into_bytes());
+
+        conn_handle.abort();
+        server_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_http2_post_form_parses_body_pairs() -> anyhow::Result<()> {
+        let port = get_test_port();
+        let addr = format!("127.0.0.1:{port}");
+        let (cert_file, key_file, cert) = create_test_cert_files()?;
+
+        let mut server = potato::HttpServer::new(&addr);
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve_http2(&cert_file, &key_file).await;
+        });
+        sleep(Duration::from_millis(350)).await;
+
+        let tls_stream = connect_tls_with_alpn(&addr, &cert, vec![b"h2".to_vec()]).await?;
+        let (mut sender, connection) = client::handshake(tls_stream).await?;
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/http2_post_form")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(())?;
+        let (response_future, mut request_stream) = sender.send_request(request, false)?;
+        request_stream.send_data(bytes::Bytes::from_static(b"name=alice&x=1"), true)?;
+        let response = response_future.await?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+        assert_eq!(bytes, b"got=alice".to_vec());
+
+        conn_handle.abort();
+        server_handle.abort();
+        Ok(())
+    }
 }

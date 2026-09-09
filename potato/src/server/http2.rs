@@ -35,9 +35,14 @@ pub async fn serve_http2_impl(
         let acceptor = acceptor.clone();
         let pipe_ctx2 = Arc::clone(&pipe_ctx);
         super::HttpServer::spawn_connection(async move {
-            let stream = match acceptor.accept(stream).await {
-                Ok(stream) => stream,
-                Err(_) => return,
+            let handshake = tokio::time::timeout(
+                crate::global_config::ServerConfig::get_tls_handshake_timeout().await,
+                acceptor.accept(stream),
+            )
+            .await;
+            let stream = match handshake {
+                Ok(Ok(stream)) => stream,
+                _ => return,
             };
 
             let negotiated_h2 = stream
@@ -58,7 +63,15 @@ pub async fn serve_http2_impl(
                 return;
             }
 
-            let mut h2_conn = match h2_server::handshake(stream).await {
+            // Explicit resource limits (aligned with the HTTP/3 server):
+            // bound concurrent streams per connection and header list size so
+            // a single connection cannot amplify memory pressure.
+            let mut h2_builder = h2_server::Builder::new();
+            h2_builder
+                .max_concurrent_streams(128)
+                .max_header_list_size(16 * 1024)
+                .max_frame_size(16 * 1024);
+            let mut h2_conn = match h2_builder.handshake(stream).await {
                 Ok(conn) => conn,
                 Err(_) => return,
             };
@@ -69,7 +82,9 @@ pub async fn serve_http2_impl(
                     Err(_) => break,
                 };
                 let pipe_ctx3 = Arc::clone(&pipe_ctx2);
-                super::HttpServer::spawn_connection(async move {
+                // 每个请求流不占连接配额（连接本身已计数，流数量由
+                // max_concurrent_streams 限制）
+                super::HttpServer::spawn_connection_untracked(async move {
                     let _ = handle_h2_request(req_head, respond, pipe_ctx3, client_addr).await;
                 });
             }
@@ -210,9 +225,27 @@ async fn handle_h2_request(
 
     let mut request_body = Vec::new();
     let max_body_bytes = crate::global_config::ServerConfig::get_max_body_bytes();
-    while let Some(chunk) = req_head.body_mut().data().await {
-        let chunk = chunk?;
-        if request_body.len() + chunk.len() > max_body_bytes {
+    // 整个请求体读取阶段受请求超时约束，防止慢速客户端长期占用流任务
+    let request_timeout = crate::global_config::ServerConfig::get_request_timeout().await;
+    let read_request_body = async {
+        while let Some(chunk) = req_head.body_mut().data().await {
+            let chunk = chunk?;
+            // 必须释放接收窗口，否则客户端在发满 64KB（默认窗口）后
+            // 等待 WINDOW_UPDATE，形成死锁
+            let _ = req_head
+                .body_mut()
+                .flow_control()
+                .release_capacity(chunk.len());
+            if request_body.len() + chunk.len() > max_body_bytes {
+                return Err(anyhow::anyhow!("request body too large"));
+            }
+            request_body.extend_from_slice(&chunk);
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    match tokio::time::timeout(request_timeout, read_request_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_too_large)) => {
             let response = http::Response::builder()
                 .status(413)
                 .body(())
@@ -220,9 +253,19 @@ async fn handle_h2_request(
             let _ = respond.send_response(response, true);
             return Ok(());
         }
-        request_body.extend_from_slice(&chunk);
+        Err(_elapsed) => {
+            let response = http::Response::builder()
+                .status(408)
+                .body(())
+                .map_err(|e| anyhow::anyhow!("Failed to build response: {e}"))?;
+            let _ = respond.send_response(response, true);
+            return Ok(());
+        }
     }
     req.body = request_body.into();
+    // 与 h1 路径一致地解析 body_pairs/body_files，保证带类型参数的
+    // handler 在 h2 下可用
+    HttpRequest::parse_body_content(&mut req);
 
     let res = PipeContext::handle_request(pipe_ctx.as_ref(), &mut req, 0).await;
 
@@ -231,7 +274,16 @@ async fn handle_h2_request(
         if is_h2_h3_forbidden_response_header(key) {
             continue;
         }
-        response_builder = response_builder.header(key.as_ref(), value.as_ref());
+        // 清洗控制字符，与 h1 路径行为一致；非法值不再丢弃整个响应
+        let sanitized = crate::full::sanitize_header_str(value);
+        response_builder = response_builder.header(key.as_ref(), sanitized.as_ref());
+    }
+    for (key, value) in res.multi_headers.iter() {
+        if is_h2_h3_forbidden_response_header(key) {
+            continue;
+        }
+        let sanitized = crate::full::sanitize_header_str(value);
+        response_builder = response_builder.header(key.as_ref(), sanitized.as_ref());
     }
     let response = response_builder
         .body(())
@@ -250,16 +302,30 @@ async fn handle_h2_request(
                     stream
                         .send_data(bytes::Bytes::from(data), eos)
                         .map_err(|e| anyhow::anyhow!("Failed to send data: {e}"))?;
+                } else if res.trailers.is_empty() {
+                    // Empty body without trailers still needs END_STREAM,
+                    // otherwise the stream is aborted with RST_STREAM.
+                    stream
+                        .send_data(bytes::Bytes::new(), true)
+                        .map_err(|e| anyhow::anyhow!("Failed to send data: {e}"))?;
                 }
             }
             crate::HttpResponseBody::Stream(mut rx) => {
                 while let Some(chunk) = rx.recv().await {
+                    if chunk.is_empty() {
+                        break;
+                    }
                     stream
                         .send_data(bytes::Bytes::from(chunk), false)
                         .map_err(|e| anyhow::anyhow!("Failed to send data: {e}"))?;
                 }
-                // 发送空帧表示结束
-                if !res.trailers.is_empty() {
+                // 无 trailers 时必须显式发送 END_STREAM 空帧，否则客户端
+                // 会把 RST_STREAM 当作响应截断。
+                if res.trailers.is_empty() {
+                    stream
+                        .send_data(bytes::Bytes::new(), true)
+                        .map_err(|e| anyhow::anyhow!("Failed to send data: {e}"))?;
+                } else {
                     stream
                         .send_data(bytes::Bytes::new(), false)
                         .map_err(|e| anyhow::anyhow!("Failed to send data: {e}"))?;
@@ -280,10 +346,18 @@ async fn handle_h2_request(
                 }
             }
         }
-        stream
-            .send_trailers(trailers)
-            .map_err(|e| anyhow::anyhow!("Failed to send trailers: {e}"))?;
+        if trailers.is_empty() {
+            // 所有 trailer 均被过滤时退化为空数据帧收尾
+            stream
+                .send_data(bytes::Bytes::new(), true)
+                .map_err(|e| anyhow::anyhow!("Failed to send data: {e}"))?;
+        } else {
+            stream
+                .send_trailers(trailers)
+                .map_err(|e| anyhow::anyhow!("Failed to send trailers: {e}"))?;
+        }
     }
 
     Ok(())
 }
+

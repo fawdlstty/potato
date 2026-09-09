@@ -242,10 +242,16 @@ static HANDLERS: LazyLock<HashMap<&'static str, HashMap<HttpMethod, &'static Req
     LazyLock::new(|| {
         let mut handlers = HashMap::with_capacity(16);
         for flag in inventory::iter::<RequestHandlerFlag> {
-            handlers
+            let by_method = handlers
                 .entry(flag.path)
-                .or_insert_with(|| HashMap::with_capacity(16))
-                .insert(flag.method, flag);
+                .or_insert_with(|| HashMap::with_capacity(16));
+            if by_method.insert(flag.method, flag).is_some() {
+                // 同路径同方法的后注册项会覆盖先注册项，这里提示避免静默丢失
+                eprintln!(
+                    "[potato] warning: duplicate route registration for {} {:?}; the later one overwrites the earlier one",
+                    flag.path, flag.method
+                );
+            }
         }
         handlers
     });
@@ -254,7 +260,15 @@ static HANDLERS_FLAT: LazyLock<FxHashMap<(&'static str, HttpMethod), &'static Re
     LazyLock::new(|| {
         let mut handlers = FxHashMap::with_capacity_and_hasher(64, Default::default());
         for flag in inventory::iter::<RequestHandlerFlag> {
-            handlers.insert((flag.path, flag.method), flag);
+            if handlers
+                .insert((flag.path, flag.method), flag)
+                .is_some()
+            {
+                eprintln!(
+                    "[potato] warning: duplicate route registration for {} {:?}; the later one overwrites the earlier one",
+                    flag.path, flag.method
+                );
+            }
         }
         handlers
     });
@@ -528,17 +542,71 @@ impl PipeContext {
         Some(Some((start, end)))
     }
 
-    fn read_file_range(path: &str, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
-        let mut file = std::fs::File::open(path)?;
-        file.seek(SeekFrom::Start(start))?;
-        let read_len_u64 = end - start + 1;
-        let read_len = usize::try_from(read_len_u64)?;
-        let mut buffer = vec![0u8; read_len];
-        file.read_exact(&mut buffer)?;
-        Ok(buffer)
+    async fn read_file_range(path: &str, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
+        // The blocking filesystem calls run on the blocking pool so slow
+        // disks cannot stall async worker threads.
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(start))?;
+            let read_len_u64 = end - start + 1;
+            let read_len = usize::try_from(read_len_u64)?;
+            let mut buffer = vec![0u8; read_len];
+            file.read_exact(&mut buffer)?;
+            Ok(buffer)
+        })
+        .await?
     }
 
-    fn from_static_file(req: &HttpRequest, path: &str, meta: &Metadata) -> HttpResponse {
+    /// Serve a byte range of a file as a chunked stream. File reads happen on
+    /// the blocking pool through a small bounded channel, so neither memory
+    /// (only a few chunks are in flight) nor the async workers are tied up by
+    /// huge files.
+    ///
+    /// **Known limitation:** a client that accepts data extremely slowly can
+    /// pin its blocking reader thread while the channel is full; the pool
+    /// (default ~512 threads) bounds the total impact. Clients that disconnect
+    /// release the thread immediately via the `is_closed` check.
+    fn stream_file_range(path: &str, start: u64, len: u64, http_code: u16) -> HttpResponse {
+        const STREAM_CHUNK_SIZE: usize = 256 * 1024;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let path = path.to_string();
+        let _reader = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek};
+            let Ok(mut file) = std::fs::File::open(&path) else {
+                return;
+            };
+            if file.seek(SeekFrom::Start(start)).is_err() {
+                return;
+            }
+            let mut remaining = len;
+            let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
+            while remaining > 0 {
+                if tx.is_closed() {
+                    break;
+                }
+                let to_read = remaining.min(buf.len() as u64) as usize;
+                match file.read(&mut buf[..to_read]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        remaining -= n as u64;
+                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let mut res = HttpResponse::chunked(rx);
+        res.http_code = http_code;
+        res
+    }
+
+    fn static_streaming_limit() -> u64 {
+        crate::global_config::ServerConfig::get_max_body_bytes() as u64
+    }
+
+    async fn from_static_file(req: &HttpRequest, path: &str, meta: &Metadata) -> HttpResponse {
         let etag = Self::static_file_etag(meta);
         match req.check_precondition_headers(Some(meta), etag.as_deref()) {
             PreflightResult::NotModified => {
@@ -563,9 +631,25 @@ impl PipeContext {
             {
                 match parsed_range {
                     Some((start, end)) => {
-                        let data = match Self::read_file_range(path, start, end) {
+                        let read_len = end - start + 1;
+                        if read_len > Self::static_streaming_limit() {
+                            // Oversized range: stream instead of materializing
+                            // the whole range in memory.
+                            let mut res = Self::stream_file_range(path, start, read_len, 206);
+                            res.add_header(
+                                "Content-Range".into(),
+                                format!("bytes {start}-{end}/{}", meta.len()).into(),
+                            );
+                            res.add_header("Accept-Ranges".into(), "bytes".into());
+                            Self::add_static_validators(&mut res, meta, etag.as_deref());
+                            return res;
+                        }
+                        let data = match Self::read_file_range(path, start, end).await {
                             Ok(data) => data,
-                            Err(err) => return HttpResponse::error(format!("{err}")),
+                            Err(err) => {
+                                eprintln!("[potato] static file read error: {err}");
+                                return HttpResponse::error("Failed to read file");
+                            }
                         };
                         let mut res = HttpResponse::from_mem_file(path, data, false, None);
                         res.http_code = 206;
@@ -590,6 +674,26 @@ impl PipeContext {
                     }
                 }
             }
+        }
+
+        if meta.len() > Self::static_streaming_limit() {
+            // Oversized whole-file request: stream it, do not buffer it.
+            let mut res = Self::stream_file_range(path, 0, meta.len(), 200);
+            let mime_type = match path.split('.').next_back() {
+                Some("css") => "text/css",
+                Some("csv") => "text/csv",
+                Some("htm") => "text/html",
+                Some("html") => "text/html",
+                Some("js") => "application/javascript",
+                Some("json") => "application/json",
+                Some("pdf") => "application/pdf",
+                Some("xml") => "application/xml",
+                _ => "application/octet-stream",
+            };
+            res.add_header("Content-Type".into(), mime_type.into());
+            res.add_header("Accept-Ranges".into(), "bytes".into());
+            Self::add_static_validators(&mut res, meta, etag.as_deref());
+            return res;
         }
 
         let mut res = HttpResponse::from_file(path, false, Some(meta.clone()));
@@ -855,6 +959,10 @@ impl PipeContext {
     }
 
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+    /// Expose a jemalloc heap profile endpoint. **Security note:** the profile
+    /// reveals process memory layout — protect the route with `use_preprocess`
+    /// authentication and avoid enabling it on production instances exposed
+    /// to the public internet.
     pub fn use_jemalloc(&mut self, url_path: impl Into<String>) {
         self.items.push(PipeContextItem::Jemalloc(url_path.into()));
     }
@@ -1020,6 +1128,9 @@ impl PipeContext {
     }
 
     #[cfg(feature = "openapi")]
+    /// Mount the OpenAPI document and Swagger UI. **Security note:** the
+    /// generated document discloses every route and its parameters; guard it
+    /// with `use_preprocess` authentication on production deployments.
     pub fn use_openapi(&mut self, url_path: impl Into<String>) {
         #[derive(rust_embed::Embed)]
         #[folder = "swagger_res"]
@@ -1272,7 +1383,20 @@ impl PipeContext {
                     let canonical_root = if *allow_symlink_escape {
                         None
                     } else {
-                        std::fs::canonicalize(loc_path).ok()
+                        // 根目录 canonicalize 失败时必须拒绝请求而不是跳过
+                        // 包含检查，否则路径穿越防护静默失效
+                        match std::fs::canonicalize(loc_path) {
+                            Ok(root) => Some(root),
+                            Err(err) => {
+                                eprintln!(
+                                    "[potato] static root {loc_path} unavailable: {err}"
+                                );
+                                let mut res = HttpResponse::error("Not Found");
+                                res.http_code = 404;
+                                maybe_execute_postprocess!(res);
+                                return res;
+                            }
+                        }
                     };
                     let req_suffix = req_suffix.trim_start_matches('/');
                     let path = match Self::sanitize_location_route_path(loc_path, req_suffix) {
@@ -1293,7 +1417,7 @@ impl PipeContext {
                                 }
                             }
                             if let Some(path) = path.to_str() {
-                                let mut res = Self::from_static_file(req, path, &meta);
+                                let mut res = Self::from_static_file(req, path, &meta).await;
                                 maybe_execute_postprocess!(res);
                                 return res;
                             }
@@ -1318,7 +1442,7 @@ impl PipeContext {
                                         }
                                     }
                                     if let Some(path) = tmp_path.to_str() {
-                                        let mut res = Self::from_static_file(req, path, &tmp_meta);
+                                        let mut res = Self::from_static_file(req, path, &tmp_meta).await;
                                         maybe_execute_postprocess!(res);
                                         return res;
                                     }
@@ -1337,7 +1461,7 @@ impl PipeContext {
                                         }
                                     }
                                     if let Some(path) = tmp_path.to_str() {
-                                        let mut res = Self::from_static_file(req, path, &tmp_meta);
+                                        let mut res = Self::from_static_file(req, path, &tmp_meta).await;
                                         maybe_execute_postprocess!(res);
                                         return res;
                                     }
@@ -1524,7 +1648,10 @@ impl PipeContext {
                             return response;
                         }
                         Err(err) => {
-                            let mut res = HttpResponse::error(format!("{err}"));
+                            eprintln!("[potato] reverse proxy error: {err}");
+                            let mut res =
+                                HttpResponse::error("Bad Gateway: upstream request failed");
+                            res.http_code = 502;
                             maybe_execute_postprocess!(res);
                             return res;
                         }
@@ -1566,7 +1693,10 @@ impl PipeContext {
                                     ),
                                 }
                             }
-                            Err(err) => HttpResponse::error(format!("{err}")),
+                            Err(err) => {
+                                eprintln!("[potato] jemalloc profile dump error: {err}");
+                                HttpResponse::error("Failed to dump profile")
+                            }
                         };
                         maybe_execute_postprocess!(res);
                         return res;
@@ -1626,9 +1756,8 @@ impl PipeContext {
                                 {
                                     Ok(uri) => uri,
                                     Err(e) => {
-                                        return HttpResponse::error(format!(
-                                            "Failed to build URI: {e}"
-                                        ));
+                                        eprintln!("[potato] WebDAV URI build error: {e}");
+                                        return HttpResponse::error("Bad Request");
                                     }
                                 };
                             }
@@ -1640,9 +1769,8 @@ impl PipeContext {
                                 {
                                     Ok(uri) => uri,
                                     Err(e) => {
-                                        return HttpResponse::error(format!(
-                                            "Failed to build URI: {e}"
-                                        ));
+                                        eprintln!("[potato] WebDAV URI build error: {e}");
+                                        return HttpResponse::error("Bad Request");
                                     }
                                 };
                             }
@@ -1671,7 +1799,7 @@ impl PipeContext {
                             })
                             .collect();
                         for (k, v) in headers {
-                            res.add_header(k.into(), v.into());
+                            res.append_header(k.into(), v.into());
                         }
                         res.http_code = new_res.status().as_u16();
                         res.version = format!("{:?}", new_res.version()).into();
@@ -1728,6 +1856,14 @@ impl HttpServer {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        // Refuse new connections beyond the configured cap so a connection
+        // flood cannot exhaust memory/file descriptors (the caller drops the
+        // socket, closing it).
+        if ACTIVE_CONNECTIONS.load(Ordering::Acquire)
+            >= crate::global_config::ServerConfig::get_max_connections()
+        {
+            return;
+        }
         ACTIVE_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
         let mut tasks = CONNECTION_TASKS.lock().unwrap();
         while tasks.try_join_next().is_some() {}
@@ -1735,6 +1871,19 @@ impl HttpServer {
             let _connection_guard = ConnectionGuard;
             future.await;
         });
+    }
+
+    /// Spawn a task on the connection JoinSet without consuming a connection
+    /// slot. Used for intermediate phases (TLS handshake wrappers) and
+    /// h2/h3 request streams, where the carrying connection is already
+    /// counted and stream counts are bounded separately.
+    pub(crate) fn spawn_connection_untracked<F>(future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = CONNECTION_TASKS.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(future);
     }
 
     async fn drain_connections(grace: Duration) {
@@ -2002,37 +2151,42 @@ impl HttpServer {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
             let mut req = HttpRequest::new();
             loop {
+                // Cap the whole per-request read phase (headers + body). This
+                // bounds idle keep-alive connections and defeats Slowloris
+                // style slow reads; WebSocket upgrades switch protocols before
+                // the next iteration and are not affected.
+                let request_timeout = crate::global_config::ServerConfig::get_request_timeout().await;
                 let n = {
-                    match HttpRequest::from_stream_with_limits_into(
-                        &mut buf,
-                        &mut stream,
-                        request_limits.map(|(header, _)| header),
-                        request_limits.map(|(_, body)| body),
-                        &mut req,
+                    match tokio::time::timeout(
+                        request_timeout,
+                        HttpRequest::from_stream_with_limits_into(
+                            &mut buf,
+                            &mut stream,
+                            request_limits.map(|(header, _)| header),
+                            request_limits.map(|(_, body)| body),
+                            &mut req,
+                        ),
                     )
                     .await
                     {
-                        Ok(n) => n,
-                        Err(err) => {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(err)) => {
                             let err_msg = err.to_string();
-                            if err_msg.contains("conflicting duplicate Content-Length headers") {
-                                break;
-                            }
+                            eprintln!("[potato] request parse error: {err_msg}");
                             let mut res = if err_msg.contains("request body too large") {
-                                let mut res =
-                                    HttpResponse::text(format!("Payload Too Large: {err_msg}"));
+                                let mut res = HttpResponse::text("Payload Too Large");
                                 res.http_code = 413;
                                 res
                             } else if err_msg.contains("Expect header") {
-                                let mut res = HttpResponse::html(err_msg);
+                                let mut res = HttpResponse::html("Expectation Failed");
                                 res.http_code = 417;
                                 res
                             } else if err_msg.contains("unsupported Transfer-Encoding") {
-                                let mut res = HttpResponse::html(err_msg);
+                                let mut res = HttpResponse::html("Unsupported Transfer-Encoding");
                                 res.http_code = 501;
                                 res
                             } else {
-                                HttpResponse::bad_request(err_msg)
+                                HttpResponse::bad_request("Bad Request")
                             };
                             res.add_header("Connection".into(), "close".into());
                             let _ = res
@@ -2040,6 +2194,9 @@ impl HttpServer {
                                 .await;
                             break;
                         }
+                        // Timed out waiting for a complete request: close the
+                        // connection without a response.
+                        Err(_elapsed) => break,
                     }
                 };
                 req.client_addr = Some(client_addr);
@@ -2049,6 +2206,13 @@ impl HttpServer {
                     let stream = Arc::new(Mutex::new(stream));
                     req.stream = Some(Arc::clone(&stream));
                     let mut res = PipeContext::handle_request(pipe_ctx.as_ref(), &mut req, 0).await;
+                    if req.stream.is_none() {
+                        // upgrade_websocket already took the stream and wrote
+                        // the 101 handshake; the socket now speaks the
+                        // upgraded protocol and must not receive an HTTP
+                        // response.
+                        break;
+                    }
                     if conn != HttpConnection::KeepAlive {
                         res.add_header("Connection".into(), "close".into());
                     }
@@ -2149,10 +2313,18 @@ impl HttpServer {
             _ = stream.set_nodelay(true);
             let acceptor = acceptor.clone();
             let pipe_ctx2 = Arc::clone(&pipe_ctx);
-            Self::spawn_connection(async move {
-                let stream = match acceptor.accept(stream).await {
-                    Ok(stream) => stream,
-                    Err(_) => return,
+            // 握手阶段不占连接配额（真正的连接由内层 spawn_http1_connection 计数）
+            Self::spawn_connection_untracked(async move {
+                // Bound the TLS handshake so clients can't hold handshake
+                // state open indefinitely.
+                let handshake = tokio::time::timeout(
+                    crate::global_config::ServerConfig::get_tls_handshake_timeout().await,
+                    acceptor.accept(stream),
+                )
+                .await;
+                let stream = match handshake {
+                    Ok(Ok(stream)) => stream,
+                    _ => return,
                 };
                 Self::spawn_http1_connection(
                     pipe_ctx2,
@@ -2203,10 +2375,17 @@ impl HttpServer {
                     let acme_manager2 = acme_manager_clone.clone();
                     let acceptor_clone = acceptor.clone();
 
-                    Self::spawn_connection(async move {
-                        let stream = match acceptor_clone.accept(stream).await {
-                            Ok(stream) => stream,
-                            Err(_) => return,
+                    // 握手阶段不占连接配额（真正的连接由内层
+                    // handle_acme_or_normal → spawn_http1_connection 计数）
+                    Self::spawn_connection_untracked(async move {
+                        let handshake = tokio::time::timeout(
+                            crate::global_config::ServerConfig::get_tls_handshake_timeout().await,
+                            acceptor_clone.accept(stream),
+                        )
+                        .await;
+                        let stream = match handshake {
+                            Ok(Ok(stream)) => stream,
+                            _ => return,
                         };
 
                         Self::handle_acme_or_normal(
@@ -2230,7 +2409,17 @@ impl HttpServer {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut buf = vec![0u8; 4096];
-        if stream.read(&mut buf).await.unwrap_or(0) == 0 {
+        // 空闲/慢速连接同样受请求超时约束，防止占满全局连接配额
+        let read = tokio::time::timeout(
+            crate::global_config::ServerConfig::get_request_timeout().await,
+            stream.read(&mut buf),
+        )
+        .await;
+        let n = match read {
+            Ok(Ok(n)) => n,
+            _ => return,
+        };
+        if n == 0 {
             return;
         }
         let request = String::from_utf8_lossy(&buf);
@@ -2272,9 +2461,15 @@ impl HttpServer {
     ) {
         // 先读取部分数据检查是否是ACME挑战
         let mut buf = vec![0u8; 4096];
-        let n = match stream.read(&mut buf).await {
-            Ok(n) => n,
-            Err(_) => return,
+        // 首读同样包请求超时，防止空闲连接永久占用连接槽
+        let first_read = tokio::time::timeout(
+            crate::global_config::ServerConfig::get_request_timeout().await,
+            stream.read(&mut buf),
+        )
+        .await;
+        let n = match first_read {
+            Ok(Ok(n)) => n,
+            _ => return,
         };
 
         if n == 0 {

@@ -330,7 +330,7 @@ pub async fn serve_http3_impl(
                 let pipe_ctx3 = Arc::clone(&pipe_ctx2);
                 #[cfg(feature = "webtransport")]
                 let wt_conn = wt_conn.clone();
-                super::HttpServer::spawn_connection(async move {
+                super::HttpServer::spawn_connection_untracked(async move {
                     let (req_head, mut stream) = match resolver.resolve_request().await {
                         Ok(req_stream) => req_stream,
                         Err(_) => return,
@@ -436,28 +436,55 @@ pub async fn serve_http3_impl(
 
                     let mut request_body = Vec::new();
                     let max_body_bytes = crate::global_config::ServerConfig::get_max_body_bytes();
-                    loop {
-                        match stream.recv_data().await {
-                            Ok(Some(mut chunk)) => {
-                                let chunk_len = chunk.remaining();
-                                if request_body.len() + chunk_len > max_body_bytes {
-                                    let response =
-                                        match http::Response::builder().status(413).body(()) {
-                                            Ok(resp) => resp,
-                                            Err(_) => return,
-                                        };
-                                    let _ = stream.send_response(response).await;
-                                    let _ = stream.finish().await;
-                                    return;
+                    // 请求体读取受请求超时约束，防止慢速客户端长期占用流
+                    let request_timeout =
+                        crate::global_config::ServerConfig::get_request_timeout().await;
+                    let read_body = async {
+                        loop {
+                            match stream.recv_data().await {
+                                Ok(Some(mut chunk)) => {
+                                    let chunk_len = chunk.remaining();
+                                    if request_body.len() + chunk_len > max_body_bytes {
+                                        // true = 超限（回 413），false = 读流错误
+                                        return Err(true);
+                                    }
+                                    request_body.extend_from_slice(
+                                        &chunk.copy_to_bytes(chunk.remaining()),
+                                    );
                                 }
-                                request_body
-                                    .extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+                                Ok(None) => return Ok(()),
+                                Err(_) => return Err(false),
                             }
-                            Ok(None) => break,
-                            Err(_) => return,
+                        }
+                    };
+                    match tokio::time::timeout(request_timeout, read_body).await {
+                        Ok(Ok(())) => {}
+                        // 超限必须拒绝，不能带着截断的 body 继续处理
+                        Ok(Err(true)) => {
+                            let response = match http::Response::builder().status(413).body(()) {
+                                Ok(resp) => resp,
+                                Err(_) => return,
+                            };
+                            let _ = stream.send_response(response).await;
+                            let _ = stream.finish().await;
+                            return;
+                        }
+                        // 上游读流错误：静默关闭
+                        Ok(Err(false)) => return,
+                        Err(_elapsed) => {
+                            let response = match http::Response::builder().status(408).body(()) {
+                                Ok(resp) => resp,
+                                Err(_) => return,
+                            };
+                            let _ = stream.send_response(response).await;
+                            let _ = stream.finish().await;
+                            return;
                         }
                     }
                     req.body = request_body.into();
+                    // 与 h1 路径一致地解析 body_pairs/body_files，
+                    // 保证带类型参数的 handler 在 h3 下可用
+                    HttpRequest::parse_body_content(&mut req);
 
                     let res = PipeContext::handle_request(pipe_ctx3.as_ref(), &mut req, 0).await;
 
@@ -466,7 +493,18 @@ pub async fn serve_http3_impl(
                         if is_h2_h3_forbidden_response_header(key) {
                             continue;
                         }
-                        response_builder = response_builder.header(key.as_ref(), value.as_ref());
+                        // 清洗控制字符，与 h1/h2 路径行为一致
+                        let sanitized = crate::full::sanitize_header_str(value);
+                        response_builder =
+                            response_builder.header(key.as_ref(), sanitized.as_ref());
+                    }
+                    for (key, value) in res.multi_headers.iter() {
+                        if is_h2_h3_forbidden_response_header(key) {
+                            continue;
+                        }
+                        let sanitized = crate::full::sanitize_header_str(value);
+                        response_builder =
+                            response_builder.header(key.as_ref(), sanitized.as_ref());
                     }
                     let response = match response_builder.body(()) {
                         Ok(resp) => resp,
@@ -558,7 +596,7 @@ pub async fn serve_http3_without_encrypt_impl(
                 let pipe_ctx3 = Arc::clone(&pipe_ctx2);
                 #[cfg(feature = "webtransport")]
                 let wt_conn = wt_conn.clone();
-                super::HttpServer::spawn_connection(async move {
+                super::HttpServer::spawn_connection_untracked(async move {
                     let (req_head, mut stream) = match resolver.resolve_request().await {
                         Ok(req_stream) => req_stream,
                         Err(_) => return,
@@ -664,28 +702,55 @@ pub async fn serve_http3_without_encrypt_impl(
 
                     let mut request_body = Vec::new();
                     let max_body_bytes = crate::global_config::ServerConfig::get_max_body_bytes();
-                    loop {
-                        match stream.recv_data().await {
-                            Ok(Some(mut chunk)) => {
-                                let chunk_len = chunk.remaining();
-                                if request_body.len() + chunk_len > max_body_bytes {
-                                    let response =
-                                        match http::Response::builder().status(413).body(()) {
-                                            Ok(resp) => resp,
-                                            Err(_) => return,
-                                        };
-                                    let _ = stream.send_response(response).await;
-                                    let _ = stream.finish().await;
-                                    return;
+                    // 请求体读取受请求超时约束，防止慢速客户端长期占用流
+                    let request_timeout =
+                        crate::global_config::ServerConfig::get_request_timeout().await;
+                    let read_body = async {
+                        loop {
+                            match stream.recv_data().await {
+                                Ok(Some(mut chunk)) => {
+                                    let chunk_len = chunk.remaining();
+                                    if request_body.len() + chunk_len > max_body_bytes {
+                                        // true = 超限（回 413），false = 读流错误
+                                        return Err(true);
+                                    }
+                                    request_body.extend_from_slice(
+                                        &chunk.copy_to_bytes(chunk.remaining()),
+                                    );
                                 }
-                                request_body
-                                    .extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+                                Ok(None) => return Ok(()),
+                                Err(_) => return Err(false),
                             }
-                            Ok(None) => break,
-                            Err(_) => return,
+                        }
+                    };
+                    match tokio::time::timeout(request_timeout, read_body).await {
+                        Ok(Ok(())) => {}
+                        // 超限必须拒绝，不能带着截断的 body 继续处理
+                        Ok(Err(true)) => {
+                            let response = match http::Response::builder().status(413).body(()) {
+                                Ok(resp) => resp,
+                                Err(_) => return,
+                            };
+                            let _ = stream.send_response(response).await;
+                            let _ = stream.finish().await;
+                            return;
+                        }
+                        // 上游读流错误：静默关闭
+                        Ok(Err(false)) => return,
+                        Err(_elapsed) => {
+                            let response = match http::Response::builder().status(408).body(()) {
+                                Ok(resp) => resp,
+                                Err(_) => return,
+                            };
+                            let _ = stream.send_response(response).await;
+                            let _ = stream.finish().await;
+                            return;
                         }
                     }
                     req.body = request_body.into();
+                    // 与 h1 路径一致地解析 body_pairs/body_files，
+                    // 保证带类型参数的 handler 在 h3 下可用
+                    HttpRequest::parse_body_content(&mut req);
 
                     let res = PipeContext::handle_request(pipe_ctx3.as_ref(), &mut req, 0).await;
 
@@ -694,7 +759,18 @@ pub async fn serve_http3_without_encrypt_impl(
                         if is_h2_h3_forbidden_response_header(key) {
                             continue;
                         }
-                        response_builder = response_builder.header(key.as_ref(), value.as_ref());
+                        // 清洗控制字符，与 h1/h2 路径行为一致
+                        let sanitized = crate::full::sanitize_header_str(value);
+                        response_builder =
+                            response_builder.header(key.as_ref(), sanitized.as_ref());
+                    }
+                    for (key, value) in res.multi_headers.iter() {
+                        if is_h2_h3_forbidden_response_header(key) {
+                            continue;
+                        }
+                        let sanitized = crate::full::sanitize_header_str(value);
+                        response_builder =
+                            response_builder.header(key.as_ref(), sanitized.as_ref());
                     }
                     let response = match response_builder.body(()) {
                         Ok(resp) => resp,
@@ -748,3 +824,4 @@ pub async fn serve_http3_without_encrypt_impl(
     endpoint.wait_idle().await;
     Ok(())
 }
+

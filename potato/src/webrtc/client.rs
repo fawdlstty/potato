@@ -331,7 +331,15 @@ impl<'a> SubscriptionBuilder<'a> {
             .set_local_description(offer.clone())
             .await?;
 
-        let subscriber_id = uuid::Uuid::new_v4().to_string();
+        // 复用已在 join_room 注册的 peer_id 作为订阅者身份；服务端归属
+        // 校验要求 subscriber_id 属于本信令连接，随机 uuid 会被拒绝
+        let subscriber_id = {
+            let context = self.client.context.read().await;
+            context
+                .peer_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Not in a room - no peer_id"))?
+        };
         let params = crate::webrtc::signaling::SubscribeParams {
             room_id: self.room_id.clone(),
             publisher_id: self.publisher_id.clone(),

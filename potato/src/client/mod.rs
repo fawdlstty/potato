@@ -48,12 +48,19 @@ async fn stream_chunked_body_to_channel(
     mut buf: Vec<u8>,
     tx: Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
+    // 恶意服务器可声明超大 chunk 滴数据：限制单 chunk 与元数据行大小
+    let max_body = crate::global_config::ServerConfig::get_max_body_bytes();
+    const MAX_METADATA_LINE_BYTES: usize = 16 * 1024;
+    let mut total_body = 0usize;
     let mut cursor = 0usize;
     let mut tmp_buf = [0u8; 8192];
     loop {
         let line_end = loop {
             if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n") {
                 break cursor + pos;
+            }
+            if buf.len() - cursor >= MAX_METADATA_LINE_BYTES {
+                return Err(anyhow!("chunk metadata line too large"));
             }
             let n = stream.read(&mut tmp_buf).await?;
             if n == 0 {
@@ -76,6 +83,10 @@ async fn stream_chunked_body_to_channel(
         if chunk_size == 0 {
             return Ok(());
         }
+        if chunk_size > max_body || total_body.saturating_add(chunk_size) > max_body {
+            return Err(anyhow!("response body too large: exceeds {max_body} bytes"));
+        }
+        total_body += chunk_size;
 
         while buf.len() < cursor + chunk_size + 2 {
             let n = stream.read(&mut tmp_buf).await?;
@@ -114,13 +125,21 @@ async fn stream_body_to_channel(
     is_chunked: bool,
 ) -> anyhow::Result<()> {
     if is_chunked {
-        // chunked 模式：解析 chunk 并发送解码后的原始数据
+        // chunked 模式：解析 chunk 并发送解码后的原始数据。
+        // 与 stream_chunked_body_to_channel 一致：限制元数据行、单 chunk
+        // 与累计大小，防止恶意上游 OOM 代理进程。
+        let max_body = crate::global_config::ServerConfig::get_max_body_bytes();
+        const MAX_METADATA_LINE_BYTES: usize = 16 * 1024;
+        let mut total_body = 0usize;
         let mut cursor = 0usize;
         let mut tmp_buf = [0u8; 8192];
         loop {
             let line_end = loop {
                 if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n") {
                     break cursor + pos;
+                }
+                if buf.len() - cursor >= MAX_METADATA_LINE_BYTES {
+                    return Err(anyhow!("chunk metadata line too large"));
                 }
                 let n = stream.read(&mut tmp_buf).await?;
                 if n == 0 {
@@ -143,8 +162,16 @@ async fn stream_body_to_channel(
             if chunk_size == 0 {
                 return Ok(());
             }
+            if chunk_size > max_body || total_body.saturating_add(chunk_size) > max_body {
+                return Err(anyhow!("response body too large: exceeds {max_body} bytes"));
+            }
+            total_body += chunk_size;
 
-            while buf.len() < cursor + chunk_size + 2 {
+            let Some(chunk_end) = cursor.checked_add(chunk_size).and_then(|v| v.checked_add(2))
+            else {
+                return Err(anyhow!("chunk size overflow"));
+            };
+            while buf.len() < chunk_end {
                 let n = stream.read(&mut tmp_buf).await?;
                 if n == 0 {
                     return Ok(());
@@ -405,6 +432,10 @@ impl Session {
                     }
                     break;
                 }
+                // 恶意服务器可发送永不完整的响应头：限制 header 区大小
+                if buf.len() > crate::global_config::ServerConfig::get_max_header_bytes() {
+                    return Err(anyhow!("response header section too large"));
+                }
                 let mut tmp_buf = [0u8; 4096];
                 let n = sess_impl.stream.read(&mut tmp_buf).await?;
                 if n == 0 {
@@ -433,6 +464,11 @@ impl Session {
             if conn.eq_ignore_ascii_case("close") {
                 self.sess_impl = None;
             }
+        }
+        // 恶意服务器可能对 HEAD 响应附带 body（RFC 禁止）；skip_body 后
+        // 这些字节会滞留在连接中污染下一次响应解析，HEAD 一律不复用连接
+        if request_method == HttpMethod::HEAD {
+            self.sess_impl = None;
         }
         Ok(res)
     }
@@ -467,6 +503,10 @@ impl Session {
                         return Ok(res);
                     }
                     break;
+                }
+                // 恶意服务器可发送永不完整的响应头：限制 header 区大小
+                if buf.len() > crate::global_config::ServerConfig::get_max_header_bytes() {
+                    return Err(anyhow!("response header section too large"));
                 }
                 let mut tmp_buf = [0u8; 4096];
                 let n = sess_impl.stream.read(&mut tmp_buf).await?;
@@ -1272,6 +1312,10 @@ impl TransferSession {
             if let Some((res, hdr_len)) = HttpResponse::from_headers_part(&buf[..])? {
                 break (res, hdr_len);
             }
+            // 恶意上游可发送永不完整的响应头：限制 header 区大小
+            if buf.len() > crate::global_config::ServerConfig::get_max_header_bytes() {
+                return Err(anyhow!("response header section too large"));
+            }
             let mut tmp_buf = [0u8; 4096];
             let n = stream.read(&mut tmp_buf).await?;
             if n == 0 {
@@ -1310,8 +1354,15 @@ impl TransferSession {
             )
             .await?;
             res = res_complete;
-            // 将连接放回连接池以便复用
-            self.conns.insert(conn_key, stream);
+            // 上游宣告 close 的连接不可回池（复用会写失败或污染响应）
+            let reusable = res
+                .get_header("Connection")
+                .map(|conn| !conn.eq_ignore_ascii_case("close"))
+                .unwrap_or(true);
+            if reusable {
+                // 将连接放回连接池以便复用
+                self.conns.insert(conn_key, stream);
+            }
         }
 
         strip_hop_by_hop_response_headers(&mut res);
@@ -1416,13 +1467,13 @@ impl TransferSession {
         } else {
             let host = req.get_header_host().unwrap_or("localhost");
 
+            // 目标 scheme 只由显式的转发头/路径决定；不要用域名后缀启发式
+            // 猜测（`.com` 不代表 https），猜错会静默降级为明文 ws。
             let use_ssl = req
                 .get_header("X-Forwarded-Proto")
                 .is_some_and(|proto| proto == "https" || proto == "wss")
                 || req.get_header("X-Forwarded-Proto-Https").is_some()
-                || req.url_path.starts_with("https")
-                || host.contains(".com") && !host.contains("127.") && !host.starts_with("192.")
-                || host.contains("localhost");
+                || req.url_path.starts_with("https");
 
             let (host_part, port_part) = host.split_once(':').unwrap_or((host, ""));
 

@@ -270,11 +270,18 @@ impl H2Session {
             Ok(res)
         } else {
             // 处理普通响应
+            let max_body_bytes = crate::global_config::ServerConfig::get_max_body_bytes();
             let mut body = response.into_body();
             let mut body_data = Vec::new();
             while let Some(chunk_result) = body.data().await {
                 let chunk = chunk_result?;
                 body_data.extend_from_slice(&chunk);
+                if body_data.len() > max_body_bytes {
+                    use anyhow::anyhow;
+                    return Err(anyhow!(
+                        "response body too large: exceeds {max_body_bytes} bytes"
+                    ));
+                }
             }
 
             let mut res = HttpResponse::new();

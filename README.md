@@ -49,9 +49,3 @@ async fn main() -> anyhow::Result<()> {
 
 Please refer to: <https://github.com/fawdlstty/potato/tree/main/examples>
 
-<!--
-# TODO
-
-- cookie
-- CORS
--->

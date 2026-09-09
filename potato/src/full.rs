@@ -415,7 +415,7 @@ impl SessionCache {
                     // 设置cookie
                     cookie.to_set_cookie_string()
                 };
-                response.add_header(Cow::Borrowed("Set-Cookie"), Cow::Owned(cookie_str));
+                response.append_header(Cow::Borrowed("Set-Cookie"), Cow::Owned(cookie_str));
             }
         }
     }
@@ -607,6 +607,11 @@ impl SessionCache {
     }
 
     /// 使指定token对应的session失效（用于登出等场景）
+    ///
+    /// **Security note:** this only removes the server-side session cache;
+    /// the JWT itself remains cryptographically valid until `exp`. Callers
+    /// needing hard revocation should use short token TTLs plus a refresh
+    /// token flow or maintain a `jti` denylist.
     pub fn invalidate(token: &str) {
         use sha2::{Digest, Sha256};
 
@@ -684,6 +689,72 @@ fn parse_trailer_line(line: &[u8]) -> anyhow::Result<(String, String)> {
         Err(anyhow!("empty trailer field name"))?;
     }
     Ok((name.to_string(), value.trim().to_string()))
+}
+
+/// Strip a wrapping pair of double quotes (`"value"` -> `value`).
+///
+/// Malformed or empty quoted tokens are returned as-is instead of slicing,
+/// so hostile multipart headers can never panic the parser.
+fn strip_quoted(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
+/// Find the first offset of `needle` inside `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|part| part == needle)
+}
+
+/// Split a multipart body on its boundary delimiters.
+///
+/// Per RFC 2046 a delimiter only takes effect at the start of a line: an
+/// occurrence of `--boundary` that is not at position 0 and not preceded by
+/// CRLF is ordinary content, not a separator.
+fn split_multipart_at_boundary<'a>(data: &'a [u8], boundary: &[u8]) -> Vec<&'a [u8]> {
+    let mut positions = Vec::new();
+    let mut i = 0usize;
+    while i + boundary.len() <= data.len() {
+        if &data[i..i + boundary.len()] == boundary
+            && (i == 0 || (i >= 2 && &data[i - 2..i] == b"\r\n"))
+        {
+            positions.push(i);
+            i += boundary.len();
+        } else {
+            i += 1;
+        }
+    }
+    if positions.is_empty() {
+        return Vec::new();
+    }
+    let mut parts = Vec::with_capacity(positions.len() + 1);
+    // preamble (usually empty)
+    parts.push(&data[..positions[0]]);
+    for pair in positions.windows(2) {
+        parts.push(&data[pair[0] + boundary.len()..pair[1]]);
+    }
+    let last = *positions.last().expect("positions is non-empty");
+    parts.push(&data[last + boundary.len()..]);
+    parts
+}
+
+/// Reject header values carrying CR/LF/NUL to prevent response splitting.
+/// Returns a sanitized copy only when the input actually contains control bytes.
+pub(crate) fn sanitize_header_str(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n' || b == 0) {
+        std::borrow::Cow::Owned(
+            value
+                .chars()
+                .filter(|&c| c != '\r' && c != '\n' && c != '\0')
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
 }
 
 fn parse_transfer_encoding_tokens(raw: &str) -> anyhow::Result<Vec<String>> {
@@ -933,6 +1004,9 @@ pub enum CompressMode {
 
 pub struct Websocket {
     stream: Arc<Mutex<HttpStream>>,
+    /// true when this endpoint dialled out (client role), false for upgraded
+    /// server-side connections. Drives RFC 6455 masking direction checks.
+    is_client: bool,
 }
 
 impl Websocket {
@@ -962,7 +1036,10 @@ impl Websocket {
             .ok_or_else(|| anyhow!("session impl is null"))?
             .stream;
         let stream = Arc::new(Mutex::new(stream));
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            is_client: true,
+        })
     }
 
     async fn recv_impl(&mut self) -> anyhow::Result<WsFrameImpl> {
@@ -985,12 +1062,28 @@ impl Websocket {
                 127 => {
                     let mut buf = [0u8; 8];
                     stream.read_exact(&mut buf).await?;
-                    u64::from_be_bytes(buf) as usize
+                    let declared = u64::from_be_bytes(buf);
+                    // Never trust the declared 64-bit length: allocating it
+                    // blindly lets a remote peer OOM the process.
+                    usize::try_from(declared).map_err(|_| {
+                        anyhow::Error::msg("WebSocket frame length exceeds address space")
+                    })?
                 }
                 _ => payload_len as usize,
             }
         };
-        let omask_key = match buf[1] & 0b1000_0000 != 0 {
+        let max_frame = ServerConfig::get_ws_max_frame_size();
+        if payload_len > max_frame {
+            anyhow::bail!(
+                "WebSocket frame too large: {payload_len} bytes exceeds {max_frame} bytes"
+            );
+        }
+        // RFC 6455 §5.1: client frames MUST be masked, server frames MUST NOT be.
+        let masked = buf[1] & 0b1000_0000 != 0;
+        if masked == self.is_client {
+            anyhow::bail!("WebSocket frame masking violates RFC 6455 direction rules");
+        }
+        let omask_key = match masked {
             true => {
                 let mut mask_key = [0u8; 4];
                 stream.read_exact(&mut mask_key).await?;
@@ -1019,6 +1112,7 @@ impl Websocket {
     pub async fn recv(&mut self) -> anyhow::Result<WsFrame> {
         let mut tmp = vec![];
         let mut ping_failures = 0u32;
+        let max_message = ServerConfig::get_ws_max_message_size();
         loop {
             let timeout = ServerConfig::get_ws_ping_duration().await;
             match tokio::time::timeout(timeout, self.recv_impl()).await {
@@ -1030,26 +1124,43 @@ impl Websocket {
                     }
                     WsFrameImpl::Binary(data) => {
                         tmp.extend(data);
+                        if tmp.len() > max_message {
+                            anyhow::bail!(
+                                "WebSocket message too large: exceeds {max_message} bytes"
+                            );
+                        }
                         return Ok(WsFrame::Binary(tmp));
                     }
                     WsFrameImpl::Text(data) => {
                         tmp.extend(data);
+                        if tmp.len() > max_message {
+                            anyhow::bail!(
+                                "WebSocket message too large: exceeds {max_message} bytes"
+                            );
+                        }
                         let ret_str = String::from_utf8(tmp).unwrap_or("".to_string());
                         return Ok(WsFrame::Text(ret_str));
                     }
-                    WsFrameImpl::PartData(data) => tmp.extend(data),
+                    WsFrameImpl::PartData(data) => {
+                        tmp.extend(data);
+                        if tmp.len() > max_message {
+                            anyhow::bail!(
+                                "WebSocket message too large: exceeds {max_message} bytes"
+                            );
+                        }
+                    }
                 },
                 Err(_) => {
-                    // 发送 ping 探测连接状态，带超时保护
+                    // 发送 ping 探测连接状态，带超时保护。
+                    // 只有收到 Pong 才会清零计数（见上方 Pong 分支）；
+                    // 发送成功不代表对端存活，不能重置失败计数。
                     match tokio::time::timeout(
                         Duration::from_secs(5),
                         self.send_impl(WsFrameImpl::Ping),
                     )
                     .await
                     {
-                        Ok(Ok(())) => {
-                            ping_failures = 0;
-                        }
+                        Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             ping_failures += 1;
                             if ping_failures >= 3 {
@@ -1083,28 +1194,34 @@ impl Websocket {
             WsFrameImpl::PartData(data) => (false, 0x0, data),
         };
         let payload_len = payload.len();
+        // RFC 6455 §5.1: client-to-server frames MUST be masked, server-to-
+        // client frames MUST NOT be. Mirror the recv direction check.
+        let mask_bit = if self.is_client { 0x80 } else { 0x00 };
         let mut buf = vec![];
         buf.push((fin as u8) << 7 | opcode);
-        // Client-to-server frames must be masked per RFC 6455
-        let mask_key: [u8; 4] = rand::random();
         if payload_len < 126 {
-            buf.push((payload_len as u8) | 0x80);
+            buf.push((payload_len as u8) | mask_bit);
         } else if payload_len < 65536 {
-            buf.push(126 | 0x80);
+            buf.push(126 | mask_bit);
             buf.extend((payload_len as u16).to_be_bytes().iter());
         } else {
-            buf.push(127 | 0x80);
+            buf.push(127 | mask_bit);
             buf.extend((payload_len as u64).to_be_bytes().iter());
         }
-        buf.extend_from_slice(&mask_key);
-        // Mask the payload
-        let mut masked_payload = payload.clone();
-        for i in 0..masked_payload.len() {
-            masked_payload[i] ^= mask_key[i % 4];
-        }
+        let payload_to_send = if self.is_client {
+            let mask_key: [u8; 4] = rand::random();
+            buf.extend_from_slice(&mask_key);
+            let mut masked_payload = payload.clone();
+            for i in 0..masked_payload.len() {
+                masked_payload[i] ^= mask_key[i % 4];
+            }
+            masked_payload
+        } else {
+            payload
+        };
         let mut stream = self.stream.lock().await;
         stream.write_all(&buf).await?;
-        stream.write_all(&masked_payload).await?;
+        stream.write_all(&payload_to_send).await?;
         Ok(())
     }
 
@@ -1611,11 +1728,15 @@ impl HttpRequest {
         let mut body = Vec::new();
         let mut trailers = FxHashMap::with_capacity_and_hasher(4, Default::default());
         let mut tmp_buf = [0u8; 4096];
+        const MAX_METADATA_LINE_BYTES: usize = 16 * 1024;
 
         loop {
             let line_end = loop {
                 if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n") {
                     break cursor + pos;
+                }
+                if buf.len() - cursor >= MAX_METADATA_LINE_BYTES {
+                    anyhow::bail!("chunk metadata line too large");
                 }
                 let n = stream.read(&mut tmp_buf).await?;
                 if n == 0 {
@@ -1644,6 +1765,9 @@ impl HttpRequest {
                         if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n")
                         {
                             break cursor + pos;
+                        }
+                        if buf.len() - cursor >= MAX_METADATA_LINE_BYTES {
+                            anyhow::bail!("chunk trailer line too large");
                         }
                         let n = stream.read(&mut tmp_buf).await?;
                         if n == 0 {
@@ -1678,7 +1802,11 @@ impl HttpRequest {
                 }
             }
 
-            while buf.len() < cursor + chunk_size + 2 {
+            let Some(chunk_end) = cursor.checked_add(chunk_size).and_then(|v| v.checked_add(2))
+            else {
+                anyhow::bail!("chunk size overflow");
+            };
+            while buf.len() < chunk_end {
                 let n = stream.read(&mut tmp_buf).await?;
                 if n == 0 {
                     Err(anyhow::Error::msg("connection closed"))?;
@@ -1706,25 +1834,26 @@ impl HttpRequest {
         if self.get_header_connection() != HttpConnection::Upgrade {
             return false;
         }
+        // RFC 6455 §4.2.1: Upgrade MUST be "websocket", version MUST be 13 and
+        // a non-empty base64 Sec-WebSocket-Key MUST be present.
         if self
             .get_header_key(HeaderItem::Upgrade)
-            .is_some_and(|val| val.to_lowercase() != "websocket")
+            .is_none_or(|val| val.to_lowercase() != "websocket")
         {
             return false;
         }
-        if self
-            .get_header("Sec-WebSocket-Version")
-            .is_some_and(|val| val != "13")
-        {
+        if self.get_header("Sec-WebSocket-Version").map(|val| val != "13") != Some(false) {
             return false;
         }
-        if self
-            .get_header("Sec-WebSocket-Key")
-            .is_some_and(|val| val.is_empty())
-        {
-            return false;
+        match self.get_header("Sec-WebSocket-Key") {
+            Some(val) => {
+                if val.len() != 24 || !val.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
+                    return false;
+                }
+                true
+            }
+            None => false,
         }
-        true
     }
 
     pub async fn upgrade_websocket(&mut self) -> anyhow::Result<Websocket> {
@@ -1745,7 +1874,10 @@ impl HttpRequest {
             let res = HttpResponse::from_websocket(&ws_key);
             stream.write_all(&res.as_bytes(CompressMode::None)).await?;
         }
-        Ok(Websocket { stream })
+        Ok(Websocket {
+            stream,
+            is_client: false,
+        })
     }
 
     pub async fn get_client_addr(&self) -> anyhow::Result<SocketAddr> {
@@ -1793,12 +1925,16 @@ impl HttpRequest {
             content_length = req.parse_header_content_length()?.unwrap_or(0);
         }
 
-        if let Some(max_body_bytes) = limits.1 {
-            if content_length > max_body_bytes {
-                anyhow::bail!(
-                    "request body too large: {content_length} bytes exceeds {max_body_bytes} bytes"
-                );
-            }
+        // Body limit: per-request limit narrows the global default; the global
+        // default always applies so unbounded request bodies are impossible.
+        let max_body_bytes = limits
+            .1
+            .map(|limit| limit.min(ServerConfig::get_max_body_bytes()))
+            .unwrap_or_else(ServerConfig::get_max_body_bytes);
+        if content_length > max_body_bytes {
+            anyhow::bail!(
+                "request body too large: {content_length} bytes exceeds {max_body_bytes} bytes"
+            );
         }
 
         let has_request_body = has_chunked_transfer_encoding || content_length > 0;
@@ -1808,7 +1944,8 @@ impl HttpRequest {
             let allowed_trailers =
                 parse_declared_trailer_names(req.get_header_key(HeaderItem::Trailer));
             let (body, trailers, consumed_len) =
-                Self::read_chunked_body(buf, stream, hdr_len, &allowed_trailers, limits.1).await?;
+                Self::read_chunked_body(buf, stream, hdr_len, &allowed_trailers, Some(max_body_bytes))
+                    .await?;
             req.body = body;
             req.trailers = trailers;
             consumed_len
@@ -1826,6 +1963,16 @@ impl HttpRequest {
             content_length
         };
 
+        // 按 Content-Type 解析 body 到 body_pairs/body_files
+        Self::parse_body_content(req);
+        Ok(hdr_len + bdy_len)
+    }
+
+    /// Parse `req.body` according to the request's Content-Type header,
+    /// filling `body_pairs` / `body_files`. Shared by the HTTP/1.1 parser and
+    /// the HTTP/2 & HTTP/3 server paths so typed handler parameters work on
+    /// every protocol version.
+    pub(crate) fn parse_body_content(req: &mut HttpRequest) {
         // 先获取Content-Type的字符串值，避免借用冲突
         let content_type_str = {
             req.get_header_key(HeaderItem::Content_Type)
@@ -1861,42 +2008,57 @@ impl HttpRequest {
                     }
                 }
                 Some(HttpContentType::MultipartFormData(boundary)) => {
-                    if let Ok(body_str) = std::str::from_utf8(&req.body) {
-                        let split_str = ssformat!(64, "--{boundary}");
-                        for mut s in body_str.split(split_str.as_str()) {
-                            if s == "--" {
-                                break;
-                            }
-                            if s.ends_with("\r\n") {
-                                s = &s[..s.len() - 2];
-                            }
-                            if let Some((key_str, content)) = s.split_once("\r\n\r\n") {
-                                let keys: Vec<&str> = key_str
-                                    .split("\r\n")
-                                    .map(|p| p.split(";").collect::<Vec<_>>())
-                                    .collect::<Vec<_>>()
-                                    .into_iter()
-                                    .flatten()
-                                    .collect();
-                                let mut name = None;
-                                let mut filename = None;
-                                for key in keys.into_iter() {
-                                    if let Some((k, v)) = key.trim().split_once('=') {
-                                        if k == "name" {
-                                            name = Some(LocalHipStr::from(&v[1..v.len() - 1]));
-                                        } else if k == "filename" {
-                                            filename = Some(LocalHipStr::from(&v[1..v.len() - 1]));
-                                        }
-                                    }
+                    // 按字节切分以支持二进制文件上传；仅头解析区做文本转换。
+                    // 分隔符必须位于行首（RFC 2046），内容中间出现的
+                    // boundary 文本不会切分。
+                    let split_seq = ssformat!(64, "--{boundary}");
+                    let split_seq = split_seq.as_bytes();
+                    let body_bytes: &[u8] = &req.body[..];
+                    for mut seg in split_multipart_at_boundary(body_bytes, split_seq) {
+                        if seg == b"--" || seg.starts_with(b"--") {
+                            break;
+                        }
+                        if seg.starts_with(b"\r\n") {
+                            seg = &seg[2..];
+                        }
+                        if seg.ends_with(b"\r\n") {
+                            seg = &seg[..seg.len() - 2];
+                        }
+                        let Some(hdr_end) = find_subslice(seg, b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let (key_part, content) = seg.split_at(hdr_end);
+                        let content = &content[4..];
+                        let key_str = String::from_utf8_lossy(key_part);
+                        let keys: Vec<&str> = key_str
+                            .split("\r\n")
+                            .map(|p| p.split(";").collect::<Vec<_>>())
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                        let mut name = None;
+                        let mut filename = None;
+                        for key in keys.into_iter() {
+                            if let Some((k, v)) = key.trim().split_once('=') {
+                                let v = strip_quoted(v.trim());
+                                if v.is_empty() {
+                                    continue;
                                 }
-                                if let Some(name) = name {
-                                    if let Some(filename) = filename {
-                                        let data = LocalHipByt::from(content.as_bytes());
-                                        req.body_files.insert(name, PostFile { filename, data });
-                                    } else {
-                                        req.body_pairs.insert(name, LocalHipStr::from(content));
-                                    }
+                                if k == "name" {
+                                    name = Some(LocalHipStr::from(v));
+                                } else if k == "filename" {
+                                    filename = Some(LocalHipStr::from(v));
                                 }
+                            }
+                        }
+                        if let Some(name) = name {
+                            if let Some(filename) = filename {
+                                let data = LocalHipByt::from(content.to_vec());
+                                req.body_files.insert(name, PostFile { filename, data });
+                            } else {
+                                let text = String::from_utf8_lossy(content).to_string();
+                                req.body_pairs.insert(name, LocalHipStr::from(text));
                             }
                         }
                     }
@@ -1904,7 +2066,6 @@ impl HttpRequest {
                 None => {}
             }
         }
-        Ok(hdr_len + bdy_len)
     }
 
     pub async fn from_stream(
@@ -1989,6 +2150,7 @@ impl HttpRequest {
         req.clear_for_reuse();
         req.headers.reserve(parsed_header_count);
         let mut content_length_seen: Option<String> = None;
+        let mut transfer_encoding_seen = false;
         let mut host_header_count = 0usize;
         let mut has_valid_host = false;
         req.method = {
@@ -2038,6 +2200,17 @@ impl HttpRequest {
                 } else {
                     content_length_seen = Some(cl.to_string());
                 }
+            }
+            if h.name.eq_ignore_ascii_case("Transfer-Encoding") {
+                // RFC 9112: a recipient MUST reject messages containing more
+                // than one Transfer-Encoding header field (request smuggling).
+                if transfer_encoding_seen {
+                    anyhow::bail!("duplicate Transfer-Encoding headers are not allowed");
+                }
+                if normalized_header_value.is_empty() {
+                    anyhow::bail!("empty Transfer-Encoding header");
+                }
+                transfer_encoding_seen = true;
             }
             if h.name.eq_ignore_ascii_case("Host") {
                 host_header_count += 1;
@@ -2347,6 +2520,10 @@ pub struct HttpResponse {
     pub version: Cow<'static, str>,
     pub http_code: u16,
     pub headers: FxHashMap<Cow<'static, str>, Cow<'static, str>>,
+    /// Extra values for repeated header fields (e.g. multiple `Set-Cookie`).
+    /// The main `headers` map keeps only the first value of each field; every
+    /// later occurrence is appended here and serialized after the map values.
+    pub multi_headers: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     pub trailers: FxHashMap<Cow<'static, str>, Cow<'static, str>>,
     pub body: HttpResponseBody,
 }
@@ -2358,6 +2535,7 @@ impl Clone for HttpResponse {
             version: self.version.clone(),
             http_code: self.http_code,
             headers: self.headers.clone(),
+            multi_headers: self.multi_headers.clone(),
             trailers: self.trailers.clone(),
             body: match &self.body {
                 HttpResponseBody::Data(data) => HttpResponseBody::Data(data.clone()),
@@ -2375,6 +2553,7 @@ macro_rules! make_resp_by_text {
                 version: Cow::Borrowed("HTTP/1.1"),
                 http_code: 200,
                 headers: Self::default_headers($cnt_type),
+                multi_headers: Vec::new(),
                 trailers: FxHashMap::default(),
                 body: HttpResponseBody::Data(body.into_bytes()),
             }
@@ -2389,6 +2568,7 @@ macro_rules! make_resp_by_binary {
                 version: Cow::Borrowed("HTTP/1.1"),
                 http_code: 200,
                 headers: Self::default_headers($cnt_type),
+                multi_headers: Vec::new(),
                 trailers: FxHashMap::default(),
                 body: HttpResponseBody::Data(body.to_vec()),
             }
@@ -2450,6 +2630,7 @@ impl HttpResponse {
             version: Cow::Borrowed(""),
             http_code: 0,
             headers: FxHashMap::with_capacity_and_hasher(6, Default::default()),
+            multi_headers: Vec::new(),
             trailers: FxHashMap::default(),
             body: HttpResponseBody::Data(vec![]),
         }
@@ -2457,6 +2638,16 @@ impl HttpResponse {
 
     pub fn add_header(&mut self, key: Cow<'static, str>, value: Cow<'static, str>) {
         self.headers.insert(key, value);
+    }
+
+    /// Append an additional value for a header field, keeping any existing
+    /// value. Use this for fields that may repeat (e.g. `Set-Cookie`).
+    pub fn append_header(&mut self, key: Cow<'static, str>, value: Cow<'static, str>) {
+        if !self.headers.contains_key(&key) {
+            self.headers.insert(key.clone(), value.clone());
+        } else {
+            self.multi_headers.push((key, value));
+        }
     }
 
     pub fn not_found() -> Self {
@@ -2493,6 +2684,7 @@ impl HttpResponse {
             ]
             .into_iter()
             .collect(),
+            multi_headers: Vec::new(),
             trailers: FxHashMap::default(),
             body: HttpResponseBody::Stream(rx),
         }
@@ -2505,19 +2697,28 @@ impl HttpResponse {
         res
     }
 
+    /// Synchronously read the whole file into memory.
+    ///
+    /// **Performance note:** this blocks the async worker and buffers the
+    /// entire file; prefer the built-in static routes (which stream large
+    /// files) or keep it to small files only.
     pub fn from_file(path: &str, download: bool, meta: Option<Metadata>) -> Self {
         let mut buffer = vec![];
         let mut response_error = None;
         match File::open(path) {
             Ok(mut file) => {
                 if let Err(err) = file.read_to_end(&mut buffer) {
-                    response_error = Some(err.to_string());
+                    eprintln!("[potato] file read error for {path}: {err}");
+                    response_error = Some("failed to read file".to_string());
                 }
             }
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 response_error = Some("file not found".to_string());
             }
-            Err(err) => response_error = Some(err.to_string()),
+            Err(err) => {
+                eprintln!("[potato] file open error for {path}: {err}");
+                response_error = Some("failed to open file".to_string());
+            }
         }
         let mut response = Self::from_mem_file(path, buffer, download, meta);
         if let Some(message) = response_error {
@@ -2622,6 +2823,7 @@ impl HttpResponse {
             ]
             .into_iter()
             .collect(),
+            multi_headers: Vec::new(),
             trailers: FxHashMap::default(),
             body: HttpResponseBody::Data(vec![]),
         }
@@ -2670,11 +2872,18 @@ impl HttpResponse {
         let mut body = Vec::new();
         let mut trailers = FxHashMap::with_capacity_and_hasher(4, Default::default());
         let mut tmp_buf = [0u8; 4096];
+        // Client side: a hostile server can stream chunks forever, so bound
+        // the assembled body the same way request bodies are bounded.
+        let max_body_bytes = ServerConfig::get_max_body_bytes();
+        const MAX_METADATA_LINE_BYTES: usize = 16 * 1024;
 
         loop {
             let line_end = loop {
                 if let Some(pos) = buf[cursor..].windows(2).position(|part| part == b"\r\n") {
                     break cursor + pos;
+                }
+                if buf.len() - cursor >= MAX_METADATA_LINE_BYTES {
+                    anyhow::bail!("chunk metadata line too large");
                 }
                 let n = stream.read(&mut tmp_buf).await?;
                 if n == 0 {
@@ -2704,6 +2913,9 @@ impl HttpResponse {
                         {
                             break cursor + pos;
                         }
+                        if buf.len() - cursor >= MAX_METADATA_LINE_BYTES {
+                            anyhow::bail!("chunk trailer line too large");
+                        }
                         let n = stream.read(&mut tmp_buf).await?;
                         if n == 0 {
                             Err(anyhow::Error::msg("connection closed"))?;
@@ -2728,7 +2940,17 @@ impl HttpResponse {
                 break;
             }
 
-            while buf.len() < cursor + chunk_size + 2 {
+            if body.len().saturating_add(chunk_size) > max_body_bytes {
+                anyhow::bail!(
+                    "response body too large: chunked body exceeds {max_body_bytes} bytes"
+                );
+            }
+
+            let Some(chunk_end) = cursor.checked_add(chunk_size).and_then(|v| v.checked_add(2))
+            else {
+                anyhow::bail!("chunk size overflow");
+            };
+            while buf.len() < chunk_end {
                 let n = stream.read(&mut tmp_buf).await?;
                 if n == 0 {
                     Err(anyhow::Error::msg("connection closed"))?;
@@ -2777,7 +2999,23 @@ impl HttpResponse {
                     if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
                         continue;
                     }
-                    let _ = write!(ret, "{key}: {value}\r\n");
+                    let _ = write!(
+                        ret,
+                        "{}: {}\r\n",
+                        sanitize_header_str(key),
+                        sanitize_header_str(value)
+                    );
+                }
+                for (key, value) in self.multi_headers.iter() {
+                    if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
+                        continue;
+                    }
+                    let _ = write!(
+                        ret,
+                        "{}: {}\r\n",
+                        sanitize_header_str(key),
+                        sanitize_header_str(value)
+                    );
                 }
                 if !suppress_body {
                     let _ = write!(ret, "Content-Length: {}\r\n", payload_ref.len());
@@ -2848,7 +3086,7 @@ impl HttpResponse {
                     self.version,
                     self.http_code
                 ));
-                if self.headers.len() == 6 {
+                if self.headers.len() == 6 && self.multi_headers.is_empty() {
                     if let (
                         Some(date),
                         Some(server),
@@ -2865,12 +3103,17 @@ impl HttpResponse {
                         self.headers.get("Cache-Control"),
                     ) {
                         use std::fmt::Write as _;
-                        let _ = write!(ret, "Date: {date}\r\n");
-                        let _ = write!(ret, "Server: {server}\r\n");
-                        let _ = write!(ret, "Connection: {connection}\r\n");
-                        let _ = write!(ret, "Content-Type: {content_type}\r\n");
-                        let _ = write!(ret, "Pragma: {pragma}\r\n");
-                        let _ = write!(ret, "Cache-Control: {cache_control}\r\n");
+                        let _ = write!(ret, "Date: {}\r\n", sanitize_header_str(date));
+                        let _ = write!(ret, "Server: {}\r\n", sanitize_header_str(server));
+                        let _ = write!(ret, "Connection: {}\r\n", sanitize_header_str(connection));
+                        let _ =
+                            write!(ret, "Content-Type: {}\r\n", sanitize_header_str(content_type));
+                        let _ = write!(ret, "Pragma: {}\r\n", sanitize_header_str(pragma));
+                        let _ = write!(
+                            ret,
+                            "Cache-Control: {}\r\n",
+                            sanitize_header_str(cache_control)
+                        );
                     } else {
                         for (key, value) in self.headers.iter() {
                             if key == "Content-Length"
@@ -2878,7 +3121,12 @@ impl HttpResponse {
                             {
                                 continue;
                             }
-                            ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
+                            ret.push_str(&ssformat!(
+                                512,
+                                "{}: {}\r\n",
+                                sanitize_header_str(key),
+                                sanitize_header_str(value)
+                            ));
                         }
                     }
                 } else {
@@ -2887,8 +3135,24 @@ impl HttpResponse {
                         {
                             continue;
                         }
-                        ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
+                        ret.push_str(&ssformat!(
+                            512,
+                            "{}: {}\r\n",
+                            sanitize_header_str(key),
+                            sanitize_header_str(value)
+                        ));
                     }
+                }
+                for (key, value) in self.multi_headers.iter() {
+                    if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
+                        continue;
+                    }
+                    ret.push_str(&ssformat!(
+                        512,
+                        "{}: {}\r\n",
+                        sanitize_header_str(key),
+                        sanitize_header_str(value)
+                    ));
                 }
                 if !suppress_body_by_status {
                     ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
@@ -2917,12 +3181,28 @@ impl HttpResponse {
                     self.http_code
                 ));
                 for (key, value) in self.headers.iter() {
-                    if key == "Content-Length"
-                        || (suppress_body && key.eq_ignore_ascii_case("Transfer-Encoding"))
-                    {
+                    // 流式响应统一由写出处补 TE: chunked，headers 里预置的
+                    // （如 HttpResponse::chunked）必须跳过，避免重复头
+                    if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
                         continue;
                     }
-                    ret.push_str(&ssformat!(512, "{key}: {value}\r\n"));
+                    ret.push_str(&ssformat!(
+                        512,
+                        "{}: {}\r\n",
+                        sanitize_header_str(key),
+                        sanitize_header_str(value)
+                    ));
+                }
+                for (key, value) in self.multi_headers.iter() {
+                    if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
+                        continue;
+                    }
+                    ret.push_str(&ssformat!(
+                        512,
+                        "{}: {}\r\n",
+                        sanitize_header_str(key),
+                        sanitize_header_str(value)
+                    ));
                 }
                 if !suppress_body {
                     ret.push_str("Transfer-Encoding: chunked\r\n");
@@ -2960,9 +3240,12 @@ impl HttpResponse {
                 } else {
                     stream.write_all(b"0\r\n").await?;
                     for (name, value) in outbound_stream_trailers.iter() {
-                        stream
-                            .write_all(format!("{name}: {value}\r\n").as_bytes())
-                            .await?;
+                        let trailer_line = format!(
+                            "{}: {}\r\n",
+                            sanitize_header_str(name),
+                            sanitize_header_str(value)
+                        );
+                        stream.write_all(trailer_line.as_bytes()).await?;
                     }
                     stream.write_all(b"\r\n").await?;
                 }
@@ -2984,9 +3267,24 @@ impl HttpResponse {
         request_method: Option<HttpMethod>,
     ) -> anyhow::Result<(Self, usize)> {
         let (mut res, hdr_len) = loop {
-            match HttpResponse::from_headers_part(&buf[..])? {
-                Some((res, hdr_len)) => break (res, hdr_len),
+            match Self::from_headers_part(&buf[..])? {
+                Some((res, hdr_len)) => {
+                    if (100..200).contains(&res.http_code) && res.http_code != 101 {
+                        // Interim response (e.g. 100 Continue): discard it and
+                        // keep waiting for the final response. 101 marks a
+                        // protocol switch and IS the final response here.
+                        buf.copy_within(hdr_len.., 0);
+                        buf.truncate(buf.len() - hdr_len);
+                        continue;
+                    }
+                    break (res, hdr_len);
+                }
                 None => {
+                    // Hostile server can withhold the header terminator:
+                    // bound the header section the same way requests are.
+                    if buf.len() > ServerConfig::get_max_header_bytes() {
+                        anyhow::bail!("response header section too large");
+                    }
                     buf.extend_by_streams(stream).await?;
                 }
             }
@@ -3017,6 +3315,12 @@ impl HttpResponse {
             res.body = HttpResponseBody::Data(chunked_body);
         } else if let Some(cnt_len) = res.headers.get("Content-Length") {
             bdy_len = cnt_len.parse::<usize>().unwrap_or(0);
+            let max_body_bytes = ServerConfig::get_max_body_bytes();
+            if bdy_len > max_body_bytes {
+                anyhow::bail!(
+                    "response body too large: {bdy_len} bytes exceeds {max_body_bytes} bytes"
+                );
+            }
             while hdr_len + bdy_len > buf.len() {
                 buf.extend_by_streams(stream).await?;
             }
@@ -3075,10 +3379,19 @@ impl HttpResponse {
                 }
                 continue;
             }
-            req.headers.insert(
-                h.name.http_std_case().into(),
-                header_value.to_string().into(),
-            );
+            let name_std = h.name.http_std_case();
+            if req.headers.contains_key(name_std.as_str()) {
+                // Repeated field (e.g. multiple Set-Cookie lines): keep every
+                // value instead of letting the hash map overwrite the earlier
+                // ones.
+                req.multi_headers
+                    .push((name_std.into(), header_value.to_string().into()));
+            } else {
+                req.headers.insert(
+                    name_std.into(),
+                    header_value.to_string().into(),
+                );
+            }
         }
         if transfer_encoding_seen && content_length_seen.is_some() {
             Err(anyhow!(

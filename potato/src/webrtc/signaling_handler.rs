@@ -13,15 +13,23 @@ use crate::WsFrame;
 use anyhow::Result;
 use serde_json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+
+/// Monotonic id handed to every signaling WebSocket connection so peer_ids
+/// can be bound to the connection that registered them.
+static NEXT_SIGNALING_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// WebRTC信令处理器
 pub struct WebRtcSignalingHandler {
     sfu: Arc<WebRTCSFU>,
     /// 维护peer_id到消息发送通道的映射（用于ICE候选转发）
     peer_senders: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
+    /// peer_id -> (connection id, room id)。peer 身份由服务端绑定到建立它的
+    /// 信令连接，其它连接不能冒充、踢人或以任意 peer_id 订阅。
+    conn_bindings: Arc<Mutex<HashMap<String, (u64, String)>>>,
 }
 
 impl WebRtcSignalingHandler {
@@ -29,16 +37,38 @@ impl WebRtcSignalingHandler {
     pub fn new(sfu: Arc<WebRTCSFU>) -> Self {
         let peer_senders = Arc::new(Mutex::new(HashMap::new()));
 
-        // 修复问题1：将peer_senders传递给SFU，使SFU能够转发ICE候选给客户端
-        // 需要通过unsafe或重新设计架构，这里我们使用一个更好的方案：
-        // 在SFU中保存一个弱引用，在信令处理器中保存强引用
-        // 但由于SFU已经创建，我们采用回调方案
-
-        Self { sfu, peer_senders }
+        Self {
+            sfu,
+            peer_senders,
+            conn_bindings: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn ws_path(&self) -> &str {
         &self.sfu.config().ws_path
+    }
+
+    /// 检查 peer 是否属于当前信令连接
+    async fn peer_belongs_to_conn(&self, peer_id: &str, conn_id: u64) -> bool {
+        let bindings = self.conn_bindings.lock().await;
+        bindings
+            .get(peer_id)
+            .map(|(owner, _)| *owner == conn_id)
+            .unwrap_or(false)
+    }
+
+    /// 发送 JSON-RPC 错误响应
+    async fn send_error(
+        ws: &mut Websocket,
+        message: &str,
+        request_id: Option<u64>,
+    ) -> Result<()> {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32000, "message": message },
+            "id": request_id,
+        });
+        ws.send_text(&response.to_string()).await
     }
 
     /// 处理WebSocket升级请求
@@ -65,12 +95,41 @@ impl WebRtcSignalingHandler {
             }
         }
 
-        // 处理WebSocket消息
-        self.handle_ws_messages(&mut ws).await
+        // 处理WebSocket消息。每个连接拿到一个服务端分配的 id，peer_id 的
+        // 注册与操作都校验归属；连接断开时释放全部绑定并清理残留 peer。
+        let conn_id = NEXT_SIGNALING_CONN_ID.fetch_add(1, Ordering::Relaxed);
+
+        // 启动后台空房间清理（幂等）
+        self.sfu.start_room_cleanup_loop();
+
+        let result = self.handle_ws_messages(&mut ws, conn_id).await;
+
+        // 连接已断开：移除该连接注册的所有 peer（关闭 PeerConnection、
+        // 广播离开事件），并释放 peer_id 绑定与消息通道。
+        let owned_peers: Vec<(String, String)> = {
+            let mut bindings = self.conn_bindings.lock().await;
+            let owned: Vec<(String, String)> = bindings
+                .iter()
+                .filter(|(_, (owner, _))| *owner == conn_id)
+                .map(|(peer, (_, room))| (peer.clone(), room.clone()))
+                .collect();
+            bindings.retain(|_, (owner, _)| *owner != conn_id);
+            owned
+        };
+        for (peer_id, room_id) in owned_peers {
+            if let Some(room) = self.sfu.get_room(&room_id).await {
+                let _ = room.broadcast_peer_left(&peer_id).await;
+                let _ = room.remove_peer(&peer_id).await;
+            }
+            let mut senders = self.peer_senders.lock().await;
+            senders.remove(&peer_id);
+        }
+
+        result
     }
 
     /// 处理WebSocket消息循环
-    async fn handle_ws_messages(&self, ws: &mut Websocket) -> Result<()> {
+    async fn handle_ws_messages(&self, ws: &mut Websocket, conn_id: u64) -> Result<()> {
         println!("WebRTC WebSocket连接建立");
 
         // 创建消息通道，用于接收ICE候选等异步消息
@@ -85,7 +144,9 @@ impl WebRtcSignalingHandler {
                 result = ws.recv() => {
                     match result? {
                         WsFrame::Text(text) => {
-                            if let Err(e) = self.handle_signaling_message(ws, &text, &tx).await {
+                            if let Err(e) =
+                                self.handle_signaling_message(ws, &text, &tx, conn_id).await
+                            {
                                 eprintln!("处理信令消息失败: {e}");
                             }
                         }
@@ -112,6 +173,7 @@ impl WebRtcSignalingHandler {
         ws: &mut Websocket,
         text: &str,
         ws_tx: &mpsc::UnboundedSender<String>,
+        conn_id: u64,
     ) -> Result<()> {
         let msg: SignalingMessage = match serde_json::from_str(text) {
             Ok(m) => m,
@@ -126,26 +188,39 @@ impl WebRtcSignalingHandler {
         match msg.method {
             SignalingMethod::JoinRoom => {
                 if let SignalingParams::JoinRoom(params) = msg.params {
-                    self.handle_join_room(ws, params, request_id, ws_tx).await?;
+                    self.handle_join_room(ws, params, request_id, ws_tx, conn_id)
+                        .await?;
                 }
             }
             SignalingMethod::Publish => {
                 if let SignalingParams::Publish(params) = msg.params {
-                    self.handle_publish(ws, params, request_id).await?;
+                    self.handle_publish(ws, params, request_id, conn_id).await?;
                 }
             }
             SignalingMethod::Subscribe => {
                 if let SignalingParams::Subscribe(params) = msg.params {
-                    self.handle_subscribe(ws, params, request_id, ws_tx).await?;
+                    self.handle_subscribe(ws, params, request_id, ws_tx, conn_id)
+                        .await?;
                 }
             }
             SignalingMethod::IceCandidate => {
                 if let SignalingParams::IceCandidate(params) = msg.params {
+                    if !self.peer_belongs_to_conn(&params.peer_id, conn_id).await {
+                        Self::send_error(ws, "peer not registered on this connection", request_id)
+                            .await?;
+                        return Ok(());
+                    }
                     self.handle_ice_candidate(&params).await?;
                 }
             }
             SignalingMethod::LeaveRoom => {
                 if let SignalingParams::LeaveRoom(params) = msg.params {
+                    // 只能移除本连接注册的 peer，防止任意连接踢人
+                    if !self.peer_belongs_to_conn(&params.peer_id, conn_id).await {
+                        Self::send_error(ws, "peer not registered on this connection", request_id)
+                            .await?;
+                        return Ok(());
+                    }
                     println!("Peer {} 离开房间 {}", params.peer_id, params.room_id);
 
                     // 从房间中移除peer（这会关闭PeerConnection并清理资源）
@@ -171,7 +246,11 @@ impl WebRtcSignalingHandler {
                         drop(tracks);
                     }
 
-                    // 清理peer的消息发送通道
+                    // 释放绑定并清理peer的消息发送通道
+                    {
+                        let mut bindings = self.conn_bindings.lock().await;
+                        bindings.remove(&params.peer_id);
+                    }
                     let mut senders = self.peer_senders.lock().await;
                     senders.remove(&params.peer_id);
                 }
@@ -191,7 +270,41 @@ impl WebRtcSignalingHandler {
         params: JoinRoomParams,
         request_id: Option<u64>,
         ws_tx: &mpsc::UnboundedSender<String>,
+        conn_id: u64,
     ) -> Result<()> {
+        // peer_id 被其它存活连接占用时拒绝，防止冒充与踢人；
+        // 同时限制单连接可注册的 peer 数与 peer_id 长度，防内存洪水
+        {
+            const MAX_PEERS_PER_CONN: usize = 8;
+            const MAX_PEER_ID_LEN: usize = 128;
+            let mut bindings = self.conn_bindings.lock().await;
+            if params.peer_id.len() > MAX_PEER_ID_LEN || params.room_id.len() > MAX_PEER_ID_LEN {
+                drop(bindings);
+                Self::send_error(ws, "peer_id/room_id too long", request_id).await?;
+                return Ok(());
+            }
+            let owned_by_this_conn = bindings
+                .values()
+                .filter(|(owner, _)| *owner == conn_id)
+                .count();
+            if owned_by_this_conn >= MAX_PEERS_PER_CONN {
+                drop(bindings);
+                Self::send_error(ws, "too many peers on this connection", request_id).await?;
+                return Ok(());
+            }
+            if let Some((owner, _)) = bindings.get(&params.peer_id) {
+                if *owner != conn_id {
+                    drop(bindings);
+                    Self::send_error(ws, "peer_id already in use", request_id).await?;
+                    return Ok(());
+                }
+            }
+            bindings.insert(
+                params.peer_id.clone(),
+                (conn_id, params.room_id.clone()),
+            );
+        }
+
         println!("Peer {} 加入房间 {}", params.peer_id, params.room_id);
 
         // 注册peer的消息发送通道（用于ICE候选转发和异步消息）
@@ -203,7 +316,13 @@ impl WebRtcSignalingHandler {
 
         // 创建房间（如果不存在）
         if self.sfu.get_room(&params.room_id).await.is_none() {
-            self.sfu.create_room(&params.room_id, None).await?;
+            if let Err(e) = self.sfu.create_room(&params.room_id, None).await {
+                let mut bindings = self.conn_bindings.lock().await;
+                bindings.remove(&params.peer_id);
+                drop(bindings);
+                Self::send_error(ws, &format!("cannot join room: {e}"), request_id).await?;
+                return Ok(());
+            }
         }
 
         // 获取房间信息
@@ -237,7 +356,14 @@ impl WebRtcSignalingHandler {
         ws: &mut Websocket,
         params: PublishParams,
         request_id: Option<u64>,
+        conn_id: u64,
     ) -> Result<()> {
+        // 只允许以本连接注册的 peer 身份推流
+        if !self.peer_belongs_to_conn(&params.peer_id, conn_id).await {
+            Self::send_error(ws, "peer not registered on this connection", request_id).await?;
+            return Ok(());
+        }
+
         println!("Peer {} 开始推流到房间 {}", params.peer_id, params.room_id);
 
         // 处理Offer并生成Answer
@@ -270,7 +396,18 @@ impl WebRtcSignalingHandler {
         params: SubscribeParams,
         request_id: Option<u64>,
         ws_tx: &mpsc::UnboundedSender<String>,
+        conn_id: u64,
     ) -> Result<()> {
+        // 订阅者必须是本连接注册过的 peer，防止匿名订阅任意发布者的流
+        if !self
+            .peer_belongs_to_conn(&params.subscriber_id, conn_id)
+            .await
+        {
+            Self::send_error(ws, "subscriber not registered on this connection", request_id)
+                .await?;
+            return Ok(());
+        }
+
         println!(
             "Peer {} 订阅 {} 的流 (房间: {})",
             params.subscriber_id, params.publisher_id, params.room_id

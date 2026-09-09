@@ -900,11 +900,22 @@ mod tests {
                 ws.send_text("hello world").await?;
                 println!("✅ WebSocket text message sent");
 
-                // 接收响应
-                if let Ok(WsFrame::Text(text)) = ws.recv().await {
-                    println!("✅ WebSocket received text: {}", text);
-                    assert_eq!(text, "hello world");
+                // 接收响应（服务端 Ping/Pong 之后是回显文本；接收失败必须
+                // 硬失败，避免掩盖服务端发送方向的协议回归）
+                let mut got_text = false;
+                for _ in 0..2 {
+                    match ws.recv().await {
+                        Ok(WsFrame::Text(text)) => {
+                            println!("✅ WebSocket received text: {}", text);
+                            assert_eq!(text, "hello world");
+                            got_text = true;
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => panic!("WebSocket recv failed: {e}"),
+                    }
                 }
+                assert!(got_text, "WebSocket echo text not received");
 
                 // 测试二进制数据
                 let test_data = vec![1, 2, 3, 4, 5];
@@ -912,9 +923,13 @@ mod tests {
                 println!("✅ WebSocket binary sent");
 
                 // 接收二进制响应
-                if let Ok(WsFrame::Binary(data)) = ws.recv().await {
-                    println!("✅ WebSocket received binary: {:?}", data);
-                    assert_eq!(data, test_data);
+                match ws.recv().await {
+                    Ok(WsFrame::Binary(data)) => {
+                        println!("✅ WebSocket received binary: {:?}", data);
+                        assert_eq!(data, test_data);
+                    }
+                    Ok(_) => panic!("expected binary echo frame"),
+                    Err(e) => panic!("WebSocket recv failed: {e}"),
                 }
             }
             Err(e) => {

@@ -1455,7 +1455,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                                 Some(match handler {
                                     Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                     Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                                    None => potato::HttpResponse::error(format!("{err:?}")),
+                                    None => potato::HttpResponse::error("Internal Server Error"),
                                 })
                             }
                         };
@@ -1471,7 +1471,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                             match handler {
                                 Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                 Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                                None => potato::HttpResponse::error(format!("{err:?}")),
+                                None => potato::HttpResponse::error("Internal Server Error"),
                             }
                         }
                     },
@@ -1489,7 +1489,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         return match handler {
                             Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                             Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                            None => potato::HttpResponse::error(format!("{err:?}")),
+                            None => potato::HttpResponse::error("Internal Server Error"),
                         };
                     }
                 )*
@@ -1568,7 +1568,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                                 Some(match handler {
                                     Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                     Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                                    None => potato::HttpResponse::error(format!("{err:?}")),
+                                    None => potato::HttpResponse::error("Internal Server Error"),
                                 })
                             }
                         };
@@ -1584,7 +1584,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                             match handler {
                                 Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                 Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                                None => potato::HttpResponse::error(format!("{err:?}")),
+                                None => potato::HttpResponse::error("Internal Server Error"),
                             }
                         }
                     },
@@ -1601,7 +1601,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         return match handler {
                             Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                             Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                            None => potato::HttpResponse::error(format!("{err:?}")),
+                            None => potato::HttpResponse::error("Internal Server Error"),
                         };
                     }
                 )*
@@ -1680,7 +1680,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                                 Some(match handler {
                                     Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                     Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                                    None => potato::HttpResponse::error(format!("{err:?}")),
+                                    None => potato::HttpResponse::error("Internal Server Error"),
                                 })
                             }
                         };
@@ -1696,7 +1696,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                             match handler {
                                 Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                 Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                                None => potato::HttpResponse::error(format!("{err:?}")),
+                                None => potato::HttpResponse::error("Internal Server Error"),
                             }
                         }
                     },
@@ -1714,7 +1714,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         return match handler {
                             Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                             Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                            None => potato::HttpResponse::error(format!("{err:?}")),
+                            None => potato::HttpResponse::error("Internal Server Error"),
                         };
                     }
                 )*
@@ -1793,7 +1793,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                                 Some(match handler {
                                     Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                     Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                                    None => potato::HttpResponse::error(format!("{err:?}")),
+                                    None => potato::HttpResponse::error("Internal Server Error"),
                                 })
                             }
                         };
@@ -1809,7 +1809,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                             match handler {
                                 Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                                 Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                                None => potato::HttpResponse::error(format!("{err:?}")),
+                                None => potato::HttpResponse::error("Internal Server Error"),
                             }
                         }
                     },
@@ -1826,7 +1826,7 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                         return match handler {
                             Some(potato::ErrorHandler::Async(h)) => h(req, err).await,
                             Some(potato::ErrorHandler::Sync(h)) => h(req, err),
-                            None => potato::HttpResponse::error(format!("{err:?}")),
+                            None => potato::HttpResponse::error("Internal Server Error"),
                         };
                     }
                 )*
@@ -2660,7 +2660,11 @@ fn controller_impl_macro(attr: TokenStream, item_impl: syn::ItemImpl) -> TokenSt
                                 Box::pin(async move {
                                     match #resp_handler {
                                         Ok(resp) => resp,
-                                        Err(err) => potato::HttpResponse::error(err.to_string()),
+                                        // 错误链可能包含内部路径/上游信息：详情只进日志，对外返回通用文案
+                                        Err(err) => {
+                                            eprintln!("[potato] handler error: {err}");
+                                            potato::HttpResponse::error("Internal Server Error")
+                                        }
                                     }
                                 })
                             }
@@ -2831,6 +2835,10 @@ pub fn handle_error(attr: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 /// limit_size 属性宏 - 为 handler 设置独立的请求体大小限制
+///
+/// **语义说明**：该检查在 handler 执行前、但请求体已被连接层完整读入内存
+/// 之后执行（事后检查）。若需要读取期限制（超限即断，不缓冲），请使用
+/// `PipeContext::use_limit_size`。
 ///
 /// # 参数
 /// * 单个值: `#[potato::limit_size(1024 * 1024 * 1024)]` - 仅限制 body 为 1GB
@@ -3082,3 +3090,4 @@ mod postprocess_signature_tests {
         );
     }
 }
+

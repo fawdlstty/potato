@@ -20,3 +20,7 @@ jobs:
       run: cargo build --verbose --features full
     - name: Run tests
       run: cargo test --verbose --features full
+    - name: Clippy (full features)
+      run: cargo clippy --features full --all-targets -- -D warnings
+    - name: Check no_std (lite) build
+      run: cargo check -p potato --lib --no-default-features

@@ -76,12 +76,18 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
         let peer_id = self.context.peer_id.clone();
         tokio::spawn(async move {
             let forwarder_key = format!("{peer_id}_rtp");
+            // 最多等待 5 秒；forwarder 被删除（peer 离开）后退出而非永久自旋
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let sender = loop {
                 {
                     let forwarders = room.rtp_forwarders.lock().await;
                     if let Some(sender) = forwarders.get(&forwarder_key) {
                         break sender.clone();
                     }
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("等待 {forwarder_key} 的 RTP 转发器超时，放弃转发");
+                    return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             };
@@ -102,7 +108,12 @@ pub struct WebRTCSFU {
     rooms: Arc<Mutex<HashMap<String, Arc<Room>>>>,
     config: WebRTCConfig,
     peer_senders: SharedPeerSenders,
+    /// 防止重复启动空房间清理任务
+    cleanup_started: std::sync::atomic::AtomicBool,
 }
+
+/// 房间总数上限，防止房间洪水（每个房间都持有锁与结构）
+const MAX_ROOMS: usize = 1024;
 
 impl WebRTCSFU {
     /// 创建SFU实例
@@ -111,7 +122,33 @@ impl WebRTCSFU {
             rooms: Arc::new(Mutex::new(HashMap::new())),
             config,
             peer_senders: Arc::new(tokio::sync::RwLock::new(None)),
+            cleanup_started: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// 启动后台空房间清理任务（幂等，只在首次调用时启动）
+    pub fn start_room_cleanup_loop(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .cleanup_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let rooms = Arc::downgrade(&self.rooms);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(rooms) = rooms.upgrade() else {
+                    return;
+                };
+                if let Err(e) = Self::cleanup_empty_rooms_in(&rooms).await {
+                    eprintln!("清理空房间失败: {e}");
+                }
+            }
+        });
     }
 
     pub fn config(&self) -> &WebRTCConfig {
@@ -135,6 +172,9 @@ impl WebRTCSFU {
         let mut rooms = self.rooms.lock().await;
         if rooms.contains_key(room_id) {
             return Err(anyhow::anyhow!("Room already exists"));
+        }
+        if rooms.len() >= MAX_ROOMS {
+            return Err(anyhow::anyhow!("too many rooms: limit is {MAX_ROOMS}"));
         }
 
         let max = max_peers.unwrap_or(self.config.max_peers);
@@ -187,6 +227,11 @@ impl WebRTCSFU {
             .clone();
         drop(rooms);
 
+        // 重复 publish 视为重协商：先清理旧的 PeerConnection 与 forwarder
+        if room.get_peer(peer_id).await.is_some() {
+            let _ = room.remove_peer(peer_id).await;
+        }
+
         let pc = self
             .build_peer_connection(room.clone(), peer_id, room_id, true)
             .await?;
@@ -197,8 +242,15 @@ impl WebRTCSFU {
 
         let mut peer = Peer::new(peer_id, room_id, pc);
         peer.set_publishing(true);
-        room.add_peer(peer_id, Arc::new(peer)).await?;
-        room.create_rtp_forwarder(peer_id).await?;
+        // add_peer 失败（房间满等）时回收刚建的 PeerConnection
+        if let Err(e) = room.add_peer(peer_id, Arc::new(peer)).await {
+            let _ = room.remove_peer(peer_id).await;
+            return Err(e);
+        }
+        if let Err(e) = room.create_rtp_forwarder(peer_id).await {
+            let _ = room.remove_peer(peer_id).await;
+            return Err(e);
+        }
         Ok(answer.sdp)
     }
 
@@ -209,7 +261,11 @@ impl WebRTCSFU {
 
     /// 移除空房间
     pub async fn cleanup_empty_rooms(&self) -> Result<()> {
-        let mut rooms = self.rooms.lock().await;
+        Self::cleanup_empty_rooms_in(&self.rooms).await
+    }
+
+    async fn cleanup_empty_rooms_in(rooms: &Mutex<HashMap<String, Arc<Room>>>) -> Result<()> {
+        let mut rooms = rooms.lock().await;
         let mut empty_rooms = Vec::new();
         for (room_id, room) in rooms.iter() {
             match room.peers.try_lock() {

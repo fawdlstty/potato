@@ -83,8 +83,11 @@ impl HttpStream {
                         HttpStream::ClientTls(s) => s.read(buf).await?,
                         HttpStream::DuplexStream(s) => s.read(buf).await?,
                         HttpStream::WithPreRead { .. } => {
-                            // 不应该发生，WithPreRead不应该嵌套
-                            0
+                            // 不应该发生，WithPreRead不应该嵌套；
+                            // 返回错误避免被当作 EOF 静默丢数据
+                            return Err(anyhow::Error::msg(
+                                "nested WithPreRead stream is not supported",
+                            ));
                         }
                         HttpStream::RateLimited(s) => Box::pin(s.read(buf)).await?,
                     }
@@ -107,10 +110,34 @@ impl HttpStream {
                 pre_read_data,
             } => {
                 if !pre_read_data.is_empty() {
-                    let len = std::cmp::min(pre_read_data.len(), buf.len());
-                    buf[..len].copy_from_slice(&pre_read_data[..len]);
-                    pre_read_data.drain(..len);
-                    len
+                    // read_exact semantics: keep draining the pre-read buffer
+                    // (then the underlying stream) until buf is full.
+                    let mut filled = std::cmp::min(pre_read_data.len(), buf.len());
+                    buf[..filled].copy_from_slice(&pre_read_data[..filled]);
+                    pre_read_data.drain(..filled);
+                    while filled < buf.len() {
+                        let n = match stream.as_mut() {
+                            HttpStream::Tcp(s) => s.read(&mut buf[filled..]).await?,
+                            #[cfg(feature = "tls")]
+                            HttpStream::ServerTls(s) => s.read(&mut buf[filled..]).await?,
+                            #[cfg(feature = "tls")]
+                            HttpStream::ClientTls(s) => s.read(&mut buf[filled..]).await?,
+                            HttpStream::DuplexStream(s) => s.read(&mut buf[filled..]).await?,
+                            HttpStream::WithPreRead { .. } => {
+                                return Err(anyhow::Error::msg(
+                                    "nested WithPreRead stream is not supported",
+                                ));
+                            }
+                            HttpStream::RateLimited(s) => {
+                                Box::pin(s.read(&mut buf[filled..])).await?
+                            }
+                        };
+                        if n == 0 {
+                            return Err(anyhow::Error::msg("connection closed"));
+                        }
+                        filled += n;
+                    }
+                    buf.len()
                 } else {
                     match stream.as_mut() {
                         HttpStream::Tcp(s) => s.read_exact(buf).await?,
@@ -119,7 +146,11 @@ impl HttpStream {
                         #[cfg(feature = "tls")]
                         HttpStream::ClientTls(s) => s.read_exact(buf).await?,
                         HttpStream::DuplexStream(s) => s.read_exact(buf).await?,
-                        HttpStream::WithPreRead { .. } => 0,
+                        HttpStream::WithPreRead { .. } => {
+                            return Err(anyhow::Error::msg(
+                                "nested WithPreRead stream is not supported",
+                            ));
+                        }
                         HttpStream::RateLimited(s) => {
                             // RateLimitedStream 没有 read_exact，需要自己实现
                             let mut read = 0;
@@ -164,7 +195,7 @@ impl HttpStream {
                 #[cfg(feature = "tls")]
                 HttpStream::ClientTls(s) => s.write_all(buf).await?,
                 HttpStream::DuplexStream(s) => s.write_all(buf).await?,
-                HttpStream::WithPreRead { .. } => {}
+                HttpStream::WithPreRead { .. } => return Err(anyhow::Error::msg("nested WithPreRead stream is not supported")),
                 HttpStream::RateLimited(s) => Box::pin(s.write_all(buf)).await?,
             },
             HttpStream::RateLimited(s) => Box::pin(s.write_all(buf)).await?,
@@ -190,7 +221,7 @@ impl HttpStream {
                 #[cfg(feature = "tls")]
                 HttpStream::ClientTls(s) => write_all_vectored_inner(s, bufs).await?,
                 HttpStream::DuplexStream(s) => write_all_vectored_inner(s, bufs).await?,
-                HttpStream::WithPreRead { .. } => {}
+                HttpStream::WithPreRead { .. } => return Err(anyhow::Error::msg("nested WithPreRead stream is not supported")),
                 HttpStream::RateLimited(s) => {
                     for buf in bufs {
                         s.write_all(buf).await?;
@@ -221,7 +252,7 @@ impl HttpStream {
                 #[cfg(feature = "tls")]
                 HttpStream::ClientTls(s) => write_all_vectored2_inner(s, a, b).await?,
                 HttpStream::DuplexStream(s) => write_all_vectored2_inner(s, a, b).await?,
-                HttpStream::WithPreRead { .. } => {}
+                HttpStream::WithPreRead { .. } => return Err(anyhow::Error::msg("nested WithPreRead stream is not supported")),
                 HttpStream::RateLimited(s) => {
                     s.write_all(a).await?;
                     s.write_all(b).await?;
@@ -639,3 +670,4 @@ mod tests {
         assert_eq!(limiter.reserve(800), 800);
     }
 }
+

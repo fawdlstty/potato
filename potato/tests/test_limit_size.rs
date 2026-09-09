@@ -289,9 +289,9 @@ mod tests {
     fn test_global_config_api() {
         use potato::ServerConfig;
 
-        // 测试默认值
-        let default_body_limit = ServerConfig::get_max_body_bytes();
-        assert_eq!(default_body_limit, 100 * 1024 * 1024); // 100MB
+        // 全局配置是进程级共享状态，测试结束后必须恢复默认值，
+        // 否则并行运行的其它测试会读到被改小的上限。
+        let original = ServerConfig::get_max_body_bytes();
 
         // 测试设置新值
         ServerConfig::set_max_body_bytes(50 * 1024 * 1024);
@@ -300,6 +300,10 @@ mod tests {
         // 测试最小值保护
         ServerConfig::set_max_body_bytes(0);
         assert_eq!(ServerConfig::get_max_body_bytes(), 1);
+
+        // 恢复
+        ServerConfig::set_max_body_bytes(original);
+        assert_eq!(ServerConfig::get_max_body_bytes(), original);
 
         println!("✅ Global config API test passed");
     }

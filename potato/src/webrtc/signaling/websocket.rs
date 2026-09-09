@@ -62,6 +62,8 @@ impl WebSocketSignaling {
         method: crate::webrtc::signaling::SignalingMethod,
         params: SignalingParams,
     ) -> Result<SignalingMessage> {
+        const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
         let id = {
             let mut id_guard = self.request_id.lock().await;
             *id_guard += 1;
@@ -72,8 +74,19 @@ impl WebSocketSignaling {
         self.pending_requests.lock().await.insert(id, response_tx);
 
         let request = SignalingMessage::request(method, params, id);
-        self.send(request).await?;
-        let response = response_rx.await?;
+        let send_result = self.send(request).await;
+        if let Err(e) = send_result {
+            self.pending_requests.lock().await.remove(&id);
+            return Err(e);
+        }
+        // 带超时等待，响应永不到达时清理 pending 条目，避免泄漏
+        let response = match tokio::time::timeout(REQUEST_TIMEOUT, response_rx).await {
+            Ok(result) => result?,
+            Err(_) => {
+                self.pending_requests.lock().await.remove(&id);
+                anyhow::bail!("signaling request {id} timed out");
+            }
+        };
         Ok(response)
     }
 }

@@ -10,6 +10,13 @@ static SERVER_WS_PING_DURATION: LazyLock<RwLock<Duration>> =
 static SERVER_MAX_HEADER_COUNT: AtomicUsize = AtomicUsize::new(48);
 static SERVER_MAX_HEADER_BYTES: AtomicUsize = AtomicUsize::new(16 * 1024);
 static SERVER_MAX_BODY_BYTES: AtomicUsize = AtomicUsize::new(100 * 1024 * 1024); // 100MB default
+static SERVER_MAX_CONNECTIONS: AtomicUsize = AtomicUsize::new(64 * 1024);
+static SERVER_WS_MAX_FRAME_SIZE: AtomicUsize = AtomicUsize::new(16 * 1024 * 1024); // 16MB per frame
+static SERVER_WS_MAX_MESSAGE_SIZE: AtomicUsize = AtomicUsize::new(64 * 1024 * 1024); // 64MB per message
+static SERVER_REQUEST_TIMEOUT: LazyLock<RwLock<Duration>> =
+    LazyLock::new(|| RwLock::new(Duration::from_secs(60)));
+static SERVER_TLS_HANDSHAKE_TIMEOUT: LazyLock<RwLock<Duration>> =
+    LazyLock::new(|| RwLock::new(Duration::from_secs(10)));
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -64,6 +71,46 @@ impl ServerConfig {
     pub fn get_max_body_bytes() -> usize {
         SERVER_MAX_BODY_BYTES.load(Ordering::Relaxed)
     }
+
+    pub fn set_max_connections(limit: usize) {
+        SERVER_MAX_CONNECTIONS.store(limit.max(1), Ordering::Relaxed);
+    }
+
+    pub fn get_max_connections() -> usize {
+        SERVER_MAX_CONNECTIONS.load(Ordering::Relaxed)
+    }
+
+    pub fn set_ws_max_frame_size(limit: usize) {
+        SERVER_WS_MAX_FRAME_SIZE.store(limit.max(1), Ordering::Relaxed);
+    }
+
+    pub fn get_ws_max_frame_size() -> usize {
+        SERVER_WS_MAX_FRAME_SIZE.load(Ordering::Relaxed)
+    }
+
+    pub fn set_ws_max_message_size(limit: usize) {
+        SERVER_WS_MAX_MESSAGE_SIZE.store(limit.max(1), Ordering::Relaxed);
+    }
+
+    pub fn get_ws_max_message_size() -> usize {
+        SERVER_WS_MAX_MESSAGE_SIZE.load(Ordering::Relaxed)
+    }
+
+    pub async fn set_request_timeout(dur: Duration) {
+        *SERVER_REQUEST_TIMEOUT.write().await = dur;
+    }
+
+    pub async fn get_request_timeout() -> Duration {
+        *SERVER_REQUEST_TIMEOUT.read().await
+    }
+
+    pub async fn set_tls_handshake_timeout(dur: Duration) {
+        *SERVER_TLS_HANDSHAKE_TIMEOUT.write().await = dur;
+    }
+
+    pub async fn get_tls_handshake_timeout() -> Duration {
+        *SERVER_TLS_HANDSHAKE_TIMEOUT.read().await
+    }
 }
 
 pub struct ServerAuth;
@@ -88,8 +135,12 @@ impl ServerAuth {
         let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
         let validation = jsonwebtoken::Validation::default();
         let claims = jsonwebtoken::decode::<Claims>(token, &decoding_key, &validation)?.claims;
-        let expired = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(claims.exp);
-        match SystemTime::now() <= expired {
+        // 直接比较秒数，避免极大 exp 触发 SystemTime + Duration 溢出 panic
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match claims.exp > now {
             true => Ok(claims.sub),
             false => Err(anyhow::Error::msg("token expired")),
         }
