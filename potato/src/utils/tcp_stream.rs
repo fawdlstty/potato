@@ -657,14 +657,20 @@ mod tests {
     fn reserve_truncates_to_available_tokens() {
         let mut limiter = RateLimiter::new(8_000);
         assert_eq!(limiter.reserve(1_600), 800);
-        assert_eq!(limiter.reserve(1), 0);
+        // 8 kb/s 下相邻语句间的调度间隔就可能补入令牌（1 bit 仅需 0.125ms），
+        // 断言"再次整笔请求只会拿到远小于请求量的截断值"并预留约 100ms 的
+        // 调度容差，而不是要求恰好为 0。
+        assert!(limiter.reserve(8_000) < 800);
     }
 
     #[tokio::test]
     async fn reserve_refills_without_bulk_admission() {
         let mut limiter = RateLimiter::new(8_000);
         assert_eq!(limiter.reserve(800), 800);
-        assert_eq!(limiter.reserve(1), 0);
+
+        // 同上：排空初始令牌后不允许立即再次整笔放行；按 8 kb/s 计算，仅在
+        // 相邻语句间出现 100ms 以上的调度停顿才会误报，容差约为此前的 800 倍。
+        assert!(limiter.reserve(8_000) < 800);
 
         tokio::time::sleep(Duration::from_millis(125)).await;
         assert_eq!(limiter.reserve(800), 800);

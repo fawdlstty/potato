@@ -21,8 +21,8 @@ features:
     details: Supports OpenAPI description generation and server-side WebDAV protocol capabilities
   - title: Built-in Auth and Processing Pipeline
     details: Includes built-in JWT auth with request pre-processing and response post-processing stages
-  - title: AI Streaming Protocol Support
-    details: Supports OpenAI, Anthropic and etc. streaming protocols with chunked response handling
+  - title: Streaming Support
+    details: Supports SSE streaming responses and chunked response handling
 
 footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---

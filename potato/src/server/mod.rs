@@ -1876,7 +1876,9 @@ impl HttpServer {
     /// Spawn a task on the connection JoinSet without consuming a connection
     /// slot. Used for intermediate phases (TLS handshake wrappers) and
     /// h2/h3 request streams, where the carrying connection is already
-    /// counted and stream counts are bounded separately.
+    /// counted and stream counts are bounded separately. All call sites sit
+    /// behind tls/http2/http3/acme, all of which enable `tls`.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub(crate) fn spawn_connection_untracked<F>(future: F)
     where
         F: Future<Output = ()> + Send + 'static,

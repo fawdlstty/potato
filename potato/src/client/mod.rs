@@ -1,5 +1,4 @@
 #![allow(non_camel_case_types)]
-pub mod agent_session;
 #[cfg(feature = "http2")]
 pub mod http2;
 #[cfg(feature = "http3")]

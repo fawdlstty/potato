@@ -2,186 +2,52 @@
 
 ## 概述
 
-Potato 框架支持使用 SSE（Server-Sent Events）实现流式传输，特别适用于 AI 聊天等需要逐步返回内容的场景。框架提供了对 OpenAI、Anthropic 和 Ollama 三种主流 AI 协议的标准支持。
+Potato 框架支持使用 SSE（Server-Sent Events）实现流式传输，适用于聊天消息、进度推送、实时数据等需要逐步返回内容的场景。通过 `HttpResponse::sse()` 即可快速创建流式响应。
 
-## OpenAI 风格流式传输
-
-### 基本用法
-
-```rust
-#[potato::http_get("/api/v1/chat")]
-async fn openai_chat() -> anyhow::Result<potato::HttpResponse> {
-    let (sender, res) = potato::OpenAISender::new(
-        "chatcmpl-123456",           // 响应 ID
-        "chat.completion.chunk",     // 对象类型
-        "gpt-3.5-turbo",             // 模型名称
-        "assistant",                 // 角色
-        100,                         // 缓冲区大小
-    )
-    .await?;
-    
-    tokio::spawn(async move {
-        async fn openai_chat_inner(sender: potato::OpenAISender) -> anyhow::Result<()> {
-            sender.send("你好！").await?;
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            sender.send("我是 AI 助手。").await?;
-            sender.send_finish("stop").await?;
-            Ok(())
-        }
-        if let Err(e) = openai_chat_inner(sender).await {
-            eprintln!("OpenAI chat error: {e}");
-        }
-    });
-    
-    Ok(res)
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut server = potato::HttpServer::new("127.0.0.1:3000");
-    server.serve_http().await
-}
-```
-
-### 说明
-
-1. **创建 OpenAISender**: 使用 `OpenAISender::new()` 创建发送器和响应对象，参数包括：
-   - `id`: 响应 ID（如 "chatcmpl-123456"）
-   - `object`: 对象类型（通常为 "chat.completion.chunk"）
-   - `model`: 模型名称（如 "gpt-3.5-turbo"）
-   - `role`: 助手角色（通常为 "assistant"）
-   - `buffer_size`: 通道缓冲区大小（如 100）
-
-2. **发送消息**: 使用 `sender.send()` 发送消息片段，每次调用会添加一个内容增量。
-
-3. **结束流式**: 使用 `sender.send_finish(finish_reason)` 结束流，需要提供结束原因（如 "stop"、"length"、"content_filter"）。
-
-4. **响应类型**: Handler 返回 `anyhow::Result<HttpResponse>`，响应会自动配置 SSE 相关的头部。
-
-## Anthropic 风格流式传输
+## 基本 SSE 响应
 
 ### 基本用法
 
 ```rust
 #[potato::http_get("/api/v1/chat")]
-async fn anthropic_chat() -> anyhow::Result<potato::HttpResponse> {
-    let (sender, rx) =
-        potato::AnthropicSender::new("msg_anthropic_123456", "anthropic-3-sonnet-20240229", "assistant", 100).await?;
-    
-    tokio::spawn(async move {
-        async fn anthropic_chat_inner(sender: potato::AnthropicSender) -> anyhow::Result<()> {
-            // 发送内容片段
-            sender.send("你好！").await?;
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            sender.send("我是 Anthropic AI 助手。").await?;
-            // 发送结束事件（包含 content_block_stop, message_delta, message_stop）
-            sender.send_finish().await?;
-            Ok(())
-        }
-        if let Err(e) = anthropic_chat_inner(sender).await {
-            eprintln!("Anthropic chat error: {e}");
-        }
-    });
-    
-    Ok(rx)
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut server = potato::HttpServer::new("127.0.0.1:3000");
-    server.serve_http().await
-}
-```
-
-### 说明
-
-1. **创建 AnthropicSender**: 使用 `AnthropicSender::new()` 创建发送器和响应对象，参数包括：
-   - `id`: 消息 ID（如 "msg_anthropic_123456"）
-   - `model`: 模型名称（如 "anthropic-3-sonnet-20240229"）
-   - `role`: 助手角色（通常为 "assistant"）
-   - `buffer_size`: 通道缓冲区大小（如 100）
-
-2. **发送消息**: 使用 `sender.send()` 发送文本内容块。
-
-3. **结束流式**: 使用 `sender.send_finish()` 结束流，此方法会自动发送：
-   - `content_block_stop`: 表示内容块完成
-   - `message_delta`: 包含停止原因和使用统计
-   - `message_stop`: 表示消息完成
-
-4. **响应类型**: Handler 返回 `anyhow::Result<HttpResponse>`，自动为 Anthropic 协议配置适当的 SSE 头部。
-
-## Ollama 风格流式传输
-
-### 基本用法
-
-```rust
-#[potato::http_get("/api/v1/chat")]
-async fn ollama_chat() -> anyhow::Result<potato::HttpResponse> {
-    let (sender, rx) = potato::OllamaSender::new("llama3", 100).await?;
-    
-    tokio::spawn(async move {
-        async fn ollama_chat_inner(sender: potato::OllamaSender) -> anyhow::Result<()> {
-            // 发送内容片段
-            sender.send("你好！").await?;
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            sender.send("我是 Ollama AI 助手。").await?;
-            // 发送结束事件
-            sender.send_finish().await?;
-            Ok(())
-        }
-        if let Err(e) = ollama_chat_inner(sender).await {
-            eprintln!("Ollama chat error: {e}");
-        }
-    });
-    
-    Ok(rx)
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut server = potato::HttpServer::new("127.0.0.1:3000");
-    server.serve_http().await
-}
-```
-
-### 说明
-
-1. **创建 OllamaSender**: 使用 `OllamaSender::new()` 创建发送器和响应对象，参数包括：
-   - `model`: 模型名称（如 "llama3"、"gemma"、"mistral" 等）
-   - `buffer_size`: 通道缓冲区大小（如 100）
-
-2. **发送消息**: 使用 `sender.send()` 发送文本内容块。
-
-3. **结束流式**: 使用 `sender.send_finish()` 结束流，此方法会自动发送：
-   - `done: true`: 表示生成完成
-   - `done_reason`: 完成原因（如 "stop"）
-
-4. **响应类型**: Handler 返回 `anyhow::Result<HttpResponse>`，自动为 Ollama 协议配置适当的 SSE 头部。
-
-5. **数据格式**: Ollama 使用 NDJSON（newline-delimited JSON）格式，与 OpenAI/Anthropic 的 SSE 格式不同，但 Potato 内部统一使用 SSE 通道传输。
-
-## 通用 SSE 传输
-
-对于不需要 AI 协议的简单 SSE 场景，使用 `HttpResponse::sse()`：
-
-```rust
-#[potato::http_get("/sse")]
-async fn sse_handler() -> anyhow::Result<HttpResponse> {
+async fn sse_chat() -> anyhow::Result<potato::HttpResponse> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
 
     tokio::spawn(async move {
-        for i in 0..10 {
-            let data = format!("消息 {}\n", i).into_bytes();
-            tx.send(data).await.ok();
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        async fn sse_chat_inner(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> anyhow::Result<()> {
+            tx.send("你好！".as_bytes().to_vec()).await?;
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            tx.send("我是流式助手。".as_bytes().to_vec()).await?;
+            Ok(())
+        }
+        if let Err(e) = sse_chat_inner(tx).await {
+            eprintln!("SSE chat error: {e}");
         }
     });
 
-    Ok(HttpResponse::sse(rx))
+    Ok(potato::HttpResponse::sse(rx))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut server = potato::HttpServer::new("127.0.0.1:3000");
+    server.serve_http().await
 }
 ```
 
-对于自定义 SSE 事件，设置适当的头部：
+### 说明
+
+1. **创建通道**: 使用 `tokio::sync::mpsc::channel::<Vec<u8>>(buffer_size)` 创建发送端和接收端，`buffer_size` 为通道缓冲区大小（如 100）。
+
+2. **发送数据**: 在后台任务中通过 `tx.send(data)` 逐块发送字节流，每次发送的内容会作为一个分块推送给客户端。
+
+3. **结束流式**: 后台任务结束（`tx` 被丢弃）后，流式响应自动结束。
+
+4. **响应类型**: Handler 返回 `anyhow::Result<HttpResponse>`，`HttpResponse::sse(rx)` 会自动配置 SSE 相关的头部。
+
+## 自定义 SSE 事件
+
+对于需要自定义 SSE 事件格式的场景，设置适当的头部：
 
 ```rust
 #[potato::http_get("/sse-custom")]
@@ -202,3 +68,17 @@ async fn sse_custom_handler() -> anyhow::Result<HttpResponse> {
     Ok(resp)
 }
 ```
+
+## 客户端消费 SSE
+
+客户端使用 `stream_data()` 逐块读取流式响应：
+
+```rust
+let mut res = potato::get!("http://127.0.0.1:3000/api/v1/chat").await?;
+let mut stream = res.body.stream_data();
+while let Some(chunk) = stream.next().await {
+    print!("{}", String::from_utf8_lossy(&chunk));
+}
+```
+
+完整示例：`examples/client/04_sse_client.rs`

@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.3.29"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -108,6 +108,10 @@ std = [
     "dep:rust-embed",
     "dep:serde",
     "dep:serde_json",
+    # std-only 构建同样编译 full.rs 的 websocket 升级路径（from_websocket
+    # 使用 sha1），故 sha1 随 std 启用；websocket feature 因此只剩 dep:anyhow
+    # 的增量作用
+    "dep:sha1",
     "dep:sha2",
     "dep:smallstr",
     "dep:smallvec",

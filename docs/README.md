@@ -21,8 +21,8 @@ features:
     details: 支持 OpenAPI 描述生成与 WebDAV 服务端协议能力
   - title: 内置认证与处理链路
     details: 内置 JWT 鉴权能力，并支持请求预处理与响应后处理链路
-  - title: AI 流式协议支持
-    details: 支持 OpenAI 与 Anthropic 等流式传输协议与分块响应处理
+  - title: 流式传输支持
+    details: 支持 SSE 流式响应与分块响应处理
 
 footer: CC-BY 4.0 Licensed | Copyright © 2025 potato
 ---
