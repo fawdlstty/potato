@@ -1245,6 +1245,10 @@ impl Websocket {
         self.send_impl(WsFrameImpl::Text(data.as_bytes().to_vec()))
             .await
     }
+
+    pub async fn send_close(&mut self) -> anyhow::Result<()> {
+        self.send_impl(WsFrameImpl::Close).await
+    }
 }
 
 #[derive(Debug)]
