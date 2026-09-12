@@ -24,3 +24,17 @@ jobs:
       run: cargo clippy --features full --all-targets -- -D warnings
     - name: Check no_std (lite) build
       run: cargo check -p potato --lib --no-default-features
+
+  # MSRV 守护档：crate rust-version 的最小语言版本验证（1.88：time ^0.3.55
+  # / jsonwebtoken ^11 的硬性 MSRV 下限）。
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: "1.88"
+    - name: Build (default features)
+      run: cargo build --verbose
+    - name: Run tests (default features)
+      run: cargo test --verbose
