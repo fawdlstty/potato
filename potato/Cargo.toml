@@ -134,6 +134,7 @@ acme = ["std", "tls", "dep:instant-acme", "dep:x509-parser"]
 webrtc = ["std", "dep:webrtc", "dep:rtc", "dep:uuid", "dep:bytes", "tls"]
 full = ["std", "websocket", "openapi", "ssh", "tls", "http2", "http3", "webdav", "acme", "webrtc"]
 
+# cargo clippy --features full --all-targets -- -D warnings
 # cargo publish -p potato-macro --allow-dirty --registry crates-io
 # cargo publish -p potato --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..
