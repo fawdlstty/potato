@@ -624,7 +624,7 @@ impl SessionCache {
         static CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
         // 每100次调用触发一次清理
-        if CALL_COUNTER.fetch_add(1, Ordering::Relaxed) % 100 == 0 {
+        if CALL_COUNTER.fetch_add(1, Ordering::Relaxed).is_multiple_of(100) {
             let now = Instant::now();
             SESSION_CACHE_MANAGER.retain(|_, (_, expires_at)| *expires_at > now);
         }

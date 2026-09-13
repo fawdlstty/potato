@@ -19,6 +19,8 @@ use linkme::distributed_slice;
 // ---------------------------------------------------------------------------
 
 /// HTTP 请求方法
+// 变体名沿用 HTTP 协议惯例全大写（与 http::Method 保持一致），不遵循 Rust 首字母大写缩写规范
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpMethod {
     GET,
