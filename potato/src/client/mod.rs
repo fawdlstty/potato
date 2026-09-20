@@ -407,6 +407,11 @@ impl Session {
         {
             let sess_impl = self.session_impl()?;
             sess_impl.stream.write_all(&req.as_bytes()).await?;
+            // 写完必须 flush：write_all 返回时密文可能仍滞留 tokio-rustls
+            // 内部缓冲（请求超过 socket 发送缓冲 ~64KiB 必现），不 flush 则
+            // 尾部永不发出，服务端按 Content-Length 等不到完整 body 后长挂
+            // （2026-09-16 BYOK 大请求 502 事故根因）。
+            sess_impl.stream.flush().await?;
             loop {
                 if let Some((res, hdr_len)) = HttpResponse::from_headers_part(&buf[..])? {
                     if request_method != HttpMethod::HEAD
@@ -479,6 +484,8 @@ impl Session {
         {
             let sess_impl = self.session_impl()?;
             sess_impl.stream.write_all(&req.as_bytes()).await?;
+            // 同 do_request：写完必须 flush，防止大请求尾部滞留内部缓冲。
+            sess_impl.stream.flush().await?;
             loop {
                 if let Some((res, hdr_len)) = HttpResponse::from_headers_part(&buf[..])? {
                     if request_method != HttpMethod::HEAD
@@ -1304,6 +1311,8 @@ impl TransferSession {
         );
         let request_method = req.method;
         stream.write_all(&req.as_bytes()).await?;
+        // 同 do_request：写完必须 flush，防止大请求尾部滞留内部缓冲。
+        stream.flush().await?;
 
         // 读取响应头，判断是否为流式响应
         let mut buf: Vec<u8> = Vec::with_capacity(4096);

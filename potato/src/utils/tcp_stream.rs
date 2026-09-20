@@ -203,6 +203,27 @@ impl HttpStream {
         Ok(())
     }
 
+    /// flush 必须在 `write_all` 之后由调用方显式执行：tokio-rustls 的
+    /// AsyncWrite 允许 `write_all` 返回时仍有密文滞留内部缓冲（socket 发送
+    /// 缓冲写满后不再前进），尾部数据若不 flush 永不出网——服务端按
+    /// Content-Length 等不到完整请求体，实测 open.bigmodel.cn 对 >~64KiB 的
+    /// 请求长挂 120s 后回 502（WorkRecorder BYOK 分析超时事故根因，2026-09-16）。
+    pub async fn flush(&mut self) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        match self {
+            HttpStream::Tcp(s) => s.flush().await?,
+            #[cfg(feature = "tls")]
+            HttpStream::ServerTls(s) => s.flush().await?,
+            #[cfg(feature = "tls")]
+            HttpStream::ClientTls(s) => s.flush().await?,
+            HttpStream::DuplexStream(s) => s.flush().await?,
+            // WithPreRead / RateLimited 只出现在服务端 / ACME 路径，客户端
+            // 请求发送不经过它们
+            HttpStream::WithPreRead { .. } | HttpStream::RateLimited(_) => {}
+        }
+        Ok(())
+    }
+
     pub async fn write_all_vectored(&mut self, bufs: &[IoSlice<'_>]) -> anyhow::Result<()> {
         if bufs.is_empty() {
             return Ok(());
