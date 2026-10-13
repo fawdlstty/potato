@@ -17,12 +17,13 @@ pub async fn serve_http2_impl(
     cert_file: &str,
     key_file: &str,
     pipe_ctx: Arc<PipeContext>,
+    reuse_port: bool,
 ) -> anyhow::Result<()> {
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
     pipe_ctx.init_jemalloc_if_configured()?;
 
     let addr: SocketAddr = addr.parse()?;
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = super::bind_reuse_listener(addr, reuse_port).await?;
     let acceptor = tls_acceptor_with_alpn(
         cert_file,
         key_file,

@@ -35,6 +35,36 @@ use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKey
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
+/// 绑定监听端口。
+///
+/// `reuse_port == false`（默认）：走 `TcpListener::bind` 平台原生行为
+/// （非 Windows 平台底层已默认设 SO_REUSEADDR，重启时 TIME_WAIT 不阻塞重绑）。
+/// `reuse_port == true`：额外启用 SO_REUSEPORT，支持新旧进程并行监听同一
+/// 地址端口实现平滑重启。SO_REUSEPORT 必须与 SO_REUSEADDR 配套设置：
+/// 前者负责多套接字共存（内核按四元组负载均衡），后者负责 TIME_WAIT 期重绑。
+async fn bind_reuse_listener(addr: SocketAddr, reuse_port: bool) -> anyhow::Result<TcpListener> {
+    if !reuse_port {
+        return Ok(TcpListener::bind(addr).await?);
+    }
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    socket.set_reuseaddr(true)?;
+    // 与 tokio TcpSocket::set_reuseport 的平台门控保持一致；
+    // Windows 下 reuse_port 恒为 false（set_reuseport 入口已拦截），不会走到这里
+    #[cfg(all(
+        unix,
+        not(target_os = "solaris"),
+        not(target_os = "illumos"),
+        not(target_os = "cygwin"),
+        not(target_os = "nuttx"),
+    ))]
+    socket.set_reuseport(true)?;
+    socket.bind(addr)?;
+    Ok(socket.listen(128)?)
+}
+
 /// CORS配置
 #[derive(Debug, Clone)]
 pub struct CorsConfig {
@@ -1843,6 +1873,7 @@ pub struct HttpServer {
     serving: bool,
     shutdown_grace: Duration,
     shutdown_signal: Option<oneshot::Receiver<()>>,
+    reuse_port: bool,
     #[cfg(feature = "acme")]
     acme_manager: Option<crate::acme::AcmeManager>,
     #[cfg(feature = "acme")]
@@ -1922,6 +1953,44 @@ impl HttpServer {
         self.shutdown_grace = grace;
     }
 
+    /// 启用/禁用端口复用（SO_REUSEPORT + SO_REUSEADDR），默认禁用。
+    ///
+    /// 启用后（`enable = true`）：
+    /// - 监听套接字同时设置 SO_REUSEADDR 与 SO_REUSEPORT，支持新旧进程
+    ///   并行监听同一地址端口（内核按四元组哈希负载均衡，Linux 3.9+），
+    ///   用于平滑重启/多实例部署；
+    /// - 内核要求绑定同一地址端口的所有套接字均启用 SO_REUSEPORT 才能共存，
+    ///   因此新旧进程需同时启用本选项；
+    /// - SO_REUSEPORT 总是配套 SO_REUSEADDR：后者负责 TIME_WAIT 期重绑，
+    ///   避免重启后偶发 "Address already in use"。
+    ///
+    /// 平台差异：仅 Unix 平台支持（排除 Solaris/Illumos/Cygwin/NuttX）；
+    /// Windows 无 SO_REUSEPORT 语义，调用启用时直接返回错误。
+    pub fn set_reuseport(&mut self, enable: bool) -> anyhow::Result<()> {
+        if self.serving {
+            anyhow::bail!("server configuration cannot be changed while serving");
+        }
+        if enable && !Self::reuseport_supported() {
+            anyhow::bail!(
+                "set_reuseport is not supported on this platform: \
+                 SO_REUSEPORT does not exist on Windows"
+            );
+        }
+        self.reuse_port = enable;
+        Ok(())
+    }
+
+    /// 与 tokio `TcpSocket::set_reuseport` 的平台门控保持一致
+    const fn reuseport_supported() -> bool {
+        cfg!(all(
+            unix,
+            not(target_os = "solaris"),
+            not(target_os = "illumos"),
+            not(target_os = "cygwin"),
+            not(target_os = "nuttx"),
+        ))
+    }
+
     async fn finish_serve<F>(
         serve: F,
         shutdown_signal: Option<oneshot::Receiver<()>>,
@@ -1951,6 +2020,7 @@ impl HttpServer {
             serving: false,
             shutdown_grace: Duration::from_secs(30),
             shutdown_signal: None,
+            reuse_port: false,
             #[cfg(feature = "acme")]
             acme_manager: None,
             #[cfg(feature = "acme")]
@@ -2032,7 +2102,7 @@ impl HttpServer {
         let addr = self.addr.clone();
         let grace = self.shutdown_grace;
         let result = Self::finish_serve(
-            http2::serve_http2_impl(&addr, cert_file, key_file, pipe_ctx),
+            http2::serve_http2_impl(&addr, cert_file, key_file, pipe_ctx, self.reuse_port),
             shutdown_signal,
             grace,
         )
@@ -2092,7 +2162,8 @@ impl HttpServer {
         opts: crate::acme::AcmeOptions,
     ) -> anyhow::Result<()> {
         let acme_manager = crate::acme::AcmeManager::new(opts).await?;
-        let challenge_listener = TcpListener::bind("0.0.0.0:80").await?;
+        let challenge_listener =
+            bind_reuse_listener(SocketAddr::from(([0, 0, 0, 0], 80)), self.reuse_port).await?;
         self.acme_manager = Some(acme_manager.clone());
         self.acme_challenge_listener = Some(challenge_listener);
 
@@ -2286,7 +2357,7 @@ impl HttpServer {
         Self::start_session_cache_cleanup();
 
         let addr: SocketAddr = self.addr.parse()?;
-        let listener = TcpListener::bind(&addr).await?;
+        let listener = bind_reuse_listener(addr, self.reuse_port).await?;
         let pipe_ctx = Arc::clone(&self.pipe_ctx);
 
         loop {
@@ -2306,7 +2377,7 @@ impl HttpServer {
         self.pipe_ctx.init_jemalloc_if_configured()?;
 
         let addr: SocketAddr = self.addr.parse()?;
-        let listener = TcpListener::bind(&addr).await?;
+        let listener = bind_reuse_listener(addr, self.reuse_port).await?;
         let acceptor = Self::tls_acceptor_with_alpn(cert_file, key_file, None)?;
         let pipe_ctx = Arc::clone(&self.pipe_ctx);
 
@@ -2343,7 +2414,7 @@ impl HttpServer {
         self.pipe_ctx.init_jemalloc_if_configured()?;
 
         let addr: SocketAddr = self.addr.parse()?;
-        let listener = TcpListener::bind(&addr).await?;
+        let listener = bind_reuse_listener(addr, self.reuse_port).await?;
         let challenge_listener = self
             .acme_challenge_listener
             .take()
