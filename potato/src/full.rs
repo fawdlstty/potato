@@ -1008,6 +1008,17 @@ pub struct Websocket {
 }
 
 impl Websocket {
+    /// 克隆一个共享同一底层流的新句柄（服务端读写拆分任务场景）：读端在
+    /// 独立任务里整帧循环 `recv`（不被取消、天然帧对齐安全），写端在另一
+    /// 任务里逐帧 `send_*`；内部 stream 互斥锁按完整帧粒度串行化两个方向
+    /// 的 I/O，TCP 全双工下互不干扰。
+    pub fn clone_handle(&self) -> Self {
+        Self {
+            stream: Arc::clone(&self.stream),
+            is_client: self.is_client,
+        }
+    }
+
     pub async fn connect(url: &str, args: Vec<Headers>) -> anyhow::Result<Self> {
         let mut sess = Session::new();
         let mut req = sess.new_request(HttpMethod::GET, url).await?;
@@ -3025,6 +3036,11 @@ impl HttpResponse {
                 if cmode == CompressMode::Gzip && !suppress_body {
                     ret.extend_from_slice(b"Content-Encoding: gzip\r\n");
                 }
+                // 头部终止空行（v2.28 拍板修复的还原）：101 Switching Protocols
+                // 走本函数序列化（suppress_body 无 Content-Length 行），缺此
+                // 空行即畸形 101，RFC6455 客户端（浏览器/wslite）握手永久
+                // 挂死。与 write_to_stream 的线上形态对齐。
+                ret.extend_from_slice(b"\r\n");
                 ret.extend(payload_ref);
                 ret
             }
