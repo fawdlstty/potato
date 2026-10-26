@@ -53,15 +53,35 @@ enum WebsocketRole {
 // Websocket
 // ---------------------------------------------------------------------------
 
+/// 当前帧的已解析帧头（帧体未到齐期间挂在连接上，跨取消恢复）。
+struct FrameHeader {
+    opcode: u8,
+    payload_len: usize,
+    /// 帧头总字节数（2 + 扩展长度域 + 掩码键）。
+    header_len: usize,
+    mask_key: Option<[u8; 4]>,
+}
+
 /// WebSocket connection backed by a user-provided async socket.
 pub struct Websocket<S, R> {
     socket: S,
     rng: R,
+    /// 内部读缓冲（半帧安全垫）：调用方以 `timeout`/`select!` 掐掉 `recv`
+    /// future 时（尽力排干 / 空闲轮询 / 桥接转发形态），已从 socket 读出的
+    /// 字节留存于此，下次 `recv` 从断点继续——无缓冲直读形态下该竞态会把
+    /// 部分字节永久丢出字节流，后续解析整体错位（表现为好端端的连接被误
+    /// 判帧错误/EOF）。
+    rbuf: Vec<u8>,
+    /// 进行中帧的已解析帧头（见 [`Websocket::recv`] 两阶段解析）：帧头一旦
+    /// 解析落定即挂在此处，帧体补齐前被取消也能从原断点续读。帧完整即复
+    /// 位为 None。仅字节安全垫（rbuf）+ 本字段共同构成完整的取消安全：字节
+    /// 不丢、帧解析进度不丢。
+    frame: Option<FrameHeader>,
 }
 
 impl<S, R> Websocket<S, R> {
     pub const fn from_socket(socket: S, rng: R) -> Self {
-        Self { socket, rng }
+        Self { socket, rng, rbuf: Vec::new(), frame: None }
     }
 
     pub fn into_inner(self) -> S {
@@ -75,8 +95,137 @@ impl<S, R> Websocket<S, R> {
 
 impl<S: WebsocketIo, R: FnMut(&mut [u8])> Websocket<S, R> {
     /// Receives a complete WebSocket message.
+    ///
+    /// 两阶段解析（取消安全）：调用方普遍以 `timeout`/`select!` 包裹本方法
+    /// （尽力排干的 1ms 轮询、桥接转发的 tick 分支等），取消点可能落在帧
+    /// 解析中途。因此帧读取不走「顺序解析遇缺即读」的单遍形态，而是：
+    /// 帧头（2+扩展+掩码键）从 rbuf 纯函数解析并缓存于 `self.frame`；帧体
+    /// 未到齐只做「向 rbuf 补字节」一种 await（字节永不消费）。被取消后
+    /// 重入：帧头缓存仍在、rbuf 字节仍在，从断点继续——绝不从半帧中间重
+    /// 新按帧头解析（那会把帧体字节当帧头读，字节流整体错位）。
     pub async fn recv(&mut self) -> anyhow::Result<WsFrame> {
-        ws_recv_with_role(&mut self.socket, WebsocketRole::Client, &mut self.rng).await
+        let mut accum: Vec<u8> = Vec::new();
+        loop {
+            let (opcode, payload_len, header_len, mask_key) = match self.frame.as_ref() {
+                Some(done) => (
+                    done.opcode,
+                    done.payload_len,
+                    done.header_len,
+                    done.mask_key,
+                ),
+                None => match Self::parse_frame_header(&self.rbuf)? {
+                    Some(done) => {
+                        let tuple = (
+                            done.opcode,
+                            done.payload_len,
+                            done.header_len,
+                            done.mask_key,
+                        );
+                        self.frame = Some(done);
+                        tuple
+                    }
+                    None => {
+                        Self::fill_rbuf(&mut self.socket, &mut self.rbuf).await?;
+                        continue;
+                    }
+                },
+            };
+            if self.rbuf.len() < header_len + payload_len {
+                Self::fill_rbuf(&mut self.socket, &mut self.rbuf).await?;
+                continue;
+            }
+            let mut payload: Vec<u8> =
+                self.rbuf[header_len..header_len + payload_len].to_vec();
+            self.rbuf.drain(..header_len + payload_len);
+            self.frame = None;
+            if let Some(mk) = mask_key {
+                for (i, byte) in payload.iter_mut().enumerate() {
+                    *byte ^= mk[i % 4];
+                }
+            }
+            match opcode {
+                0x8 => return Err(anyhow::anyhow!("WebSocket close frame received")),
+                0x9 => send_client_frame(&mut self.socket, WsFrameImpl::Pong, &mut self.rng).await?,
+                0xA => {}
+                0x2 => {
+                    accum.extend(payload);
+                    return Ok(WsFrame::Binary(accum));
+                }
+                0x1 => {
+                    accum.extend(payload);
+                    let text = String::from_utf8(accum)
+                        .map_err(|_| anyhow::anyhow!("invalid UTF-8 in WebSocket text frame"))?;
+                    return Ok(WsFrame::Text(text));
+                }
+                0x0 => {
+                    accum.extend(payload);
+                    if accum.len() > LITE_WS_MAX_MESSAGE_SIZE {
+                        return Err(anyhow::anyhow!(
+                            "WebSocket message too large: exceeds {LITE_WS_MAX_MESSAGE_SIZE}"
+                        ));
+                    }
+                }
+                _ => return Err(anyhow::anyhow!("unsupported WebSocket opcode: {opcode:#04x}")),
+            }
+        }
+    }
+
+    /// 从 rbuf 纯函数解析帧头（客户端角色：服务器帧不得带掩码位）。
+    /// `Ok(None)` = 字节不足，需补读；帧头不完整绝不消费 rbuf。
+    fn parse_frame_header(rbuf: &[u8]) -> anyhow::Result<Option<FrameHeader>> {
+        if rbuf.len() < 2 {
+            return Ok(None);
+        }
+        let opcode = rbuf[0] & 0b0000_1111;
+        let masked = rbuf[1] & 0b1000_0000 != 0;
+        if masked {
+            // 客户端角色只收服务器帧（不掩码）；方向违例 = 字节流已错位。
+            return Err(anyhow::anyhow!(
+                "WebSocket frame masking violates RFC 6455 direction rules"
+            ));
+        }
+        let len7 = (rbuf[1] & 0b0111_1111) as usize;
+        let ext_len = match len7 {
+            126 => 2usize,
+            127 => 8usize,
+            _ => 0usize,
+        };
+        if rbuf.len() < 2 + ext_len {
+            return Ok(None);
+        }
+        let payload_len = match len7 {
+            126 => u16::from_be_bytes([rbuf[2], rbuf[3]]) as usize,
+            127 => {
+                let declared = u64::from_be_bytes([
+                    rbuf[2], rbuf[3], rbuf[4], rbuf[5], rbuf[6], rbuf[7], rbuf[8], rbuf[9],
+                ]);
+                usize::try_from(declared)
+                    .map_err(|_| anyhow::anyhow!("WebSocket frame length exceeds address space"))?
+            }
+            _ => len7,
+        };
+        if payload_len > LITE_WS_MAX_FRAME_SIZE {
+            return Err(anyhow::anyhow!(
+                "WebSocket frame too large: {payload_len} bytes exceeds {LITE_WS_MAX_FRAME_SIZE}"
+            ));
+        }
+        Ok(Some(FrameHeader {
+            opcode,
+            payload_len,
+            header_len: 2 + ext_len,
+            mask_key: None,
+        }))
+    }
+
+    /// 向 rbuf 补充字节（尽力一块；调用方循环判断够不够）。
+    async fn fill_rbuf(socket: &mut S, rbuf: &mut Vec<u8>) -> anyhow::Result<()> {
+        let mut tmp = [0u8; 8192];
+        let n = socket_read(socket, &mut tmp).await?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("connection closed during read"));
+        }
+        rbuf.extend_from_slice(&tmp[..n]);
+        Ok(())
     }
 
     /// Sends a WebSocket frame.
@@ -332,70 +481,87 @@ pub fn build_ws_upgrade_response(ws_key: &str) -> Vec<u8> {
 const LITE_WS_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 const LITE_WS_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
-async fn recv_impl<S: WebsocketIo>(socket: &mut S, role: &WebsocketRole) -> anyhow::Result<WsFrameImpl> {
-    let mut hdr = [0u8; 2];
-    ws_read_exact(socket, &mut hdr).await?;
-
-    let _fin = hdr[0] & 0b1000_0000 != 0;
-    let opcode = hdr[0] & 0b0000_1111;
-    let masked = hdr[1] & 0b1000_0000 != 0;
-    let mut payload_len: usize = (hdr[1] & 0b0111_1111) as usize;
-
-    // RFC 6455 §5.1: client frames MUST be masked, server frames MUST NOT be
-    if masked == matches!(role, WebsocketRole::Client) {
-        return Err(anyhow::anyhow!(
-            "WebSocket frame masking violates RFC 6455 direction rules"
-        ));
-    }
-
-    match payload_len {
-        126 => {
-            let mut ext = [0u8; 2];
-            ws_read_exact(socket, &mut ext).await?;
-            payload_len = u16::from_be_bytes(ext) as usize;
+async fn recv_impl<S: WebsocketIo>(
+    socket: &mut S,
+    role: &WebsocketRole,
+    rbuf: &mut Vec<u8>,
+) -> anyhow::Result<WsFrameImpl> {
+    // 可恢复两阶段（与 Websocket::recv 同语义）：帧头从 rbuf 纯解析，
+    // 不足/未定一律不消费任何字节，只做「向 rbuf 补字节」一种 await；帧体
+    // 整帧进 rbuf 后才一次性消费解掩码。中途被取消（select 桥接方的竞争
+    // 分支先完成）重入时，从帧头重解析同一批字节从断点续齐——绝不把帧体
+    // 中段当帧头读（那会让字节流整体错位；配持久 rbuf 的调用方依赖此
+    // 语义，单次调用形态 rbuf 即弃、行为不变）。
+    let (opcode, payload_len, header_len, mask_key) = loop {
+        if rbuf.len() < 2 {
+            rbuf_fill(socket, rbuf).await?;
+            continue;
         }
-        127 => {
-            let mut ext = [0u8; 8];
-            ws_read_exact(socket, &mut ext).await?;
-            let declared = u64::from_be_bytes(ext);
-            payload_len = usize::try_from(declared)
-                .map_err(|_| anyhow::anyhow!("WebSocket frame length exceeds address space"))?;
+        let opcode = rbuf[0] & 0b0000_1111;
+        let masked = rbuf[1] & 0b1000_0000 != 0;
+        // RFC 6455 §5.1: client frames MUST be masked, server frames MUST NOT be
+        if masked == matches!(role, WebsocketRole::Client) {
+            return Err(anyhow::anyhow!(
+                "WebSocket frame masking violates RFC 6455 direction rules"
+            ));
         }
-        _ => {}
-    }
-
-    if payload_len > LITE_WS_MAX_FRAME_SIZE {
-        return Err(anyhow::anyhow!(
-            "WebSocket frame too large: {payload_len} bytes exceeds {LITE_WS_MAX_FRAME_SIZE}"
-        ));
-    }
-
-    let mask_key = if masked {
-        let mut mk = [0u8; 4];
-        ws_read_exact(socket, &mut mk).await?;
-        Some(mk)
-    } else {
-        None
+        let len7 = (rbuf[1] & 0b0111_1111) as usize;
+        let ext_len = match len7 {
+            126 => 2usize,
+            127 => 8usize,
+            _ => 0usize,
+        };
+        if rbuf.len() < 2 + ext_len {
+            rbuf_fill(socket, rbuf).await?;
+            continue;
+        }
+        let payload_len = match len7 {
+            126 => u16::from_be_bytes([rbuf[2], rbuf[3]]) as usize,
+            127 => {
+                let declared = u64::from_be_bytes([
+                    rbuf[2], rbuf[3], rbuf[4], rbuf[5], rbuf[6], rbuf[7], rbuf[8], rbuf[9],
+                ]);
+                usize::try_from(declared)
+                    .map_err(|_| anyhow::anyhow!("WebSocket frame length exceeds address space"))?
+            }
+            _ => len7,
+        };
+        if payload_len > LITE_WS_MAX_FRAME_SIZE {
+            return Err(anyhow::anyhow!(
+                "WebSocket frame too large: {payload_len} bytes exceeds {LITE_WS_MAX_FRAME_SIZE}"
+            ));
+        }
+        let mask_key = if masked {
+            if rbuf.len() < 2 + ext_len + 4 {
+                rbuf_fill(socket, rbuf).await?;
+                continue;
+            }
+            Some([
+                rbuf[2 + ext_len],
+                rbuf[3 + ext_len],
+                rbuf[4 + ext_len],
+                rbuf[5 + ext_len],
+            ])
+        } else {
+            None
+        };
+        break (
+            opcode,
+            payload_len,
+            2 + ext_len + if masked { 4 } else { 0 },
+            mask_key,
+        );
     };
-
-    let mut payload = Vec::with_capacity(payload_len);
-    if payload_len > 0 {
-        let mut remaining = payload_len;
-        let mut tmp = [0u8; 256];
-        while remaining > 0 {
-            let chunk = core::cmp::min(remaining, tmp.len());
-            ws_read_exact(socket, &mut tmp[..chunk]).await?;
-            payload.extend_from_slice(&tmp[..chunk]);
-            remaining -= chunk;
-        }
+    while rbuf.len() < header_len + payload_len {
+        rbuf_fill(socket, rbuf).await?;
     }
-
+    let mut payload: Vec<u8> = rbuf[header_len..header_len + payload_len].to_vec();
+    rbuf.drain(..header_len + payload_len);
     if let Some(mk) = mask_key {
         for (i, b) in payload.iter_mut().enumerate() {
             *b ^= mk[i % 4];
         }
     }
-
     match opcode {
         0x0 => Ok(WsFrameImpl::PartData(payload)),
         0x1 => Ok(WsFrameImpl::Text(payload)),
@@ -407,6 +573,17 @@ async fn recv_impl<S: WebsocketIo>(socket: &mut S, role: &WebsocketRole) -> anyh
     }
 }
 
+/// 向 rbuf 补一块字节（尽力一块；调用方循环判断够不够）。连接关闭 = 错。
+async fn rbuf_fill<S: WebsocketIo>(socket: &mut S, rbuf: &mut Vec<u8>) -> anyhow::Result<()> {
+    let mut tmp = [0u8; 8192];
+    let n = socket_read(socket, &mut tmp).await?;
+    if n == 0 {
+        return Err(anyhow::anyhow!("connection closed during read"));
+    }
+    rbuf.extend_from_slice(&tmp[..n]);
+    Ok(())
+}
+
 pub async fn ws_recv<S: WebsocketIo>(socket: &mut S) -> anyhow::Result<WsFrame> {
     ws_recv_with_role(socket, WebsocketRole::Server, &mut no_rng).await
 }
@@ -416,9 +593,30 @@ async fn ws_recv_with_role<S: WebsocketIo, R: FnMut(&mut [u8])>(
     role: WebsocketRole,
     rng: &mut R,
 ) -> anyhow::Result<WsFrame> {
+    // 自由函数形态无跨调用状态：单次调用内缓冲（行为与直读等价）。
+    let mut rbuf = Vec::new();
+    ws_recv_with_role_buffered(socket, role, rng, &mut rbuf).await
+}
+
+/// 带持久读缓冲的帧接收（服务端角色，对端帧 masked，ping 自动回 pong）。
+/// TCP 分段与 WS 帧边界不对齐时，单次读可能带回后续帧的字节——桥接方
+/// 必须跨调用复用同一 rbuf，否则超前读取的字节在调用返回后被丢弃。
+pub async fn ws_recv_buffered<S: WebsocketIo>(
+    socket: &mut S,
+    rbuf: &mut Vec<u8>,
+) -> anyhow::Result<WsFrame> {
+    ws_recv_with_role_buffered(socket, WebsocketRole::Server, &mut no_rng, rbuf).await
+}
+
+async fn ws_recv_with_role_buffered<S: WebsocketIo, R: FnMut(&mut [u8])>(
+    socket: &mut S,
+    role: WebsocketRole,
+    rng: &mut R,
+    rbuf: &mut Vec<u8>,
+) -> anyhow::Result<WsFrame> {
     let mut accum: Vec<u8> = Vec::new();
     loop {
-        match recv_impl(socket, &role).await? {
+        match recv_impl(socket, &role, rbuf).await? {
             WsFrameImpl::Close => return Err(anyhow::anyhow!("WebSocket close frame received")),
             WsFrameImpl::Ping => match role {
                 WebsocketRole::Client => send_client_frame(socket, WsFrameImpl::Pong, rng).await?,

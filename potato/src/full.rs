@@ -1002,6 +1002,10 @@ pub enum CompressMode {
 
 pub struct Websocket {
     stream: Arc<Mutex<HttpStream>>,
+    /// 内部读缓冲（半帧安全垫）：空闲 ping 的 timeout 掐掉 recv future 时，
+    /// 已从内核缓冲读出的帧字节留存于此，下次 recv 从断点继续（见
+    /// `read_exact_buffered`）。仅读向使用；clone 出的写向句柄恒空。
+    rbuf: Vec<u8>,
     /// true when this endpoint dialled out (client role), false for upgraded
     /// server-side connections. Drives RFC 6455 masking direction checks.
     is_client: bool,
@@ -1011,10 +1015,12 @@ impl Websocket {
     /// 克隆一个共享同一底层流的新句柄（服务端读写拆分任务场景）：读端在
     /// 独立任务里整帧循环 `recv`（不被取消、天然帧对齐安全），写端在另一
     /// 任务里逐帧 `send_*`；内部 stream 互斥锁按完整帧粒度串行化两个方向
-    /// 的 I/O，TCP 全双工下互不干扰。
+    /// 的 I/O，TCP 全双工下互不干扰。读缓冲按「clone 后只有读向句柄 recv」
+    /// 的约定拷贝给新句柄（断点续读；写向句柄的拷贝永不消费，无害）。
     pub fn clone_handle(&self) -> Self {
         Self {
             stream: Arc::clone(&self.stream),
+            rbuf: self.rbuf.clone(),
             is_client: self.is_client,
         }
     }
@@ -1047,15 +1053,59 @@ impl Websocket {
         let stream = Arc::new(Mutex::new(stream));
         Ok(Self {
             stream,
+            rbuf: Vec::new(),
             is_client: true,
         })
+    }
+
+    /// 从内部读缓冲取 n 字节（不足时从底层流补读）。帧字节一律先落入
+    /// rbuf 再消费：空闲 ping 的 `timeout(ping_duration, recv_impl())` 掐
+    /// 掉 recv future 时，已从内核缓冲读出的半帧字节安全留在 rbuf（rbuf
+    /// 挂在 self 上，future drop 不丢），下次 recv 从断点继续——无缓冲直读
+    /// 形态下这个竞态会把部分帧永久丢出字节流，后续解析整体错位（表现为
+    /// 好端端的连接被误判帧错误/EOF 而关闭）。
+    async fn read_exact_buffered(
+        rbuf: &mut Vec<u8>,
+        stream: &mut HttpStream,
+        n: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        while rbuf.len() < n {
+            let mut tmp = [0u8; 8192];
+            let nread = stream.read(&mut tmp).await?;
+            if nread == 0 {
+                anyhow::bail!("connection closed while reading websocket frame");
+            }
+            rbuf.extend_from_slice(&tmp[..nread]);
+        }
+        Ok(rbuf.drain(..n).collect())
+    }
+
+    /// 仅向 rbuf 补充字节至 `n`（不消费）：空闲等待阶段专用。超时取消安全
+    /// ——已读字节留存 rbuf，重试即续等（调用方在拿到 `n` 字节前绝不开始
+    /// 帧解析，见 `recv` 两阶段结构）。
+    async fn fill_buffer(
+        rbuf: &mut Vec<u8>,
+        stream: &mut HttpStream,
+        n: usize,
+    ) -> anyhow::Result<()> {
+        while rbuf.len() < n {
+            let mut tmp = [0u8; 8192];
+            let nread = stream.read(&mut tmp).await?;
+            if nread == 0 {
+                anyhow::bail!("connection closed while reading websocket frame");
+            }
+            rbuf.extend_from_slice(&tmp[..nread]);
+        }
+        Ok(())
     }
 
     async fn recv_impl(&mut self) -> anyhow::Result<WsFrameImpl> {
         let mut stream = self.stream.lock().await;
         let buf = {
             let mut buf = [0u8; 2];
-            stream.read_exact(&mut buf).await?;
+            buf.copy_from_slice(
+                &Self::read_exact_buffered(&mut self.rbuf, &mut stream, 2).await?,
+            );
             buf
         };
         //let fin = buf[0] & 0b1000_0000 != 0;
@@ -1064,14 +1114,14 @@ impl Websocket {
             let payload_len = buf[1] & 0b0111_1111;
             match payload_len {
                 126 => {
-                    let mut buf = [0u8; 2];
-                    stream.read_exact(&mut buf).await?;
-                    u16::from_be_bytes(buf) as usize
+                    let ext = Self::read_exact_buffered(&mut self.rbuf, &mut stream, 2).await?;
+                    u16::from_be_bytes([ext[0], ext[1]]) as usize
                 }
                 127 => {
-                    let mut buf = [0u8; 8];
-                    stream.read_exact(&mut buf).await?;
-                    let declared = u64::from_be_bytes(buf);
+                    let ext = Self::read_exact_buffered(&mut self.rbuf, &mut stream, 8).await?;
+                    let declared = u64::from_be_bytes([
+                        ext[0], ext[1], ext[2], ext[3], ext[4], ext[5], ext[6], ext[7],
+                    ]);
                     // Never trust the declared 64-bit length: allocating it
                     // blindly lets a remote peer OOM the process.
                     usize::try_from(declared).map_err(|_| {
@@ -1094,14 +1144,13 @@ impl Websocket {
         }
         let omask_key = match masked {
             true => {
-                let mut mask_key = [0u8; 4];
-                stream.read_exact(&mut mask_key).await?;
-                Some(mask_key)
+                let mk = Self::read_exact_buffered(&mut self.rbuf, &mut stream, 4).await?;
+                Some([mk[0], mk[1], mk[2], mk[3]])
             }
             false => None,
         };
-        let mut payload = vec![0u8; payload_len];
-        stream.read_exact(&mut payload).await?;
+        let mut payload =
+            Self::read_exact_buffered(&mut self.rbuf, &mut stream, payload_len).await?;
         if let Some(mask_key) = omask_key {
             for i in 0..payload.len() {
                 payload[i] ^= mask_key[i % 4];
@@ -1124,69 +1173,89 @@ impl Websocket {
         let max_message = ServerConfig::get_ws_max_message_size();
         loop {
             let timeout = ServerConfig::get_ws_ping_duration().await;
-            match tokio::time::timeout(timeout, self.recv_impl()).await {
-                Ok(ws_frame) => match ws_frame? {
-                    WsFrameImpl::Close => return Err(anyhow::Error::msg("close frame")),
-                    WsFrameImpl::Ping => self.send_impl(WsFrameImpl::Pong).await?,
-                    WsFrameImpl::Pong => {
-                        ping_failures = 0;
+            // 两阶段结构（空闲 ping 超时与帧解析解耦）：空闲 ping 的本意是
+            // 探测「无字节到达」的死链，因此超时只允许覆盖**帧首字节到达
+            // 之前**的等待（阶段一）；帧头一旦进入 rbuf，帧解析（阶段二）
+            // 必须一气呵成——timeout 掐在帧中段会把解析进度连同 future 一
+            // 起丢弃，字节虽经 rbuf 保留，下一次调用却会从当前字节位重新
+            // 按帧头解析，字节流整体错位（表现为好端端的连接被误判
+            // masking violation / unsupported opcode 而关闭；空闲 ping 越
+            // 短〔如 100ms 写延迟上界形态〕命中概率越高，实测复现）。
+            // 阶段一（可取消）：等待帧头 ≥2 字节进入 rbuf；取消即续等，
+            // 已读字节留 rbuf 不丢。
+            let header_ready = {
+                let mut stream = self.stream.lock().await;
+                match tokio::time::timeout(
+                    timeout,
+                    Self::fill_buffer(&mut self.rbuf, &mut stream, 2),
+                )
+                .await
+                {
+                    Ok(Ok(())) => true,
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => false,
+                }
+            };
+            if !header_ready {
+                // 发送 ping 探测连接状态，带超时保护。
+                // 只有收到 Pong 才会清零计数（见下方 Pong 分支）；
+                // 发送成功不代表对端存活，不能重置失败计数。
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.send_impl(WsFrameImpl::Ping),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        ping_failures += 1;
+                        if ping_failures >= 3 {
+                            return Err(anyhow::Error::msg(format!(
+                                "WebSocket ping failed {} times, last error: {}",
+                                ping_failures, e
+                            )));
+                        }
                     }
-                    WsFrameImpl::Binary(data) => {
-                        tmp.extend(data);
-                        if tmp.len() > max_message {
-                            anyhow::bail!(
-                                "WebSocket message too large: exceeds {max_message} bytes"
-                            );
-                        }
-                        return Ok(WsFrame::Binary(tmp));
-                    }
-                    WsFrameImpl::Text(data) => {
-                        tmp.extend(data);
-                        if tmp.len() > max_message {
-                            anyhow::bail!(
-                                "WebSocket message too large: exceeds {max_message} bytes"
-                            );
-                        }
-                        let ret_str = String::from_utf8(tmp).unwrap_or("".to_string());
-                        return Ok(WsFrame::Text(ret_str));
-                    }
-                    WsFrameImpl::PartData(data) => {
-                        tmp.extend(data);
-                        if tmp.len() > max_message {
-                            anyhow::bail!(
-                                "WebSocket message too large: exceeds {max_message} bytes"
-                            );
+                    Err(_) => {
+                        ping_failures += 1;
+                        if ping_failures >= 3 {
+                            return Err(anyhow::Error::msg(
+                                "WebSocket ping timed out 3 times, connection appears dead",
+                            ));
                         }
                     }
-                },
-                Err(_) => {
-                    // 发送 ping 探测连接状态，带超时保护。
-                    // 只有收到 Pong 才会清零计数（见上方 Pong 分支）；
-                    // 发送成功不代表对端存活，不能重置失败计数。
-                    match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        self.send_impl(WsFrameImpl::Ping),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            ping_failures += 1;
-                            if ping_failures >= 3 {
-                                return Err(anyhow::Error::msg(format!(
-                                    "WebSocket ping failed {} times, last error: {}",
-                                    ping_failures, e
-                                )));
-                            }
-                        }
-                        Err(_) => {
-                            ping_failures += 1;
-                            if ping_failures >= 3 {
-                                return Err(anyhow::Error::msg(
-                                    "WebSocket ping timed out 3 times, connection appears dead",
-                                ));
-                            }
-                        }
+                }
+                continue;
+            }
+            // 阶段二（不可被空闲计时器打断）：帧头已在 rbuf，完整解析该帧。
+            // 对端既有能力发出帧头即有能力发完帧（TCP 保证或错）；真死链
+            // 由下一轮空闲间隙的 ping 失败计数兜底。调用方若在此前 drop 整
+            // 个 recv future（连接关闭语义）则无所谓进度。
+            match self.recv_impl().await? {
+                WsFrameImpl::Close => return Err(anyhow::Error::msg("close frame")),
+                WsFrameImpl::Ping => self.send_impl(WsFrameImpl::Pong).await?,
+                WsFrameImpl::Pong => {
+                    ping_failures = 0;
+                }
+                WsFrameImpl::Binary(data) => {
+                    tmp.extend(data);
+                    if tmp.len() > max_message {
+                        anyhow::bail!("WebSocket message too large: exceeds {max_message} bytes");
+                    }
+                    return Ok(WsFrame::Binary(tmp));
+                }
+                WsFrameImpl::Text(data) => {
+                    tmp.extend(data);
+                    if tmp.len() > max_message {
+                        anyhow::bail!("WebSocket message too large: exceeds {max_message} bytes");
+                    }
+                    let ret_str = String::from_utf8(tmp).unwrap_or("".to_string());
+                    return Ok(WsFrame::Text(ret_str));
+                }
+                WsFrameImpl::PartData(data) => {
+                    tmp.extend(data);
+                    if tmp.len() > max_message {
+                        anyhow::bail!("WebSocket message too large: exceeds {max_message} bytes");
                     }
                 }
             }
@@ -1889,6 +1958,7 @@ impl HttpRequest {
         }
         Ok(Websocket {
             stream,
+            rbuf: Vec::new(),
             is_client: false,
         })
     }
