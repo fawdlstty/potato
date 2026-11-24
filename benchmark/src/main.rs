@@ -29,23 +29,25 @@ async fn serve_ntex(addr: SocketAddr) -> std::io::Result<()> {
     .await
 }
 
-fn response_is_hello(buf: &[u8]) -> bool {
+fn response_body_matches(buf: &[u8], expected_body: &str) -> bool {
     let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
     };
-    let body_len = buf.len() - end - 4;
-    body_len == HELLO.len() && buf[buf.len() - HELLO.len()..] == *HELLO.as_bytes()
+    let body = &buf[end + 4..];
+    body == expected_body.as_bytes()
 }
 
 async fn bench_connection(
     addr: SocketAddr,
     requests: u64,
+    path: String,
+    expected_body: String,
     barrier: std::sync::Arc<Barrier>,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
-    let request = format!("GET /hello HTTP/1.1\r\nHost: {addr}\r\nConnection: keep-alive\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: keep-alive\r\n\r\n");
     let mut buf = Vec::with_capacity(16 * 1024);
     barrier.wait().await;
 
@@ -58,7 +60,7 @@ async fn bench_connection(
                 anyhow::bail!("connection closed");
             }
             buf.extend_from_slice(&chunk[..n]);
-            if response_is_hello(&buf) {
+            if response_body_matches(&buf, &expected_body) {
                 counter.fetch_add(1, Ordering::Relaxed);
                 buf.clear();
                 break;
@@ -68,15 +70,30 @@ async fn bench_connection(
     Ok(())
 }
 
-async fn run_bench(addr: SocketAddr, connections: usize, requests: u64) -> anyhow::Result<()> {
+async fn run_bench(
+    addr: SocketAddr,
+    connections: usize,
+    requests: u64,
+    path: String,
+    expected_body: String,
+) -> anyhow::Result<()> {
     let total_requests = connections as u64 * requests;
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let barrier = std::sync::Arc::new(Barrier::new(connections + 1));
     let mut tasks = tokio::task::JoinSet::new();
 
     for _ in 0..connections {
-        let (addr, requests, barrier, counter) = (addr, requests, barrier.clone(), counter.clone());
-        tasks.spawn(bench_connection(addr, requests, barrier, counter));
+        let (addr, requests, path, expected_body, barrier, counter) = (
+            addr,
+            requests,
+            path.clone(),
+            expected_body.clone(),
+            barrier.clone(),
+            counter.clone(),
+        );
+        tasks.spawn(bench_connection(
+            addr, requests, path, expected_body, barrier, counter,
+        ));
     }
 
     let started = Instant::now();
@@ -106,14 +123,21 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".into());
 
-    let (addr, framework, connections, requests) = match command.as_str() {
+    let (addr, framework, connections, requests, path, expected_body) = match command.as_str() {
         "serve" => {
             let framework = args.next().unwrap_or_default();
             let port = args
                 .next()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(18080_u16);
-            (SocketAddr::from(([127, 0, 0, 1], port)), framework, 0, 0)
+            (
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                framework,
+                0,
+                0,
+                String::new(),
+                String::new(),
+            )
         }
         "bench" => {
             let port = args
@@ -125,11 +149,15 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(128_usize);
             let requests = args.next().and_then(|v| v.parse().ok()).unwrap_or(5000);
+            let path = args.next().unwrap_or_else(|| "/hello".into());
+            let expected_body = args.next().unwrap_or_else(|| HELLO.into());
             (
                 SocketAddr::from(([127, 0, 0, 1], port)),
                 "ignored".to_string(),
                 connections,
                 requests,
+                path,
+                expected_body,
             )
         }
         _ => (
@@ -137,6 +165,8 @@ fn main() -> anyhow::Result<()> {
             String::new(),
             0,
             0,
+            String::new(),
+            String::new(),
         ),
     };
 
@@ -150,11 +180,15 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     match command.as_str() {
         "serve" => runtime.block_on(serve_potato(addr)),
-        "bench" => runtime.block_on(run_bench(addr, connections, requests)),
+        "bench" => {
+            runtime.block_on(run_bench(addr, connections, requests, path, expected_body))
+        }
         _ => {
             eprintln!("Usage:");
             eprintln!("  worker serve <potato|ntex> [port]");
-            eprintln!("  worker bench ignored [connections] [requests-per-connection]");
+            eprintln!(
+                "  worker bench [port] [connections] [requests-per-connection] [path] [expected-body]"
+            );
             Ok(())
         }
     }
