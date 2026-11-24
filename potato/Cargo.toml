@@ -135,7 +135,9 @@ webrtc = ["std", "dep:webrtc", "dep:rtc", "dep:uuid", "dep:bytes", "tls"]
 full = ["std", "websocket", "openapi", "ssh", "tls", "http2", "http3", "webdav", "acme", "webrtc"]
 
 # cargo test --features full
-# cargo clippy --features full --all-targets -- -D warnings
+# cargo +nightly clippy --features full --all-targets -- -D warnings
+# （clippy 一条须用 nightly：CI ubuntu-latest 的 stable clippy 总比本地新，
+#  新 lint 只有 nightly 能提前暴露；linux 独有路径需在 WSL/真 linux 验证）
 # cargo publish -p potato-macro --allow-dirty --registry crates-io
 # cargo publish -p potato --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..
