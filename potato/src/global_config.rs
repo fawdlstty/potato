@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -13,8 +13,7 @@ static SERVER_MAX_BODY_BYTES: AtomicUsize = AtomicUsize::new(100 * 1024 * 1024);
 static SERVER_MAX_CONNECTIONS: AtomicUsize = AtomicUsize::new(64 * 1024);
 static SERVER_WS_MAX_FRAME_SIZE: AtomicUsize = AtomicUsize::new(16 * 1024 * 1024); // 16MB per frame
 static SERVER_WS_MAX_MESSAGE_SIZE: AtomicUsize = AtomicUsize::new(64 * 1024 * 1024); // 64MB per message
-static SERVER_REQUEST_TIMEOUT: LazyLock<RwLock<Duration>> =
-    LazyLock::new(|| RwLock::new(Duration::from_secs(60)));
+static SERVER_REQUEST_TIMEOUT_NANOS: AtomicU64 = AtomicU64::new(60 * 1_000_000_000);
 static SERVER_TLS_HANDSHAKE_TIMEOUT: LazyLock<RwLock<Duration>> =
     LazyLock::new(|| RwLock::new(Duration::from_secs(10)));
 
@@ -97,11 +96,13 @@ impl ServerConfig {
     }
 
     pub async fn set_request_timeout(dur: Duration) {
-        *SERVER_REQUEST_TIMEOUT.write().await = dur;
+        // 存纳秒原子量：请求热路径每请求读取，避免异步锁开销
+        //（u64 纳秒上限约 584 年，Duration 截断风险可忽略）
+        SERVER_REQUEST_TIMEOUT_NANOS.store(dur.as_nanos() as u64, Ordering::Relaxed);
     }
 
     pub async fn get_request_timeout() -> Duration {
-        *SERVER_REQUEST_TIMEOUT.read().await
+        Duration::from_nanos(SERVER_REQUEST_TIMEOUT_NANOS.load(Ordering::Relaxed))
     }
 
     pub async fn set_tls_handshake_timeout(dur: Duration) {

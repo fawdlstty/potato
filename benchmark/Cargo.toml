@@ -4,8 +4,19 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# 独立构建：不带 [workspace] 表会被上层 repo workspace 收编，导致
+# CARGO_PROFILE_* 环境变量与缓存布局跟独立压测流程不一致
+[workspace]
+
 [dependencies]
+actix-web = "4"
 anyhow = "1.0.104"
+axum = "0.8"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1"] }
+may = "0.3.46"
+may_minihttp = "0.1"
 ntex = { version = "2.18.0", features = ["tokio"] }
 potato = { path = "../potato" }
 tokio = { version = "1.53.1", features = ["full"] }

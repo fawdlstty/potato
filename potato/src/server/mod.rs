@@ -9,7 +9,8 @@ use crate::utils::refstr::HeaderItem;
 use crate::utils::tcp_stream::HttpStream;
 use crate::CompressMode;
 use crate::{
-    HttpHandler, HttpMethod, HttpRequest, HttpRequestTargetForm, HttpResponse, PreflightResult,
+    HttpHandler, HttpMethod, HttpRequest, HttpRequestTargetForm, HttpResponse, HttpResponseBody,
+    PreflightResult,
 };
 use crate::{RequestHandlerFlag, TransferSession};
 use rustc_hash::FxHashMap;
@@ -17,7 +18,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::future::Future;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{IoSlice, Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -34,6 +35,131 @@ use tokio_rustls::rustls;
 use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
+
+// ===================== writev 合并机制（响应批量写出） =====================
+//
+// 动机：HTTP/1.1 keep-alive 连接上流水线请求（一次 read 吐出多个完整请求）
+// 此前按「解析→处理→逐响应 writev」推进，每响应一次系统调用。内核网络栈
+// 是主要瓶颈时，把同一连接上连续就绪的多个响应攒成IoSlice 队列、单次
+// writev 打包写出，可显著降低 syscall 次数提升 QPS。
+//
+// 写序安全红线（全部满足才正确）：
+// 1. 任何可能阻塞的 socket 读、或解析路径内的插写（100-Continue）之前，
+//    必须先 flush 待发响应——否则响应滞留至死锁或写序错乱。
+//    连接循环在每轮解析前用 [`buf_holds_complete_request`] 探测：
+//    buf 不含完整请求（下一轮解析可能阻塞/插写）即冲刷。
+// 2. Stream 体（chunked 流式）与超大 Data 体不入队，冲刷后直写兜底，
+//    保留 write_to_stream 的零拷贝写路径。
+// 3. 队列 FIFO，响应顺序与 HTTP 语义一致。
+
+/// 单响应载荷入队上限：超过则放弃合并直写（避免大块 memcpy 与队头延迟）
+const BATCH_MAX_PAYLOAD: usize = 16 * 1024;
+/// 批量总字节阈值：达到即冲刷
+const BATCH_MAX_BYTES: usize = 32 * 1024;
+/// 分片数上限：低于 writev 的 IOV_MAX（Linux 1024），留裕量
+const BATCH_MAX_PIECES: usize = 510;
+
+/// 同连接响应合并写出器。`pieces` 持有每个响应的完整序列化字节
+/// （头块+body，[`HttpResponse::as_bytes`] 产物），flush 时拼成
+/// IoSlice 数组走单次 `writev`。
+struct ResponseBatcher {
+    pieces: Vec<Vec<u8>>,
+    pending_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueOutcome {
+    /// 已入队（稍后随批写出）
+    Queued,
+    /// 不适合入队：调用方需先 `flush` 再走 `write_to_stream` 直写
+    Direct,
+}
+
+impl ResponseBatcher {
+    fn new() -> Self {
+        Self {
+            pieces: Vec::with_capacity(64),
+            pending_bytes: 0,
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pieces.is_empty()
+    }
+
+    fn should_flush(&self) -> bool {
+        self.pending_bytes >= BATCH_MAX_BYTES || self.pieces.len() >= BATCH_MAX_PIECES
+    }
+
+    /// 尝试把响应入队。仅接受小尺寸 Data 体响应；Stream 体与超限载荷
+    /// 返回 [`QueueOutcome::Direct`]（保留零拷贝直写路径）。
+    fn queue_response(
+        &mut self,
+        res: &HttpResponse,
+        cmode: CompressMode,
+        method: Option<HttpMethod>,
+    ) -> QueueOutcome {
+        let payload_len = match &res.body {
+            HttpResponseBody::Data(data) => data.len(),
+            HttpResponseBody::Stream(_) => return QueueOutcome::Direct,
+        };
+        if payload_len > BATCH_MAX_PAYLOAD {
+            return QueueOutcome::Direct;
+        }
+        let bytes = res.as_bytes(cmode, method);
+        self.pending_bytes += bytes.len();
+        self.pieces.push(bytes);
+        QueueOutcome::Queued
+    }
+
+    /// 把攒下的所有响应切片经一次（或多次部分写续传）writev 写出。
+    async fn flush(&mut self, stream: &mut HttpStream) -> anyhow::Result<()> {
+        if self.pieces.is_empty() {
+            return Ok(());
+        }
+        let slices: Vec<IoSlice<'_>> = self.pieces.iter().map(Vec::as_slice).map(IoSlice::new).collect();
+        stream.write_all_vectored(&slices).await?;
+        self.pieces.clear();
+        self.pending_bytes = 0;
+        Ok(())
+    }
+}
+
+/// 探测 buf 中是否已缓冲一个完整请求（头解析完成、非 chunked/非 Expect、
+/// body 按 Content-Length 已齐）。用于 flush 决策：返回 false 意味着下一轮
+/// 解析可能阻塞在 socket 读上（或触发 100-Continue 插写），必须先冲刷
+/// 待发响应。仅做 httparse 头解析与原始头扫描，不做 HttpRequest 转换，
+/// 头解析错误一律按 false 处理（真解析稍后产生错误响应，顺序安全）。
+fn buf_holds_complete_request(buf: &[u8]) -> bool {
+    if buf.is_empty() {
+        return false;
+    }
+    let mut headers = [httparse::EMPTY_HEADER; 48];
+    let mut req = httparse::Request::new(&mut headers);
+    let hdr_len = match httparse::ParserConfig::default().parse_request(&mut req, buf) {
+        Ok(httparse::Status::Complete(n)) => n,
+        _ => return false,
+    };
+    let mut content_length = 0usize;
+    for h in req.headers.iter() {
+        if h.name.is_empty() {
+            break;
+        }
+        // chunked body 长度未知、Expect 会触发插写：一律视为不完整
+        if h.name.eq_ignore_ascii_case("Transfer-Encoding")
+            || h.name.eq_ignore_ascii_case("Expect")
+        {
+            return false;
+        }
+        if h.name.eq_ignore_ascii_case("Content-Length") {
+            match std::str::from_utf8(h.value).ok().and_then(|v| v.trim().parse().ok()) {
+                Some(v) => content_length = v,
+                None => return false,
+            }
+        }
+    }
+    hdr_len.checked_add(content_length).is_some_and(|n| n <= buf.len())
+}
 
 /// 绑定监听端口。
 ///
@@ -2223,59 +2349,76 @@ impl HttpServer {
         Self::spawn_connection(async move {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
             let mut req = HttpRequest::new();
+            // writev 合并：待发响应批量队列
+            let mut batch = ResponseBatcher::new();
             loop {
+                // 写序安全闸门：有待发响应且 buf 不足以完整解析下一请求时，
+                // 下一步解析可能阻塞在 socket 读（或触发 100-Continue 插写），
+                // 必须先冲刷；buf 已含完整请求则跳过，把本批响应留给
+                // 后续响应合并成单次 writev
+                if batch.has_pending()
+                    && !buf_holds_complete_request(&buf)
+                    && batch.flush(&mut stream).await.is_err()
+                {
+                    break;
+                }
                 // Cap the whole per-request read phase (headers + body). This
                 // bounds idle keep-alive connections and defeats Slowloris
                 // style slow reads; WebSocket upgrades switch protocols before
                 // the next iteration and are not affected.
                 let request_timeout = crate::global_config::ServerConfig::get_request_timeout().await;
-                let n = {
-                    match tokio::time::timeout(
-                        request_timeout,
-                        HttpRequest::from_stream_with_limits_into(
-                            &mut buf,
-                            &mut stream,
-                            request_limits.map(|(header, _)| header),
-                            request_limits.map(|(_, body)| body),
-                            &mut req,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(n)) => n,
-                        Ok(Err(err)) => {
-                            let err_msg = err.to_string();
-                            eprintln!("[potato] request parse error: {err_msg}");
-                            let mut res = if err_msg.contains("request body too large") {
-                                let mut res = HttpResponse::text("Payload Too Large");
-                                res.http_code = 413;
-                                res
-                            } else if err_msg.contains("Expect header") {
-                                let mut res = HttpResponse::html("Expectation Failed");
-                                res.http_code = 417;
-                                res
-                            } else if err_msg.contains("unsupported Transfer-Encoding") {
-                                let mut res = HttpResponse::html("Unsupported Transfer-Encoding");
-                                res.http_code = 501;
-                                res
-                            } else {
-                                HttpResponse::bad_request("Bad Request")
-                            };
-                            res.add_header("Connection".into(), "close".into());
-                            let _ = res
-                                .write_to_stream(&mut stream, CompressMode::None, None)
-                                .await;
-                            break;
-                        }
-                        // Timed out waiting for a complete request: close the
-                        // connection without a response.
-                        Err(_elapsed) => break,
+                let read = HttpRequest::from_stream_with_limits_into(
+                    &mut buf,
+                    &mut stream,
+                    request_limits.map(|(header, _)| header),
+                    request_limits.map(|(_, body)| body),
+                    &mut req,
+                );
+                // Err(None) = 超时；Err(Some(msg)) = 解析错误
+                let outcome = match tokio::time::timeout(request_timeout, read).await {
+                    Ok(Ok(n)) => Ok(n),
+                    Ok(Err(err)) => Err(Some(err.to_string())),
+                    Err(_elapsed) => Err(None),
+                };
+                let n = match outcome {
+                    Ok(n) => n,
+                    Err(Some(err_msg)) => {
+                        eprintln!("[potato] request parse error: {err_msg}");
+                        let mut res = if err_msg.contains("request body too large") {
+                            let mut res = HttpResponse::text("Payload Too Large");
+                            res.http_code = 413;
+                            res
+                        } else if err_msg.contains("Expect header") {
+                            let mut res = HttpResponse::html("Expectation Failed");
+                            res.http_code = 417;
+                            res
+                        } else if err_msg.contains("unsupported Transfer-Encoding") {
+                            let mut res = HttpResponse::html("Unsupported Transfer-Encoding");
+                            res.http_code = 501;
+                            res
+                        } else {
+                            HttpResponse::bad_request("Bad Request")
+                        };
+                        res.add_header("Connection".into(), "close".into());
+                        // 先冲刷此前积压的正常响应，再补错误响应，保住写序
+                        let _ = batch.flush(&mut stream).await;
+                        let _ = res
+                            .write_to_stream(&mut stream, CompressMode::None, None)
+                            .await;
+                        break;
                     }
+                    // Timed out waiting for a complete request: close the
+                    // connection without a response.
+                    Err(None) => break,
                 };
                 req.client_addr = Some(client_addr);
                 let cmode = req.get_header_accept_encoding();
                 let conn = req.get_header_connection();
                 if conn == HttpConnection::Upgrade && req.is_websocket() {
+                    // 升级握手续接同一 socket：先冲刷此前积压的响应，保写序
+                    if batch.flush(&mut stream).await.is_err() {
+                        break;
+                    }
                     let stream = Arc::new(Mutex::new(stream));
                     req.stream = Some(Arc::clone(&stream));
                     let mut res = PipeContext::handle_request(pipe_ctx.as_ref(), &mut req, 0).await;
@@ -2303,22 +2446,60 @@ impl HttpServer {
                 if conn != HttpConnection::KeepAlive {
                     res.add_header("Connection".into(), "close".into());
                 }
-                let write_res = res
-                    .write_to_stream(&mut stream, cmode, Some(req.method))
-                    .await;
-                match write_res {
-                    Ok(()) => {
-                        if n > 0 {
-                            let remain = buf.len().saturating_sub(n);
-                            if remain > 0 {
-                                buf.copy_within(n.., 0);
+                // writev 合并（流水线感知直写快路径）：
+                // 批空且 buf 已被当前请求耗尽（buf.len()==n，纯字节比较零解析
+                // 成本，depth=1 常态）→ 响应直写，退化为独立读写：
+                // write_to_stream 走栈上头块+头体两段零拷贝 writev，省掉
+                // as_bytes 堆分配+头体 memcpy、Vec<IoSlice> 分配和批处理
+                // 往返；否则照旧入队攒批，冲刷交给 should_flush / 循环头守卫 /
+                // 关闭路径（流水线批次仍单 writev 合并打包含末尾响应，不拆批）。
+                // 写序安全：批空直写不可能乱序；入队后的冲刷时机由循环头守卫
+                // 兜底（buf 不含完整请求时解析可能阻塞或触发 100-Continue
+                // 插写，守卫会先冲刷）。
+                let direct_write = !batch.has_pending()
+                    && n == buf.len()
+                    && matches!(&res.body, HttpResponseBody::Data(d) if d.len() <= BATCH_MAX_PAYLOAD);
+                if direct_write {
+                    if res
+                        .write_to_stream(&mut stream, cmode, Some(req.method))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                } else {
+                    match batch.queue_response(&res, cmode, Some(req.method)) {
+                        QueueOutcome::Queued => {
+                            if batch.should_flush() && batch.flush(&mut stream).await.is_err() {
+                                break;
                             }
-                            buf.truncate(remain);
+                        }
+                        QueueOutcome::Direct => {
+                            if batch.flush(&mut stream).await.is_err() {
+                                break;
+                            }
+                            if res
+                                .write_to_stream(&mut stream, cmode, Some(req.method))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
-                    Err(_) => break,
+                }
+                if n > 0 {
+                    let remain = buf.len().saturating_sub(n);
+                    if remain > 0 {
+                        buf.copy_within(n.., 0);
+                    }
+                    buf.truncate(remain);
                 }
                 if conn != HttpConnection::KeepAlive {
+                    // 连接关闭前冲刷最后的待发响应
+                    if batch.flush(&mut stream).await.is_err() {
+                        break;
+                    }
                     break;
                 }
             }

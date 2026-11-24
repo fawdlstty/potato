@@ -994,7 +994,7 @@ pub enum HttpRequestTargetForm {
     Asterisk,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CompressMode {
     None,
     Gzip,
@@ -1954,7 +1954,9 @@ impl HttpRequest {
         {
             let mut stream = stream.lock().await;
             let res = HttpResponse::from_websocket(&ws_key);
-            stream.write_all(&res.as_bytes(CompressMode::None)).await?;
+            stream
+                .write_all(&res.as_bytes(CompressMode::None, None))
+                .await?;
         }
         Ok(Websocket {
             stream,
@@ -3050,10 +3052,13 @@ impl HttpResponse {
         Ok((body, trailers, cursor - hdr_len))
     }
 
-    pub fn as_bytes(&self, mut cmode: CompressMode) -> Vec<u8> {
+    pub fn as_bytes(&self, mut cmode: CompressMode, request_method: Option<HttpMethod>) -> Vec<u8> {
         match &self.body {
             HttpResponseBody::Data(data) => {
                 let suppress_body = Self::status_disallows_response_body(self.http_code);
+                // 方法级抑制（HEAD）：与 write_to_stream 对齐——Content-Length
+                // 照常声明，但 body 字节不落盘
+                let suppress_body_by_method = Self::method_disallows_response_body(request_method);
                 let mut payload_tmp: Vec<u8> = vec![];
                 if cmode == CompressMode::Gzip
                     && data.len() >= 32
@@ -3078,16 +3083,65 @@ impl HttpResponse {
                 let mut ret = Vec::with_capacity(payload_ref.len().saturating_add(512));
                 let status_str = self.http_code.http_code_to_desp();
                 let _ = write!(ret, "{} {} {status_str}\r\n", self.version, self.http_code);
-                for (key, value) in self.headers.iter() {
-                    if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
-                        continue;
+                // 6 标准头快速路径：与 write_to_stream 的固定顺序输出对齐，
+                // 保证 as_bytes 与 write_to_stream 线上字节形态一致
+                if self.headers.len() == 6 && self.multi_headers.is_empty() {
+                    if let (
+                        Some(date),
+                        Some(server),
+                        Some(connection),
+                        Some(content_type),
+                        Some(pragma),
+                        Some(cache_control),
+                    ) = (
+                        self.headers.get("Date"),
+                        self.headers.get("Server"),
+                        self.headers.get("Connection"),
+                        self.headers.get("Content-Type"),
+                        self.headers.get("Pragma"),
+                        self.headers.get("Cache-Control"),
+                    ) {
+                        let _ = write!(ret, "Date: {}\r\n", sanitize_header_str(date));
+                        let _ = write!(ret, "Server: {}\r\n", sanitize_header_str(server));
+                        let _ = write!(ret, "Connection: {}\r\n", sanitize_header_str(connection));
+                        let _ = write!(
+                            ret,
+                            "Content-Type: {}\r\n",
+                            sanitize_header_str(content_type)
+                        );
+                        let _ = write!(ret, "Pragma: {}\r\n", sanitize_header_str(pragma));
+                        let _ = write!(
+                            ret,
+                            "Cache-Control: {}\r\n",
+                            sanitize_header_str(cache_control)
+                        );
+                    } else {
+                        for (key, value) in self.headers.iter() {
+                            if key == "Content-Length"
+                                || key.eq_ignore_ascii_case("Transfer-Encoding")
+                            {
+                                continue;
+                            }
+                            let _ = write!(
+                                ret,
+                                "{}: {}\r\n",
+                                sanitize_header_str(key),
+                                sanitize_header_str(value)
+                            );
+                        }
                     }
-                    let _ = write!(
-                        ret,
-                        "{}: {}\r\n",
-                        sanitize_header_str(key),
-                        sanitize_header_str(value)
-                    );
+                } else {
+                    for (key, value) in self.headers.iter() {
+                        if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
+                            continue;
+                        }
+                        let _ = write!(
+                            ret,
+                            "{}: {}\r\n",
+                            sanitize_header_str(key),
+                            sanitize_header_str(value)
+                        );
+                    }
                 }
                 for (key, value) in self.multi_headers.iter() {
                     if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
@@ -3111,7 +3165,9 @@ impl HttpResponse {
                 // 空行即畸形 101，RFC6455 客户端（浏览器/wslite）握手永久
                 // 挂死。与 write_to_stream 的线上形态对齐。
                 ret.extend_from_slice(b"\r\n");
-                ret.extend(payload_ref);
+                if !suppress_body_by_method && !payload_ref.is_empty() {
+                    ret.extend(payload_ref);
+                }
                 ret
             }
             HttpResponseBody::Stream(_) => vec![], // Stream responses are handled separately
@@ -3166,14 +3222,14 @@ impl HttpResponse {
                     payload_ref = &[];
                 }
 
+                // 单遍直写序列化：直接 write! 进目标缓冲。此前每头经
+                // ssformat! 先格式化进临时 SmallString 再 push_str 拷贝，
+                // 双重格式化在 depth=1 热路径实测比批处理 as_bytes 路径
+                // 慢约 3%（2026-11-24 ABBA 配对实锤）。
+                use std::fmt::Write as _;
                 let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
                 let status_str = self.http_code.http_code_to_desp();
-                ret.push_str(&ssformat!(
-                    64,
-                    "{} {} {status_str}\r\n",
-                    self.version,
-                    self.http_code
-                ));
+                let _ = write!(ret, "{} {} {status_str}\r\n", self.version, self.http_code);
                 if self.headers.len() == 6 && self.multi_headers.is_empty() {
                     if let (
                         Some(date),
@@ -3190,7 +3246,6 @@ impl HttpResponse {
                         self.headers.get("Pragma"),
                         self.headers.get("Cache-Control"),
                     ) {
-                        use std::fmt::Write as _;
                         let _ = write!(ret, "Date: {}\r\n", sanitize_header_str(date));
                         let _ = write!(ret, "Server: {}\r\n", sanitize_header_str(server));
                         let _ = write!(ret, "Connection: {}\r\n", sanitize_header_str(connection));
@@ -3209,12 +3264,12 @@ impl HttpResponse {
                             {
                                 continue;
                             }
-                            ret.push_str(&ssformat!(
-                                512,
+                            let _ = write!(
+                                ret,
                                 "{}: {}\r\n",
                                 sanitize_header_str(key),
                                 sanitize_header_str(value)
-                            ));
+                            );
                         }
                     }
                 } else {
@@ -3223,27 +3278,27 @@ impl HttpResponse {
                         {
                             continue;
                         }
-                        ret.push_str(&ssformat!(
-                            512,
+                        let _ = write!(
+                            ret,
                             "{}: {}\r\n",
                             sanitize_header_str(key),
                             sanitize_header_str(value)
-                        ));
+                        );
                     }
                 }
                 for (key, value) in self.multi_headers.iter() {
                     if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
                         continue;
                     }
-                    ret.push_str(&ssformat!(
-                        512,
+                    let _ = write!(
+                        ret,
                         "{}: {}\r\n",
                         sanitize_header_str(key),
                         sanitize_header_str(value)
-                    ));
+                    );
                 }
                 if !suppress_body_by_status {
-                    ret.push_str(&ssformat!(64, "Content-Length: {}\r\n", payload_ref.len()));
+                    let _ = write!(ret, "Content-Length: {}\r\n", payload_ref.len());
                 }
                 if cmode == CompressMode::Gzip && !suppress_body_by_status {
                     ret.push_str("Content-Encoding: gzip\r\n");
@@ -3260,37 +3315,33 @@ impl HttpResponse {
             }
             HttpResponseBody::Stream(rx) => {
                 // For Stream body, send headers first, then chunks
+                use std::fmt::Write as _;
                 let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
                 let status_str = self.http_code.http_code_to_desp();
-                ret.push_str(&ssformat!(
-                    64,
-                    "{} {} {status_str}\r\n",
-                    self.version,
-                    self.http_code
-                ));
+                let _ = write!(ret, "{} {} {status_str}\r\n", self.version, self.http_code);
                 for (key, value) in self.headers.iter() {
                     // 流式响应统一由写出处补 TE: chunked，headers 里预置的
                     // （如 HttpResponse::chunked）必须跳过，避免重复头
                     if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
                         continue;
                     }
-                    ret.push_str(&ssformat!(
-                        512,
+                    let _ = write!(
+                        ret,
                         "{}: {}\r\n",
                         sanitize_header_str(key),
                         sanitize_header_str(value)
-                    ));
+                    );
                 }
                 for (key, value) in self.multi_headers.iter() {
                     if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
                         continue;
                     }
-                    ret.push_str(&ssformat!(
-                        512,
+                    let _ = write!(
+                        ret,
                         "{}: {}\r\n",
                         sanitize_header_str(key),
                         sanitize_header_str(value)
-                    ));
+                    );
                 }
                 if !suppress_body {
                     ret.push_str("Transfer-Encoding: chunked\r\n");
@@ -3301,11 +3352,10 @@ impl HttpResponse {
                         .map(|(name, _)| name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    ret.push_str(&ssformat!(512, "Trailer: {trailer_names}\r\n"));
+                    let _ = write!(ret, "Trailer: {trailer_names}\r\n");
                 }
                 ret.push_str("\r\n");
-                let header_bytes: Vec<u8> = ret.as_bytes().to_vec();
-                stream.write_all(&header_bytes).await?;
+                stream.write_all(ret.as_bytes()).await?;
 
                 if suppress_body {
                     return Ok(());
@@ -3660,7 +3710,7 @@ mod tests {
         let mut res = HttpResponse::text("hello");
         res.add_header("Transfer-Encoding".into(), "chunked".into());
 
-        let serialized = String::from_utf8(res.as_bytes(CompressMode::None)).unwrap();
+        let serialized = String::from_utf8(res.as_bytes(CompressMode::None, None)).unwrap();
         assert!(serialized.contains("Content-Length: 5\r\n"));
         assert!(!serialized.contains("Transfer-Encoding:"));
     }
