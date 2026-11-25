@@ -130,7 +130,9 @@ impl ResponseBatcher {
 /// 解析可能阻塞在 socket 读上（或触发 100-Continue 插写），必须先冲刷
 /// 待发响应。仅做 httparse 头解析与原始头扫描，不做 HttpRequest 转换，
 /// 头解析错误一律按 false 处理（真解析稍后产生错误响应，顺序安全）。
-fn buf_holds_complete_request(buf: &[u8]) -> bool {
+/// doc(hidden)：仅供 fuzz target 做探测/真解析一致性断言，不属公开 API。
+#[doc(hidden)]
+pub fn buf_holds_complete_request(buf: &[u8]) -> bool {
     if buf.is_empty() {
         return false;
     }
@@ -333,6 +335,43 @@ impl PipeContext {
     }
 }
 
+// bench-phases 调查专用：d1 连接循环三阶段用户态累计（纳秒）。
+// 由 benchmark crate 的显式 feature 开启；正常构建零开销（字段与分支均不存在）。
+#[cfg(feature = "bench-phases")]
+pub mod bench_phases {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static READ_PARSE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static DISPATCH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static REQUESTS: AtomicU64 = AtomicU64::new(0);
+    #[inline]
+    pub fn add(stage: &AtomicU64, from: std::time::Instant) {
+        stage.fetch_add(from.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    /// 首次使用时启动 2s 周期转储线程（stderr），进程级累计换算每请求 µs
+    pub fn ensure_dumper() {
+        static DUMPER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        DUMPER.get_or_init(|| {
+            std::thread::spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let r = REQUESTS.swap(0, Ordering::Relaxed);
+                let a = READ_PARSE_NS.swap(0, Ordering::Relaxed);
+                let d = DISPATCH_NS.swap(0, Ordering::Relaxed);
+                let w = WRITE_NS.swap(0, Ordering::Relaxed);
+                if r == 0 {
+                    continue;
+                }
+                eprintln!(
+                    "PHASE_WINDOW reqs={r} read_parse={:.2}us dispatch={:.2}us write={:.2}us",
+                    a as f64 / r as f64 / 1000.0,
+                    d as f64 / r as f64 / 1000.0,
+                    w as f64 / r as f64 / 1000.0
+                );
+            });
+        });
+    }
+}
+
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static CONNECTIONS_DRAINED: LazyLock<Notify> = LazyLock::new(Notify::new);
 static CONNECTION_TASKS: LazyLock<StdMutex<tokio::task::JoinSet<()>>> =
@@ -429,6 +468,133 @@ static HANDLERS_FLAT: LazyLock<FxHashMap<(&'static str, HttpMethod), &'static Re
         handlers
     });
 
+/// 动态路由模式段：固定段精确比较，参数段捕获任意非空段
+enum RouteSegment {
+    Static(&'static str),
+    Param(&'static str), // 参数名，借用自 pattern 字符串
+}
+
+struct DynamicRoute {
+    method: HttpMethod,
+    flag: &'static RequestHandlerFlag,
+    segments: Vec<RouteSegment>,
+}
+
+/// 含 `{name}` 段的路由模式表，按段数分组。
+/// init 时一次性解析 pattern，请求期只做固定段精确比较，无正则无运行时解析
+static DYNAMIC_HANDLERS: LazyLock<HashMap<usize, Vec<DynamicRoute>>> = LazyLock::new(|| {
+    let mut map: HashMap<usize, Vec<DynamicRoute>> = HashMap::with_capacity(8);
+    for flag in inventory::iter::<RequestHandlerFlag> {
+        let Some(segments) = parse_dynamic_pattern(flag.path) else {
+            continue;
+        };
+        let count = segments.len();
+        let bucket = map.entry(count).or_default();
+        if bucket
+            .iter()
+            .any(|route| route.flag.path == flag.path && route.method == flag.method)
+        {
+            eprintln!(
+                "[potato] warning: duplicate dynamic route registration for {} {:?}; the later one is ignored",
+                flag.path, flag.method
+            );
+            continue;
+        }
+        bucket.push(DynamicRoute {
+            method: flag.method,
+            flag,
+            segments,
+        });
+    }
+    map
+});
+
+/// 把含 `{name}` 的路径模式拆成段；不含参数的路径返回 None（走精确匹配表）。
+/// 与宏侧 parse_path_params 同一套规则：参数必须占满整段
+fn parse_dynamic_pattern(path: &'static str) -> Option<Vec<RouteSegment>> {
+    if !path.contains('{') {
+        return None;
+    }
+    let mut segments = Vec::with_capacity(path.split('/').count());
+    for seg in path.split('/') {
+        if seg.starts_with('{') && seg.ends_with('}') && seg.len() >= 3 {
+            segments.push(RouteSegment::Param(&seg[1..seg.len() - 1]));
+        } else if seg.contains('{') || seg.contains('}') {
+            // 宏在编译期已拦截非法 pattern，这里是运行期兜底
+            eprintln!("[potato] warning: invalid dynamic route pattern `{path}` ignored");
+            return None;
+        } else {
+            segments.push(RouteSegment::Static(seg));
+        }
+    }
+    Some(segments)
+}
+
+/// 动态路由匹配：按段数查表，固定段精确比较、参数段捕获非空段。
+/// 命中时把 (参数名, 起始偏移, 结束偏移) 追加进 params（url_path 字节区间）
+fn match_dynamic_handlers(
+    url_path: &str,
+    method: HttpMethod,
+    params: &mut Vec<(&'static str, u32, u32)>,
+) -> Option<&'static RequestHandlerFlag> {
+    let seg_count = url_path.split('/').count();
+    let bucket = DYNAMIC_HANDLERS.get(&seg_count)?;
+    for route in bucket {
+        if route.method != method {
+            continue;
+        }
+        params.clear();
+        if match_route_segments(route, url_path, params) {
+            return Some(route.flag);
+        }
+    }
+    params.clear();
+    None
+}
+
+/// 单条动态路由的逐段匹配；zip 长度由段数分桶保证一致
+fn match_route_segments(
+    route: &DynamicRoute,
+    url_path: &str,
+    params: &mut Vec<(&'static str, u32, u32)>,
+) -> bool {
+    let mut offset = 0usize;
+    for (pseg, rseg) in route.segments.iter().zip(url_path.split('/')) {
+        match pseg {
+            RouteSegment::Static(s) => {
+                if *s != rseg {
+                    return false;
+                }
+            }
+            RouteSegment::Param(name) => {
+                if rseg.is_empty() {
+                    return false;
+                }
+                params.push((name, offset as u32, (offset + rseg.len()) as u32));
+            }
+        }
+        offset += rseg.len() + 1;
+    }
+    true
+}
+
+/// 收集与路径匹配的全部动态路由方法（OPTIONS Allow 列表用）
+fn match_dynamic_methods(url_path: &str) -> Vec<HttpMethod> {
+    let seg_count = url_path.split('/').count();
+    let Some(bucket) = DYNAMIC_HANDLERS.get(&seg_count) else {
+        return vec![];
+    };
+    let mut params = Vec::with_capacity(4);
+    let mut methods = vec![];
+    for route in bucket {
+        params.clear();
+        if match_route_segments(route, url_path, &mut params) {
+            methods.push(route.method);
+        }
+    }
+    methods
+}
+
 pub enum PipeContextItem {
     Handlers,
     LocationRoute((String, String, bool)),
@@ -482,6 +648,7 @@ impl Clone for PipeContextItem {
 
 pub struct PipeContext {
     items: Vec<PipeContextItem>,
+    disable_compress: bool,
 }
 
 #[cfg(all(test, feature = "webtransport"))]
@@ -860,11 +1027,15 @@ impl PipeContext {
     pub fn new() -> Self {
         Self {
             items: vec![PipeContextItem::Handlers],
+            disable_compress: false,
         }
     }
 
     pub fn empty() -> Self {
-        Self { items: vec![] }
+        Self {
+            items: vec![],
+            disable_compress: false,
+        }
     }
 
     pub fn clone_items(&self) -> Vec<PipeContextItem> {
@@ -877,6 +1048,13 @@ impl PipeContext {
     /// needed to make normal `http_*` handlers part of request processing.
     pub fn use_handlers(&mut self) {
         self.items.push(PipeContextItem::Handlers);
+    }
+
+    /// 关闭基于 Accept-Encoding 的响应压缩协商：开启后响应恒不压缩、
+    /// 不发送 Content-Encoding 头。响应由前置反代统一压缩、或基准测试
+    /// 要求响应保持未压缩（如 TFB v2 契约）时使用。
+    pub fn set_disable_compress(&mut self, disable: bool) {
+        self.disable_compress = disable;
     }
 
     pub fn use_location_route(
@@ -1181,6 +1359,7 @@ impl PipeContext {
                             for arg in args.iter() {
                                 let arg_name = arg["name"].as_str().unwrap_or("");
                                 let arg_required = arg["required"].as_bool().unwrap_or(true);
+                                let arg_in = arg["in"].as_str().unwrap_or("");
                                 let arg_type = {
                                     let arg_type = arg["type"].as_str().unwrap_or("");
                                     match arg_type.starts_with('i') || arg_type.starts_with('u') {
@@ -1193,16 +1372,39 @@ impl PipeContext {
                                     arg_name.to_string(),
                                     arg_type.to_string(),
                                     arg_required,
+                                    arg_in.to_string(),
                                 ));
                             }
                         }
                     }
                     arg_pairs
                 };
-                if !arg_pairs.is_empty() {
+                {
+                    // 路径参数（in=path）所有方法都渲染为 parameters，不进 query/requestBody
+                    let mut parameters = vec![];
+                    for (arg_name, arg_type, _arg_required, arg_in) in arg_pairs.iter() {
+                        if arg_in == "path" {
+                            parameters.push(serde_json::json!({
+                                "name": arg_name,
+                                "in": "path",
+                                "description": "",
+                                "required": true,
+                                "schema": { "type": arg_type },
+                            }));
+                        }
+                    }
+                    if !parameters.is_empty() {
+                        root_cur_path["parameters"] = serde_json::Value::Array(parameters);
+                    }
+                }
+                let body_arg_pairs: Vec<_> = arg_pairs
+                    .iter()
+                    .filter(|(.., arg_in)| arg_in != "path")
+                    .collect();
+                if !body_arg_pairs.is_empty() {
                     if flag.method == HttpMethod::GET {
                         let mut parameters = vec![];
-                        for (arg_name, arg_type, arg_required) in arg_pairs.iter() {
+                        for (arg_name, arg_type, arg_required, _arg_in) in body_arg_pairs.iter() {
                             parameters.push(serde_json::json!({
                                 "name": arg_name,
                                 "in": "query",
@@ -1211,11 +1413,23 @@ impl PipeContext {
                                 "schema": { "type": arg_type },
                             }));
                         }
-                        root_cur_path["parameters"] = serde_json::Value::Array(parameters);
+                        if !parameters.is_empty() {
+                            match root_cur_path.get_mut("parameters") {
+                                Some(existing) => {
+                                    if let Some(arr) = existing.as_array_mut() {
+                                        arr.extend(parameters);
+                                    }
+                                }
+                                None => {
+                                    root_cur_path["parameters"] =
+                                        serde_json::Value::Array(parameters)
+                                }
+                            }
+                        }
                     } else {
                         let mut properties = serde_json::json!({});
                         let mut required = vec![];
-                        for (arg_name, arg_type, arg_required) in arg_pairs.iter() {
+                        for (arg_name, arg_type, arg_required, _arg_in) in body_arg_pairs.iter() {
                             properties[arg_name] = match arg_type == "file" {
                                 true => {
                                     serde_json::json!({ "type": "string", "format": "binary" })
@@ -1400,7 +1614,13 @@ impl PipeContext {
         req: &mut HttpRequest,
         skip: usize,
     ) -> HttpResponse {
-        let mut response = if req.method == HttpMethod::OPTIONS
+        // 无 CORS 配置时不做 Origin/Access-Control-Request-Method 头查找
+        // （depth=1 每请求两次哈希查找纯开销）；行为等价——原实现的预检分支
+        // 只在配置存在且两头齐备时才有意义，apply_cors_headers 无配置时
+        // 本就直接返回。
+        let has_cors = self2.cors_config().is_some();
+        let mut response = if has_cors
+            && req.method == HttpMethod::OPTIONS
             && req.get_header("Origin").is_some()
             && req.get_header("Access-Control-Request-Method").is_some()
         {
@@ -1412,7 +1632,9 @@ impl PipeContext {
         } else {
             Self::handle_request_inner(self2, req, skip).await
         };
-        self2.apply_cors_headers(&mut response, req);
+        if has_cors {
+            self2.apply_cors_headers(&mut response, req);
+        }
         response
     }
 
@@ -1467,9 +1689,19 @@ impl PipeContext {
                 }
                 PipeContextItem::Cors(_) => continue,
                 PipeContextItem::Handlers => {
-                    let handler_ref = HANDLERS_FLAT
+                    // 先查精确匹配表（静态路由热路径），未命中再按段匹配动态路由
+                    let mut handler_ref = HANDLERS_FLAT
                         .get(&(&req.url_path[..], req.method))
                         .map(|p| p.handler);
+                    if handler_ref.is_none() {
+                        req.url_path_params.clear();
+                        handler_ref = match_dynamic_handlers(
+                            &req.url_path[..],
+                            req.method,
+                            &mut req.url_path_params,
+                        )
+                        .map(|p| p.handler);
+                    }
                     if let Some(handler_ref) = handler_ref {
                         let mut res = match handler_ref {
                             HttpHandler::Async(handler) => handler(req).await,
@@ -1482,6 +1714,25 @@ impl PipeContext {
                             if let Some(get_handler_ref) = HANDLERS_FLAT
                                 .get(&(&req.url_path[..], HttpMethod::GET))
                                 .map(|p| p.handler)
+                            {
+                                req.method = HttpMethod::GET;
+                                let mut res = match get_handler_ref {
+                                    HttpHandler::Async(handler) => handler(req).await,
+                                    HttpHandler::Sync(handler) => handler(req),
+                                };
+                                req.method = HttpMethod::HEAD;
+                                res.body = crate::HttpResponseBody::Data(vec![]);
+                                maybe_execute_postprocess!(res);
+                                return res;
+                            }
+                            // 动态路由 GET 回退（HEAD /user/1 -> GET /user/{id}）
+                            req.url_path_params.clear();
+                            if let Some(get_handler_ref) = match_dynamic_handlers(
+                                &req.url_path[..],
+                                HttpMethod::GET,
+                                &mut req.url_path_params,
+                            )
+                            .map(|p| p.handler)
                             {
                                 req.method = HttpMethod::GET;
                                 let mut res = match get_handler_ref {
@@ -1510,9 +1761,15 @@ impl PipeContext {
                                     {
                                         options.insert(HttpMethod::HEAD);
                                     }
-                                } else if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
-                                    options.extend(handlers.keys().copied());
-                                    if handlers.contains_key(&HttpMethod::GET) {
+                                } else {
+                                    if let Some(handlers) = HANDLERS.get(&req.url_path[..]) {
+                                        options.extend(handlers.keys().copied());
+                                    }
+                                    // 动态路由按段匹配聚合 Allow 方法
+                                    for method in match_dynamic_methods(&req.url_path[..]) {
+                                        options.insert(method);
+                                    }
+                                    if options.contains(&HttpMethod::GET) {
                                         options.insert(HttpMethod::HEAD);
                                     }
                                 }
@@ -2013,6 +2270,8 @@ impl HttpServer {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        #[cfg(feature = "bench-phases")]
+        bench_phases::ensure_dumper();
         // Refuse new connections beyond the configured cap so a connection
         // flood cannot exhaust memory/file descriptors (the caller drops the
         // socket, closing it).
@@ -2022,7 +2281,7 @@ impl HttpServer {
             return;
         }
         ACTIVE_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
-        let mut tasks = CONNECTION_TASKS.lock().unwrap();
+        let mut tasks = CONNECTION_TASKS.lock().unwrap_or_else(|e| e.into_inner());
         while tasks.try_join_next().is_some() {}
         tasks.spawn(async move {
             let _connection_guard = ConnectionGuard;
@@ -2040,7 +2299,7 @@ impl HttpServer {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut tasks = CONNECTION_TASKS.lock().unwrap();
+        let mut tasks = CONNECTION_TASKS.lock().unwrap_or_else(|e| e.into_inner());
         while tasks.try_join_next().is_some() {}
         tasks.spawn(future);
     }
@@ -2058,7 +2317,7 @@ impl HttpServer {
         }
 
         {
-            let mut tasks = CONNECTION_TASKS.lock().unwrap();
+            let mut tasks = CONNECTION_TASKS.lock().unwrap_or_else(|e| e.into_inner());
             tasks.abort_all();
             while tasks.try_join_next().is_some() {}
         }
@@ -2071,7 +2330,7 @@ impl HttpServer {
                 _ = CONNECTIONS_DRAINED.notified() => {}
             }
         }
-        let mut tasks = CONNECTION_TASKS.lock().unwrap();
+        let mut tasks = CONNECTION_TASKS.lock().unwrap_or_else(|e| e.into_inner());
         while tasks.try_join_next().is_some() {}
     }
 
@@ -2351,6 +2610,14 @@ impl HttpServer {
             let mut req = HttpRequest::new();
             // writev 合并：待发响应批量队列
             let mut batch = ResponseBatcher::new();
+            // 每连接一根读超时 Sleep（避免每请求经 timeout() 新建 Sleep 带来的
+            // TimerEntry 分配与时间轮操作）。重臂策略见循环内：距上次重臂不足
+            // SLACK 时完全跳过 reset，把每连接的 reset 频率从每请求一次降到
+            // 至多每 SLACK 一次
+            let mut request_read_sleep = std::pin::pin!(tokio::time::sleep(
+                crate::global_config::ServerConfig::get_request_timeout().await
+            ));
+            let mut last_rearm = tokio::time::Instant::now();
             loop {
                 // 写序安全闸门：有待发响应且 buf 不足以完整解析下一请求时，
                 // 下一步解析可能阻塞在 socket 读（或触发 100-Continue 插写），
@@ -2367,21 +2634,54 @@ impl HttpServer {
                 // style slow reads; WebSocket upgrades switch protocols before
                 // the next iteration and are not affected.
                 let request_timeout = crate::global_config::ServerConfig::get_request_timeout().await;
-                let read = HttpRequest::from_stream_with_limits_into(
-                    &mut buf,
-                    &mut stream,
-                    request_limits.map(|(header, _)| header),
-                    request_limits.map(|(_, body)| body),
-                    &mut req,
-                );
-                // Err(None) = 超时；Err(Some(msg)) = 解析错误
-                let outcome = match tokio::time::timeout(request_timeout, read).await {
-                    Ok(Ok(n)) => Ok(n),
-                    Ok(Err(err)) => Err(Some(err.to_string())),
-                    Err(_elapsed) => Err(None),
+                // read future 的 buf/stream 借用须在结果产出后立刻结束
+                // （后续写路径还要用 stream），故包一层块作用域；语义与原
+                // timeout(request_timeout, read).await 完全一致。
+                #[cfg(feature = "bench-phases")]
+                let t_read = std::time::Instant::now();
+                let outcome = {
+                    let read = HttpRequest::from_stream_with_limits_into(
+                        &mut buf,
+                        &mut stream,
+                        request_limits.map(|(header, _)| header),
+                        request_limits.map(|(_, body)| body),
+                        &mut req,
+                    );
+                    tokio::pin!(read);
+                    // Err(None) = 超时；Err(Some(msg)) = 解析错误
+                    // 读阶段超时懒重臂（depth=1 热路径）：每请求仍取一次
+                    // Instant::now 判断，但距上次重臂不足 SLACK 时沿用现有
+                    // armed deadline 跳过 reset——持续流量下空闲预算始终
+                    // ≥ timeout-SLACK，空闲语义从「timeout 整」放宽为
+                    // 「timeout-SLACK ~ timeout」（SLACK=min(timeout/4,1s)，
+                    // 默认 10s 级超时下窗口偏差 <0.25s）。安全性：Sleep 已
+                    // 触发 ⟹ now-last_rearm ≥ timeout ≥ SLACK，重臂条件必然
+                    // 成立，不会把已触发的 Sleep 留给下一次 select 误杀活跃
+                    // 连接。biased select 先读后钟，poll 顺序与 timeout()
+                    // 等价；超时分支丢弃未完成的 read future，语义同 timeout
+                    // 的超时路径。
+                    let now = tokio::time::Instant::now();
+                    if now.saturating_duration_since(last_rearm)
+                        >= (request_timeout / 4).min(std::time::Duration::from_secs(1))
+                    {
+                        request_read_sleep.as_mut().reset(now + request_timeout);
+                        last_rearm = now;
+                    }
+                    tokio::select! {
+                        biased;
+                        result = &mut read => match result {
+                            Ok(n) => Ok(n),
+                            Err(err) => Err(Some(err.to_string())),
+                        },
+                        _ = &mut request_read_sleep => Err(None),
+                    }
                 };
                 let n = match outcome {
-                    Ok(n) => n,
+                    Ok(n) => {
+                        #[cfg(feature = "bench-phases")]
+                        bench_phases::add(&bench_phases::READ_PARSE_NS, t_read);
+                        n
+                    }
                     Err(Some(err_msg)) => {
                         eprintln!("[potato] request parse error: {err_msg}");
                         let mut res = if err_msg.contains("request body too large") {
@@ -2412,7 +2712,11 @@ impl HttpServer {
                     Err(None) => break,
                 };
                 req.client_addr = Some(client_addr);
-                let cmode = req.get_header_accept_encoding();
+                let cmode = if pipe_ctx.disable_compress {
+                    CompressMode::None
+                } else {
+                    req.get_header_accept_encoding()
+                };
                 let conn = req.get_header_connection();
                 if conn == HttpConnection::Upgrade && req.is_websocket() {
                     // 升级握手续接同一 socket：先冲刷此前积压的响应，保写序
@@ -2442,7 +2746,11 @@ impl HttpServer {
                     }
                     break;
                 }
+                #[cfg(feature = "bench-phases")]
+                let t_dispatch = std::time::Instant::now();
                 let mut res = PipeContext::handle_request(pipe_ctx.as_ref(), &mut req, 0).await;
+                #[cfg(feature = "bench-phases")]
+                bench_phases::add(&bench_phases::DISPATCH_NS, t_dispatch);
                 if conn != HttpConnection::KeepAlive {
                     res.add_header("Connection".into(), "close".into());
                 }
@@ -2459,6 +2767,8 @@ impl HttpServer {
                 let direct_write = !batch.has_pending()
                     && n == buf.len()
                     && matches!(&res.body, HttpResponseBody::Data(d) if d.len() <= BATCH_MAX_PAYLOAD);
+                #[cfg(feature = "bench-phases")]
+                let t_write = std::time::Instant::now();
                 if direct_write {
                     if res
                         .write_to_stream(&mut stream, cmode, Some(req.method))
@@ -2488,6 +2798,15 @@ impl HttpServer {
                         }
                     }
                 }
+                // 响应内存归还线程本地池（depth=1 热路径）：头表/体缓冲已
+                // 序列化完毕，mem::take 后 res 以空默认成员 drop 零成本。
+                // 靠后于全部写路径，此时 res 不再被引用。
+                #[cfg(feature = "bench-phases")]
+                {
+                    bench_phases::add(&bench_phases::WRITE_NS, t_write);
+                    bench_phases::REQUESTS.fetch_add(1, Ordering::Relaxed);
+                }
+                res.recycle_into_pool();
                 if n > 0 {
                     let remain = buf.len().saturating_sub(n);
                     if remain > 0 {

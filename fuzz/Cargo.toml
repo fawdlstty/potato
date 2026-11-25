@@ -1,0 +1,44 @@
+[package]
+name = "potato-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# 与 potato 同源的 httparse 版本，fuzz target 内用它独立复扫原始帧做交叉比对
+httparse = "1.10"
+tokio = { version = "1.53", default-features = false, features = ["io-util"] }
+potato = { path = "../potato", default-features = false, features = ["std"] }
+
+[[bin]]
+name = "http1_request_headers"
+path = "fuzz_targets/http1_request_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_request_full"
+path = "fuzz_targets/http1_request_full.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_response"
+path = "fuzz_targets/http1_response.rs"
+test = false
+doc = false
+bench = false
+
+# 独立于主工作区：自带锁文件与 target 目录
+[workspace]
+
+# 运行方式（须在仓库根目录）：
+#   cargo fuzz run <target> fuzz/corpus/<target> fuzz/seedcorpus/<target> \
+#     -- -max_len=20000
+# 第一个目录存新发现语料（已 gitignore），seedcorpus 为只读种子（随仓库提交）。

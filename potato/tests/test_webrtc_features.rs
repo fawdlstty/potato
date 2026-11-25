@@ -41,7 +41,8 @@ fn test_webrtc_config_defaults() {
         assert_eq!(config.max_peers, 100);
         assert!(config
             .ice_servers
-            .contains(&"stun:stun.l.google.com:19302".to_string()));
+            .iter()
+            .any(|i| i == "stun:stun.l.google.com:19302"));
         assert_eq!(config.ws_path, "/ws");
     }
 }

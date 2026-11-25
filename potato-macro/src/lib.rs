@@ -100,6 +100,30 @@ static ARG_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     .collect()
 });
 
+/// 解析路径模板里的 `{name}` 参数段（编译期校验，非法模板直接 panic）。
+/// 参数必须占满整段（与 actix/axum 同规则）；返回按出现顺序的参数名列表
+fn parse_path_params(path: &str) -> Vec<String> {
+    let mut ret = vec![];
+    for seg in path.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        if seg.starts_with('{') && seg.ends_with('}') {
+            let name = &seg[1..seg.len() - 1];
+            if name.is_empty() || name.contains('{') || name.contains('}') {
+                panic!("invalid path parameter in route `{path}`: `{seg}`");
+            }
+            if ret.iter().any(|existing| existing == name) {
+                panic!("duplicate path parameter `{{{name}}}` in route `{path}`");
+            }
+            ret.push(name.to_string());
+        } else if seg.contains('{') || seg.contains('}') {
+            panic!("path parameter must occupy a full segment in route `{path}`: `{seg}`");
+        }
+    }
+    ret
+}
+
 /// Controller 字段类型
 /// 验证 Controller 结构体字段
 fn validate_controller_struct(
@@ -1028,6 +1052,33 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
 
     let final_path_expr = quote! { #final_path };
 
+    // 解析路径模板 `{name}` 参数段，并校验与函数参数一一对应
+    let path_params = parse_path_params(&final_path);
+    let fn_arg_name_strs: Vec<String> = root_fn
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            syn::FnArg::Typed(arg) => {
+                let pat_str = arg.pat.to_token_stream().to_string();
+                Some(
+                    pat_str
+                        .strip_prefix("mut ")
+                        .unwrap_or(&pat_str[..])
+                        .to_string(),
+                )
+            }
+            _ => None,
+        })
+        .collect();
+    for name in &path_params {
+        if !fn_arg_name_strs.iter().any(|arg_name| arg_name == name) {
+            panic!(
+                "route `{final_path}` declares {{{name}}} but handler has no matching argument"
+            );
+        }
+    }
+
     // 生成 tag 表达式
     let tag_expr = if has_receiver {
         // 使用类型名来生成唯一的常量名
@@ -1063,7 +1114,45 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                 .iter()
                 .find_map(parse_arg_name_attr)
                 .unwrap_or_else(|| arg_name_str.clone());
-            let arg_value = match &arg_type_str[..] {
+            // 路径参数：参数名（mut 前缀剥除）命中路径模板 `{name}` 段时，
+            // 生成从 req.url_path_params 提取并解析的专用代码，不再走 query/body
+            let arg_name_norm = arg_name_str
+                .strip_prefix("mut ")
+                .unwrap_or(&arg_name_str[..])
+                .to_string();
+            let arg_path_param = path_params
+                .iter()
+                .find(|param| **param == arg_name_norm)
+                .map(|param| param.as_str());
+            let arg_value = if let Some(path_param) = arg_path_param {
+                if !ARG_TYPES.contains(arg_type_str.as_str()) {
+                    panic!(
+                        "path parameter {{{path_param}}} in route `{final_path}` has unsupported type `{arg_type_str}`; supported: String / bool / numeric types"
+                    );
+                }
+                doc_args.push(json!(
+                    { "name": path_param, "type": arg_type_str, "required": true, "in": "path" }
+                ));
+                if arg_type_str == "String" {
+                    quote! {
+                        match req.path_param(#path_param) {
+                            Some(__potato_val) => __potato_val.into_owned(),
+                            None => return potato::HttpResponse::bad_request(format!("miss arg: {}", #path_param)),
+                        }
+                    }
+                } else {
+                    quote! {
+                        match req.path_param(#path_param) {
+                            Some(__potato_val) => match __potato_val.parse() {
+                                Ok(__potato_parsed) => __potato_parsed,
+                                Err(_) => return potato::HttpResponse::bad_request(format!("arg[{}] is not {} type", #path_param, #arg_type_str)),
+                            },
+                            None => return potato::HttpResponse::bad_request(format!("miss arg: {}", #path_param)),
+                        }
+                    }
+                }
+            } else {
+                match &arg_type_str[..] {
                 "& mut HttpRequest" => quote! { req },
                 "& mut OnceCache" => {
                     quote! { __potato_once_cache.as_mut().expect("OnceCache not available") }
@@ -1153,7 +1242,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
                     }
                     arg_value
                 }
-                _ => panic!("unsupported arg type: [{arg_type_str}]"),
+                    _ => panic!("unsupported arg type: [{arg_type_str}]"),
+                }
             };
             args.push(arg_value);
             arg_names.push(random_ident());
@@ -1854,7 +1944,14 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
         quote! {
             #[doc(hidden)]
             fn #wrap_func_name2(req: &mut potato::HttpRequest) -> potato::HttpResponse {
-                let mut __potato_response = #handler_wrap_func_body.unwrap();
+                let mut __potato_response = match #handler_wrap_func_body {
+                    Ok(resp) => resp,
+                    // 错误链可能包含内部路径/上游信息：详情只进日志，对外返回通用文案
+                    Err(err) => {
+                        eprintln!("[potato] handler error: {err}");
+                        potato::HttpResponse::error("Internal Server Error")
+                    }
+                };
                 #add_headers_code
                 #cors_headers_code
                 __potato_response

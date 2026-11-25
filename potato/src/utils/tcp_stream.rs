@@ -27,7 +27,6 @@ pub enum HttpStream {
     /// 速率限制的流
     RateLimited(RateLimitedStream),
 }
-unsafe impl Send for HttpStream {}
 
 impl HttpStream {
     pub fn from_tcp(s: TcpStream) -> Self {
@@ -206,8 +205,8 @@ impl HttpStream {
     /// flush 必须在 `write_all` 之后由调用方显式执行：tokio-rustls 的
     /// AsyncWrite 允许 `write_all` 返回时仍有密文滞留内部缓冲（socket 发送
     /// 缓冲写满后不再前进），尾部数据若不 flush 永不出网——服务端按
-    /// Content-Length 等不到完整请求体，实测 open.bigmodel.cn 对 >~64KiB 的
-    /// 请求长挂 120s 后回 502（WorkRecorder BYOK 分析超时事故根因，2026-09-16）。
+    /// Content-Length 等不到完整请求体，实测部分上游服务对 >~64KiB 的
+    /// 请求长挂 120s 后回 502。
     pub async fn flush(&mut self) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt as _;
         match self {
@@ -398,20 +397,6 @@ impl TcpStreamExt for TcpStream {}
 impl TcpStreamExt for ClientTlsStream<TcpStream> {}
 #[cfg(feature = "tls")]
 impl TcpStreamExt for ServerTlsStream<TcpStream> {}
-
-/// # Safety
-/// 此trait用于将裸指针转换为可变引用，调用者必须保证指针的有效性
-pub unsafe trait TcpStreamExt2 {
-    /// # Safety
-    /// 调用者必须保证指针指向有效的TcpStreamExt对象
-    unsafe fn get_mut(self) -> &'static mut dyn TcpStreamExt;
-}
-
-unsafe impl TcpStreamExt2 for *mut dyn TcpStreamExt {
-    unsafe fn get_mut(self) -> &'static mut dyn TcpStreamExt {
-        &mut *self as &mut dyn TcpStreamExt
-    }
-}
 
 #[async_trait]
 pub trait VecU8Ext {

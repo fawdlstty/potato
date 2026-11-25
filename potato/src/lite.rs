@@ -4,7 +4,6 @@ pub mod websocket;
 #[cfg(feature = "websocket")]
 pub use websocket::*;
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -267,7 +266,11 @@ fn wait_for_wake() {
     if hook.is_null() {
         core::hint::spin_loop();
     } else {
-        // The pointer was installed from a valid `fn()` by `set_wait_hook`.
+        // SAFETY: `WAIT_HOOK` is a private static whose only writer is the
+        // typed `set_wait_hook`, which stores either null or a valid `fn()`
+        // coerced via `as usize as *mut ()`; null was already checked above.
+        // `fn()` and a raw pointer share the same representation on all
+        // supported targets, so transmuting it back is sound.
         let hook: fn() = unsafe { core::mem::transmute(hook) };
         hook();
     }
@@ -289,6 +292,14 @@ fn waker_vtable() -> &'static RawWakerVTable {
     &RawWakerVTable::new(clone_waker, wake_waker, wake_waker_by_ref, drop_waker)
 }
 
+// SAFETY (applies to all four vtable functions below): `data` is always a
+// pointer produced by `Arc::into_raw::<ExecutorWaker>` in `waker()` — the
+// only place a `RawWaker` is constructed here — and every function keeps the
+// reference count balanced: `clone_waker`/`wake_waker_by_ref` produce one new
+// strong reference (`ManuallyDrop` around `Arc::from_raw` so the original
+// count is not consumed) while `wake_waker` and `drop_waker` consume one.
+// `ExecutorWaker` holds only an `AtomicBool`, so it is `Send + Sync`,
+// satisfying the `RawWaker` contract.
 unsafe fn clone_waker(data: *const ()) -> RawWaker {
     let waker =
         core::mem::ManuallyDrop::new(unsafe { Arc::from_raw(data.cast::<ExecutorWaker>()) });
@@ -324,7 +335,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     let waker = waker(Arc::clone(&state));
     let mut cx = Context::from_waker(&waker);
 
-    let mut future = Box::pin(future);
+    let mut future = core::pin::pin!(future);
     loop {
         if let Poll::Ready(output) = Future::poll(future.as_mut(), &mut cx) {
             return output;

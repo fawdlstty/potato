@@ -1,11 +1,10 @@
 [package]
 name = "potato"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/fawdlstty/potato"
-homepage = "https://github.com/fawdlstty/potato"
 description = "A very simple and high performance http library."
 authors = ["fawdlstty<f@fawdlstty.com>"]
 keywords = ["http", "web"]
@@ -15,7 +14,6 @@ exclude = ["src/main.rs"]
 
 [dependencies]
 anyhow = { version = "1.0.104", optional = true, default-features = false }
-async-recursion = { version = "1.1.1", optional = true }
 async-trait = { version = "0.1.92", optional = true }
 base64 = { version = "0.23.1", optional = true, default-features = false }
 chrono = { version = "0.4.45", optional = true }
@@ -24,7 +22,7 @@ http = { version = "1.5.0", optional = true }
 httparse = { version = "1.10.1", optional = true }
 inventory = { version = "0.3.24", optional = true }
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"], optional = true }
-potato-macro = { version = "0.3.29", path = "../potato-macro" }
+potato-macro = { version = "0.4.7", path = "../potato-macro" }
 linkme = { version = "0.3.37" }
 rand = { version = "0.10.2", optional = true }
 rustc-hash = { version = "2.1.1", optional = true }
@@ -88,13 +86,15 @@ time = "0.3.55"
 
 [features]
 default = ["std", "websocket", "openapi", "tls"]
+# 压测调查专用：d1 连接循环三阶段（读+解析/分发/写出）用户态耗时统计，
+# 仅 benchmark crate 以显式 feature 开启，正常运行零成本
+bench-phases = []
 std = [
     "potato-macro/std",
     "dep:anyhow",
     "anyhow/std",
     "dep:base64",
     "base64/std",
-    "dep:async-recursion",
     "dep:async-trait",
     "dep:chrono",
     "dep:flate2",
@@ -136,8 +136,6 @@ full = ["std", "websocket", "openapi", "ssh", "tls", "http2", "http3", "webdav",
 
 # cargo test --features full
 # cargo +nightly clippy --features full --all-targets -- -D warnings
-# （clippy 一条须用 nightly：CI ubuntu-latest 的 stable clippy 总比本地新，
-#  新 lint 只有 nightly 能提前暴露；linux 独有路径需在 WSL/真 linux 验证）
 # cargo publish -p potato-macro --allow-dirty --registry crates-io
 # cargo publish -p potato --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..

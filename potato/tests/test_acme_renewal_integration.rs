@@ -193,9 +193,9 @@ mod acme_renewal_integration_tests {
         };
 
         assert_eq!(full_opts.domains.len(), 3);
-        assert!(full_opts.domains.contains(&"example.com".to_string()));
-        assert!(full_opts.domains.contains(&"www.example.com".to_string()));
-        assert!(full_opts.domains.contains(&"api.example.com".to_string()));
+        assert!(full_opts.domains.iter().any(|i| i == "example.com"));
+        assert!(full_opts.domains.iter().any(|i| i == "www.example.com"));
+        assert!(full_opts.domains.iter().any(|i| i == "api.example.com"));
         assert!(full_opts.acme_directory.is_some());
         assert!(full_opts.cert_dir.is_some());
 

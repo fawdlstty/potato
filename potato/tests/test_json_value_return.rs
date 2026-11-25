@@ -1,6 +1,5 @@
 #![cfg(feature = "std")]
-/// 测试 HTTP handler 支持 serde_json::Value 和 anyhow::Result<serde_json::Value> 返回类型
-
+// 测试 HTTP handler 支持 serde_json::Value 和 anyhow::Result<serde_json::Value> 返回类型
 #[test]
 fn test_http_get_json_value_return() {
     #[potato::http_get("/test-json-value")]

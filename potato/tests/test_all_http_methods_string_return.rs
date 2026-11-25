@@ -1,6 +1,5 @@
 #![cfg(feature = "std")]
-/// 测试所有 HTTP 方法宏都支持 String 返回类型
-
+// 测试所有 HTTP 方法宏都支持 String 返回类型
 #[test]
 fn test_http_post_string_return() {
     #[potato::http_post("/test-post")]

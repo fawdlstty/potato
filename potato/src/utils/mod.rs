@@ -1,5 +1,6 @@
 pub mod bytes;
 pub mod enums;
+pub mod header_store;
 #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
 pub mod jemalloc_helper;
 pub mod number;

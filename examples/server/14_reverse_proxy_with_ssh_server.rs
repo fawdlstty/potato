@@ -8,10 +8,10 @@ async fn main() {
                     let mut sess =
                         potato::TransferSession::from_reverse_proxy("/", "http://127.0.0.1:8080");
                     if let Err(err) = sess.with_ssh_jumpbox(&potato::SshJumpboxInfo {
-                        host: "192.168.0.100".to_string(),
+                        host: "jump.example".to_string(),
                         port: 22,
-                        username: "root".to_string(),
-                        password: "root".to_string(),
+                        username: "user".to_string(),
+                        password: "password".to_string(),
                         host_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleReplaceMe host".to_string(),
                     })
                     .await

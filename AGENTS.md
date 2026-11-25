@@ -9,3 +9,10 @@
    此类过程信息由 git 历史与专项文档承载。
 3. 维护时机：新增/修改功能、主人纠正 design.md 内容、发现内容膨胀时随会话更新收敛。
 4. 边界：演绎只以主人要求为边界补全，不改已确认结论。
+
+# potato 项目改动验收规则
+
+1. 每次改动代码内容后，一概要求以下两条命令执行成功，缺一不可（用户要求）：
+   - `cargo test --features full`
+   - `cargo +nightly clippy --features full --all-targets -- -D warnings`
+2. 任一命令失败时必须修复后重跑，全部通过才算改动完成（用户要求）。

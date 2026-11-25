@@ -74,9 +74,9 @@ mod acme_full_workflow_tests {
         };
 
         assert_eq!(opts.domains.len(), 3);
-        assert!(opts.domains.contains(&"example.com".to_string()));
-        assert!(opts.domains.contains(&"www.example.com".to_string()));
-        assert!(opts.domains.contains(&"api.example.com".to_string()));
+        assert!(opts.domains.iter().any(|i| i == "example.com"));
+        assert!(opts.domains.iter().any(|i| i == "www.example.com"));
+        assert!(opts.domains.iter().any(|i| i == "api.example.com"));
     }
 
     /// 测试证书重载的原子性

@@ -1,6 +1,5 @@
 #![cfg(feature = "std")]
-/// 测试 String 和 &'static str 返回类型支持
-
+// 测试 String 和 &'static str 返回类型支持
 #[test]
 fn test_string_return_type() {
     // 测试异步函数返回 String

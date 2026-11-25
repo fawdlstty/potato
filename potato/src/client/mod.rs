@@ -87,7 +87,11 @@ async fn stream_chunked_body_to_channel(
         }
         total_body += chunk_size;
 
-        while buf.len() < cursor + chunk_size + 2 {
+        let Some(chunk_end) = cursor.checked_add(chunk_size).and_then(|v| v.checked_add(2))
+        else {
+            return Err(anyhow!("chunk size overflow"));
+        };
+        while buf.len() < chunk_end {
             let n = stream.read(&mut tmp_buf).await?;
             if n == 0 {
                 return Ok(());
@@ -95,12 +99,12 @@ async fn stream_chunked_body_to_channel(
             buf.extend_from_slice(&tmp_buf[..n]);
         }
 
-        if &buf[cursor + chunk_size..cursor + chunk_size + 2] != b"\r\n" {
+        if &buf[chunk_end - 2..chunk_end] != b"\r\n" {
             return Err(anyhow!("invalid chunk terminator"));
         }
 
         if tx
-            .send(buf[cursor..cursor + chunk_size].to_vec())
+            .send(buf[cursor..chunk_end - 2].to_vec())
             .await
             .is_err()
         {
@@ -410,7 +414,7 @@ impl Session {
             // 写完必须 flush：write_all 返回时密文可能仍滞留 tokio-rustls
             // 内部缓冲（请求超过 socket 发送缓冲 ~64KiB 必现），不 flush 则
             // 尾部永不发出，服务端按 Content-Length 等不到完整 body 后长挂
-            // （2026-09-16 BYOK 大请求 502 事故根因）。
+            // 直至超时（实测部分上游服务回 502）。
             sess_impl.stream.flush().await?;
             loop {
                 if let Some((res, hdr_len)) = HttpResponse::from_headers_part(&buf[..])? {

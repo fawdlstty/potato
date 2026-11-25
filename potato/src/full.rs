@@ -40,11 +40,11 @@ use hipstr::{LocalHipByt, LocalHipStr};
 use http::uri::Scheme;
 use http::Uri;
 use rust_embed::Embed;
-use rustc_hash::FxHashMap;
+use crate::utils::header_store::{RequestHeaders, ResponseHeaders};
 use sha1::{Digest, Sha1};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt;
 use std::fs::{File, Metadata};
 use std::io::{ErrorKind, Read};
@@ -755,6 +755,158 @@ pub(crate) fn sanitize_header_str(value: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// 无符号整数转 ASCII 数字串（写入 tmp 并返回数字段）。
+/// 输出与 `u64` 的 Display 恒等，供热路径序列化绕开 fmt 机制开销。
+fn u64_ascii_str(v: u64, tmp: &mut [u8; 20]) -> &str {
+    let mut i = tmp.len();
+    let mut v = v;
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&tmp[i..]).expect("u64 ascii digits are valid utf8")
+}
+
+/// 热路径头行序列化宏（`SmallString` 缓冲，仅接受 `&str`）：
+/// 常量前缀 + 净化后的值 + CRLF 直写，与
+/// `write!("{}: {}\r\n", sanitize_header_str(k), sanitize_header_str(v))`
+/// 字节形态一致，绕开 fmt 机制调度开销（depth=1 直写路径每响应）。
+macro_rules! push_header_line_str {
+    ($ret:expr, $prefix:expr, $value:expr) => {{
+        $ret.push_str($prefix);
+        let __v = sanitize_header_str($value);
+        $ret.push_str(&__v);
+        $ret.push_str("\r\n");
+    }};
+}
+
+/// URI 合法字符表：条目为 0 表示非法，否则为字节自身。
+/// 移植自 http-1.5.0 `uri::URI_CHARS`（判定语义一致；>127 全非法，
+/// 保证合法条目段必为合法单字节 UTF-8）。
+#[rustfmt::skip]
+const URI_CHARS: [u8; 256] = [
+    //  0      1      2      3      4      5      6      7      8      9
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, //   x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, //  1x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, //  2x
+        0,     0,     0,  b'!',     0,  b'#',  b'$',     0,  b'&', b'\'', //  3x
+     b'(',  b')',  b'*',  b'+',  b',',  b'-',  b'.',  b'/',  b'0',  b'1', //  4x
+     b'2',  b'3',  b'4',  b'5',  b'6',  b'7',  b'8',  b'9',  b':',  b';', //  5x
+        0,  b'=',     0,  b'?',  b'@',  b'A',  b'B',  b'C',  b'D',  b'E', //  6x
+     b'F',  b'G',  b'H',  b'I',  b'J',  b'K',  b'L',  b'M',  b'N',  b'O', //  7x
+     b'P',  b'Q',  b'R',  b'S',  b'T',  b'U',  b'V',  b'W',  b'X',  b'Y', //  8x
+     b'Z',  b'[',     0,  b']',     0,  b'_',     0,  b'a',  b'b',  b'c', //  9x
+     b'd',  b'e',  b'f',  b'g',  b'h',  b'i',  b'j',  b'k',  b'l',  b'm', // 10x
+     b'n',  b'o',  b'p',  b'q',  b'r',  b's',  b't',  b'u',  b'v',  b'w', // 11x
+     b'x',  b'y',  b'z',     0,     0,     0,  b'~',     0,     0,     0, // 12x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 13x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 14x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 15x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 16x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 17x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 18x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 19x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 20x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 21x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 22x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 23x
+        0,     0,     0,     0,     0,     0,     0,     0,     0,     0, // 24x
+        0,     0,     0,     0,     0,     0                              // 25x
+];
+
+/// Host 头 authority 语法校验（仅 accept/reject 判定）。
+/// 与 `http::uri::Authority::from_str(..).is_ok()` 判定逐分支等价：
+/// http 的 `TryFrom<&[u8]>` 校验通过后会 `Bytes::copy_from_slice` 拷贝一份
+/// （depth=1 每请求一次堆分配 + 拷贝 + 释放），校验-only 场景纯浪费，
+/// 故移植 `validate_authority_bytes` + `create_authority` 的截断拒绝规则：
+/// 首个 `/`、`?`、`#` 处截断后要求恰好消费全部输入。
+fn validate_authority_str(s: &str) -> bool {
+    let s = s.as_bytes();
+    if s.is_empty() {
+        return false;
+    }
+
+    let mut colon_cnt: u32 = 0;
+    let mut start_bracket = false;
+    let mut end_bracket = false;
+    let mut has_percent = false;
+    let mut end = s.len();
+    let mut at_sign_pos: usize = s.len();
+    const MAX_COLONS: u32 = 8; // e.g., [FEDC:BA98:7654:3210:FEDC:BA98:7654:3210]:80
+
+    let mut i = 0;
+    while i < s.len() {
+        let b = s[i];
+        let ch = URI_CHARS[b as usize];
+
+        if ch == b'/' || ch == b'?' || ch == b'#' {
+            end = i;
+            break;
+        }
+
+        if ch == 0 {
+            if b == b'%' {
+                // userinfo/zone-id 的百分号编码：仅在它属于 userinfo 时合法，
+                // http 同款规则——末尾统一按 has_percent 拒绝（除非已被
+                // `]`/`@` 清零）
+                has_percent = true;
+            } else {
+                return false;
+            }
+        } else if ch == b':' {
+            if colon_cnt >= MAX_COLONS {
+                return false;
+            }
+            colon_cnt += 1;
+        } else if ch == b'[' {
+            if has_percent || start_bracket {
+                return false;
+            }
+            start_bracket = true;
+        } else if ch == b']' {
+            if !start_bracket || end_bracket {
+                return false;
+            }
+            end_bracket = true;
+            // IPv6 字面量内部的冒号/百分号不算数
+            colon_cnt = 0;
+            has_percent = false;
+        } else if ch == b'@' {
+            at_sign_pos = i;
+            // userinfo 的冒号/百分号不算数
+            colon_cnt = 0;
+            has_percent = false;
+        }
+
+        i += 1;
+    }
+
+    if start_bracket != end_bracket {
+        return false;
+    }
+    if colon_cnt > 1 {
+        // 'localhost:8080:3030' 之类拒绝
+        return false;
+    }
+    if end > 0 && at_sign_pos == end - 1 {
+        // `@` 后无内容
+        return false;
+    }
+    if has_percent {
+        // host 段（非 userinfo/IPv6 zone）出现 `%`
+        return false;
+    }
+    // create_authority：截断点未消费到串尾即拒绝（"host/path" 形态）
+    if end != s.len() {
+        return false;
+    }
+    true
+}
+
 fn parse_transfer_encoding_tokens(raw: &str) -> anyhow::Result<Vec<String>> {
     let codings = raw
         .split(',')
@@ -1352,6 +1504,10 @@ pub struct PostFile {
     pub data: LocalHipByt<'static>,
 }
 
+// SAFETY: 字段为 hipstr Rc 后端句柄（非原子引用计数，本身 !Send）。框架内部
+// 只对值整体 move（move 期间无引用计数操作），不做跨线程 clone/drop。注意
+// 本类型带 derive(Clone)：用户若跨线程克隆句柄并与其他线程并发 clone/drop
+// 同一 Rc 分配，会破坏引用计数（UB），此约定无法由框架强制，须由用户保证。
 unsafe impl Send for PostFile {}
 
 pub struct HttpRequest {
@@ -1359,18 +1515,43 @@ pub struct HttpRequest {
     pub target_form: HttpRequestTargetForm,
     pub url_path: LocalHipStr<'static>,
     pub url_query: HashMap<LocalHipStr<'static>, LocalHipStr<'static>>,
+    /// 原始查询串（`?` 后的未解码原文），无查询时为 None。
+    /// url_query 是按参数名折叠的 HashMap，识别重复参数名/原始转义需用 raw_query()
+    pub url_query_raw: Option<LocalHipStr<'static>>,
+    /// 动态路由 `{name}` 段捕获值：(参数名, url_path 起始偏移, 结束偏移)，
+    /// 区间指向原始（未解码）路径字节，解码延迟到取值时按需进行
+    pub url_path_params: Vec<(&'static str, u32, u32)>,
     pub version: u8,
-    pub headers: FxHashMap<HeaderOrHipStr, LocalHipStr<'static>>,
-    pub trailers: FxHashMap<HeaderOrHipStr, LocalHipStr<'static>>,
+    pub headers: RequestHeaders,
+    pub trailers: RequestHeaders,
     pub body: LocalHipByt<'static>,
     pub body_pairs: HashMap<LocalHipStr<'static>, LocalHipStr<'static>>,
     pub body_files: HashMap<LocalHipStr<'static>, PostFile>,
+    /// multipart 重复上传的字段名（同名真实文件段出现多次时记录，HashMap 折叠前捕获）
+    pub body_dup_files: Vec<LocalHipStr<'static>>,
+    /// multipart 中 filename="" 的未选中文件输入的字段名（此类段同时按原语义落入 body_pairs）
+    pub body_unselected_files: Vec<LocalHipStr<'static>>,
+    /// multipart 存在头残缺段（缺 \r\n\r\n 头结束符，无法按部件解析）
+    pub body_malformed_multipart: bool,
     pub client_addr: Option<SocketAddr>,
     pub exts: HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>>,
     stream: Option<Arc<Mutex<HttpStream>>>,
 }
 
+// SAFETY: 本类型含 LocalHipStr<'static>/LocalHipByt<'static>（hipstr Rc 后端，
+// 非原子引用计数，本身 !Send），此断言承重。安全性依赖不变量：同一 Rc 分配
+// 的两个句柄不得在不同线程并发 clone/drop。框架侧已保证——请求只整体 move
+//（move 期间无引用计数操作），无 Clone 实现，字段克隆全部发生在单个请求的
+// 单线程作用域内（解析、handler 调用、响应生成）；tokio 多线程调度器下任务
+// 线程迁移属纯 move，不违规。字段均为 pub：用户若把克隆出的字段句柄 move 进
+// 其他并发任务并与原请求的存活期重叠，即可违反不变量（UB），须由用户保证。
 unsafe impl Send for HttpRequest {}
+
+// SAFETY: 承重断言，不可删——server 会 spawn 持 `&HttpRequest` 跨 await 的
+// future（如 from_static_file），`&T: Send` 要求 `T: Sync`。安全性依赖与
+// Send 相同的不变量：框架侧同一时刻只有单一 future 持引用，不存在两个线程
+// 经不同引用并发 clone 字段的路径；用户若把 `&req` 复制进多个任务并并发
+// clone Rc 句柄字段，即可违反不变量（UB），须由用户保证。
 unsafe impl Sync for HttpRequest {}
 
 impl fmt::Debug for HttpRequest {
@@ -1380,12 +1561,17 @@ impl fmt::Debug for HttpRequest {
             .field("target_form", &self.target_form)
             .field("url_path", &self.url_path)
             .field("url_query", &self.url_query)
+            .field("url_query_raw", &self.url_query_raw)
+            .field("url_path_params", &self.url_path_params)
             .field("version", &self.version)
             .field("headers", &self.headers)
             .field("trailers", &self.trailers)
             .field("body", &self.body)
             .field("body_pairs", &self.body_pairs)
             .field("body_files", &self.body_files)
+            .field("body_dup_files", &self.body_dup_files)
+            .field("body_unselected_files", &self.body_unselected_files)
+            .field("body_malformed_multipart", &self.body_malformed_multipart)
             .field("client_addr", &self.client_addr)
             .field("exts", &self.exts)
             .finish()
@@ -1449,12 +1635,17 @@ impl HttpRequest {
         self.target_form = HttpRequestTargetForm::Origin;
         self.url_path = "".into();
         self.url_query.clear();
+        self.url_query_raw = None;
+        self.url_path_params.clear();
         self.version = 11;
         self.headers.clear();
         self.trailers.clear();
         self.body = LocalHipByt::new();
         self.body_pairs.clear();
         self.body_files.clear();
+        self.body_dup_files.clear();
+        self.body_unselected_files.clear();
+        self.body_malformed_multipart = false;
         self.client_addr = None;
         self.exts.clear();
         self.stream = None;
@@ -1466,12 +1657,17 @@ impl HttpRequest {
             target_form: HttpRequestTargetForm::Origin,
             url_path: LocalHipStr::from("/"),
             url_query: HashMap::new(),
+            url_query_raw: None,
+            url_path_params: Vec::with_capacity(4),
             version: 11,
-            headers: FxHashMap::with_capacity_and_hasher(header_capacity, Default::default()),
-            trailers: FxHashMap::default(),
+            headers: RequestHeaders::with_capacity(header_capacity),
+            trailers: RequestHeaders::new(),
             body: LocalHipByt::new(),
             body_pairs: HashMap::new(),
             body_files: HashMap::new(),
+            body_dup_files: Vec::new(),
+            body_unselected_files: Vec::new(),
+            body_malformed_multipart: false,
             client_addr: None,
             exts: HashMap::new(),
             stream: None,
@@ -1490,6 +1686,51 @@ impl HttpRequest {
         q
     }
 
+    /// 原始查询串：`?` 之后、未解码的原文；无查询串时返回 None（`?` 单独出现
+    /// 返回 Some("")）。url_query 已按参数名折叠进 HashMap，同名参数（含
+    /// %xx 转义后同名的）会互相覆盖，无法识别重复参数名；需要区分重复、
+    /// 顺序或自行控制转义语义时用本方法取原文。
+    pub fn raw_query(&self) -> Option<&str> {
+        self.url_query_raw.as_ref().map(|s| &s[..])
+    }
+
+    /// 取动态路由 `{name}` 段的解码值。
+    /// 无 %xx 转义时零拷贝借用 url_path 切片，有转义才分配解码；
+    /// path 段语义中 '+' 是字面量，不做空格转换。
+    pub fn path_param(&self, name: &str) -> Option<std::borrow::Cow<'_, str>> {
+        let (_, start, end) = self
+            .url_path_params
+            .iter()
+            .find(|(param_name, _, _)| *param_name == name)?;
+        let seg = &self.url_path[..][*start as usize..*end as usize];
+        if seg.as_bytes().contains(&b'%') {
+            Some(std::borrow::Cow::Owned(Self::decode_path_segment(seg)))
+        } else {
+            Some(std::borrow::Cow::Borrowed(seg))
+        }
+    }
+
+    /// 仅解码 %xx 转义；非法转义原样保留，非法 UTF-8 走有损替换
+    fn decode_path_segment(seg: &str) -> String {
+        let bytes = seg.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi << 4 | lo) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     fn get_ext<T: Any + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
         self.exts
             .get(&TypeId::of::<T>())
@@ -1498,9 +1739,11 @@ impl HttpRequest {
 
     fn parse_path_and_query(&mut self, target: &str) {
         self.url_query.clear();
+        self.url_query_raw = None;
         match target.find('?') {
             Some(p) => {
                 self.url_path = LocalHipStr::from(&target[..p]);
+                self.url_query_raw = Some(LocalHipStr::from(&target[p + 1..]));
                 self.url_query = target[p + 1..]
                     .split('&')
                     .map(|s| s.split_once('=').unwrap_or((s, "")))
@@ -1549,6 +1792,7 @@ impl HttpRequest {
             }
             self.target_form = HttpRequestTargetForm::Asterisk;
             self.url_query.clear();
+            self.url_query_raw = None;
             self.url_path = LocalHipStr::from("*");
             return Ok(());
         }
@@ -1608,10 +1852,11 @@ impl HttpRequest {
         req.parse_path_and_query(uri.path_and_query().map(|v| v.as_str()).unwrap_or("/"));
         req.headers.insert(
             HeaderOrHipStr::from_str("Host"),
-            uri.authority()
-                .map(|authority| authority.as_str())
-                .unwrap_or("localhost")
-                .into(),
+            LocalHipStr::from(
+                uri.authority()
+                    .map(|authority| authority.as_str())
+                    .unwrap_or("localhost"),
+            ),
         );
         let use_ssl = uri.scheme() == Some(&Scheme::HTTPS);
         let port = uri.port_u16().unwrap_or(if use_ssl { 443 } else { 80 });
@@ -1627,18 +1872,11 @@ impl HttpRequest {
     }
 
     pub fn get_header(&self, key: &str) -> Option<&str> {
-        if let Some(header_item) = HeaderItem::try_from_str(key) {
-            if let Some(value) = self.headers.get(&HeaderOrHipStr::HeaderItem(header_item)) {
-                return Some(&value[..]);
-            }
-        }
-        self.headers
-            .get(&HeaderOrHipStr::HipStr(LocalHipStr::from(key)))
-            .map(|a| &a[..])
+        self.headers.get_by_str(key).map(|v| &v[..])
     }
 
     pub fn get_header_key(&self, key: HeaderItem) -> Option<&str> {
-        self.headers.get(&key.into()).map(|a| &a[..])
+        self.headers.get_header_item(key).map(|v| &v[..])
     }
 
     pub fn set_trailer(
@@ -1650,14 +1888,7 @@ impl HttpRequest {
     }
 
     pub fn get_trailer(&self, key: &str) -> Option<&str> {
-        if let Some(header_item) = HeaderItem::try_from_str(key) {
-            if let Some(value) = self.trailers.get(&HeaderOrHipStr::HeaderItem(header_item)) {
-                return Some(&value[..]);
-            }
-        }
-        self.trailers
-            .get(&HeaderOrHipStr::HipStr(LocalHipStr::from(key)))
-            .map(|a| &a[..])
+        self.trailers.get_by_str(key).map(|v| &v[..])
     }
 
     pub fn get_header_accept_encoding(&self) -> CompressMode {
@@ -1803,12 +2034,12 @@ impl HttpRequest {
         max_body_bytes: Option<usize>,
     ) -> anyhow::Result<(
         LocalHipByt<'static>,
-        FxHashMap<HeaderOrHipStr, LocalHipStr<'static>>,
+        RequestHeaders,
         usize,
     )> {
         let mut cursor = hdr_len;
         let mut body = Vec::new();
-        let mut trailers = FxHashMap::with_capacity_and_hasher(4, Default::default());
+        let mut trailers = RequestHeaders::with_capacity(4);
         let mut tmp_buf = [0u8; 4096];
         const MAX_METADATA_LINE_BYTES: usize = 16 * 1024;
 
@@ -1929,10 +2160,8 @@ impl HttpRequest {
         }
         match self.get_header("Sec-WebSocket-Key") {
             Some(val) => {
-                if val.len() != 24 || !val.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
-                    return false;
-                }
-                true
+                val.len() == 24
+                    && val.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
             }
             None => false,
         }
@@ -2048,8 +2277,13 @@ impl HttpRequest {
             content_length
         };
 
-        // 按 Content-Type 解析 body 到 body_pairs/body_files
-        Self::parse_body_content(req);
+        // 按 Content-Type 解析 body 到 body_pairs/body_files。
+        // 无 body 的请求（d1 keep-alive GET 常态）直接跳过：空体解析是
+        // 纯 no-op（json/form/multipart 对空输入均不产出条目），
+        // 省去每请求一次 Content-Type 头查找。
+        if has_request_body {
+            Self::parse_body_content(req);
+        }
         Ok(hdr_len + bdy_len)
     }
 
@@ -2110,6 +2344,11 @@ impl HttpRequest {
                             seg = &seg[..seg.len() - 2];
                         }
                         let Some(hdr_end) = find_subslice(seg, b"\r\n\r\n") else {
+                            // 前导区（首边界前的空段）为空属正常形态；非空段
+                            // 缺头结束符即残缺部件，打标供上层判 400
+                            if !seg.is_empty() {
+                                req.body_malformed_multipart = true;
+                            }
                             continue;
                         };
                         let (key_part, content) = seg.split_at(hdr_end);
@@ -2124,10 +2363,16 @@ impl HttpRequest {
                             .collect();
                         let mut name = None;
                         let mut filename = None;
+                        let mut filename_empty = false;
                         for key in keys.into_iter() {
                             if let Some((k, v)) = key.trim().split_once('=') {
                                 let v = strip_quoted(v.trim());
                                 if v.is_empty() {
+                                    // filename="" 表示未选中的文件输入，与
+                                    // 无 filename 的文本字段语义不同，单独记录
+                                    if k == "filename" {
+                                        filename_empty = true;
+                                    }
                                     continue;
                                 }
                                 if k == "name" {
@@ -2137,13 +2382,20 @@ impl HttpRequest {
                                 }
                             }
                         }
-                        if let Some(name) = name {
+                        if let Some(name) = &name {
                             if let Some(filename) = filename {
                                 let data = LocalHipByt::from(content.to_vec());
-                                req.body_files.insert(name, PostFile { filename, data });
+                                if req.body_files.contains_key(name) {
+                                    req.body_dup_files.push(name.clone());
+                                }
+                                req.body_files
+                                    .insert(name.clone(), PostFile { filename, data });
                             } else {
                                 let text = String::from_utf8_lossy(content).to_string();
-                                req.body_pairs.insert(name, LocalHipStr::from(text));
+                                req.body_pairs.insert(name.clone(), LocalHipStr::from(text));
+                                if filename_empty {
+                                    req.body_unselected_files.push(name.clone());
+                                }
                             }
                         }
                     }
@@ -2273,62 +2525,99 @@ impl HttpRequest {
             }
             let header_value = str::from_utf8(h.value)?;
             let normalized_header_value = header_value.trim();
-            if h.name.eq_ignore_ascii_case("Content-Length") {
-                let cl = normalized_header_value;
-                if cl.is_empty() {
-                    Err(anyhow!("empty Content-Length header"))?;
+            // 特判头单次判别值分派（d1 热路径）：from_str 内部已完成一次
+            // (首字符,长度) 预筛 + 大小写不敏感全名校验，据其判别值分派，
+            // 免去此前每头最多 4 次大小写不敏感字符串比较。命中集合与原
+            // eq_ignore_ascii_case 四连判完全一致（try_from_str 同为
+            // eq_ignore_ascii_case 全名校验）。
+            enum SpecialHeader {
+                ContentLength,
+                TransferEncoding,
+                Host,
+                Expect,
+                Other,
+            }
+            let key = HeaderOrHipStr::from_str(h.name);
+            let special = match &key {
+                HeaderOrHipStr::HeaderItem(HeaderItem::Content_Length) => {
+                    SpecialHeader::ContentLength
                 }
-                if let Some(prev) = &content_length_seen {
-                    if prev != cl {
-                        Err(anyhow!("conflicting duplicate Content-Length headers"))?;
+                HeaderOrHipStr::HeaderItem(HeaderItem::Transfer_Encoding) => {
+                    SpecialHeader::TransferEncoding
+                }
+                HeaderOrHipStr::HeaderItem(HeaderItem::Host) => SpecialHeader::Host,
+                HeaderOrHipStr::HeaderItem(HeaderItem::Expect) => SpecialHeader::Expect,
+                _ => SpecialHeader::Other,
+            };
+            match special {
+                SpecialHeader::ContentLength => {
+                    let cl = normalized_header_value;
+                    if cl.is_empty() {
+                        Err(anyhow!("empty Content-Length header"))?;
                     }
-                } else {
-                    content_length_seen = Some(cl.to_string());
+                    // RFC 9112: Content-Length 值必须为纯数字。符号/溢出值在头
+                    // 解析阶段就拒绝，避免被下游按不同口径解读（请求走私向量）。
+                    if !cl.bytes().all(|b| b.is_ascii_digit()) {
+                        Err(anyhow!("invalid Content-Length header"))?;
+                    }
+                    if let Some(prev) = &content_length_seen {
+                        if prev != cl {
+                            Err(anyhow!("conflicting duplicate Content-Length headers"))?;
+                        }
+                    } else {
+                        content_length_seen = Some(cl.to_string());
+                    }
+                    // 校验通过后照常入库：body 读取（parse_header_content_length）
+                    // 与下游业务都按存储里的 Content-Length 取值
+                    req.headers.insert(key, LocalHipStr::from(cl));
                 }
-            }
-            if h.name.eq_ignore_ascii_case("Transfer-Encoding") {
-                // RFC 9112: a recipient MUST reject messages containing more
-                // than one Transfer-Encoding header field (request smuggling).
-                if transfer_encoding_seen {
-                    anyhow::bail!("duplicate Transfer-Encoding headers are not allowed");
-                }
-                if normalized_header_value.is_empty() {
-                    anyhow::bail!("empty Transfer-Encoding header");
-                }
-                transfer_encoding_seen = true;
-            }
-            if h.name.eq_ignore_ascii_case("Host") {
-                host_header_count += 1;
-                if host_header_count > 1 {
-                    anyhow::bail!("multiple Host headers are not allowed");
-                }
-                if normalized_header_value.is_empty() {
-                    anyhow::bail!("empty Host header");
-                }
-                if http::uri::Authority::from_str(normalized_header_value).is_err() {
-                    anyhow::bail!("invalid Host header");
-                }
-                has_valid_host = true;
-            }
-            if h.name.eq_ignore_ascii_case("Expect") {
-                let expect_key: HeaderOrHipStr = HeaderItem::Expect.into();
-                if let Some(existing) = req.headers.get(&expect_key) {
-                    req.headers.insert(
-                        expect_key,
-                        LocalHipStr::from(format!(
-                            "{}, {normalized_header_value}",
-                            existing.as_str()
-                        )),
-                    );
-                } else {
+                SpecialHeader::TransferEncoding => {
+                    // RFC 9112: a recipient MUST reject messages containing more
+                    // than one Transfer-Encoding header field (request smuggling).
+                    if transfer_encoding_seen {
+                        anyhow::bail!("duplicate Transfer-Encoding headers are not allowed");
+                    }
+                    if normalized_header_value.is_empty() {
+                        anyhow::bail!("empty Transfer-Encoding header");
+                    }
+                    transfer_encoding_seen = true;
+                    // 校验通过后入库：has_chunked_transfer_encoding 按存储取值
                     req.headers
-                        .insert(expect_key, LocalHipStr::from(normalized_header_value));
+                        .insert(key, LocalHipStr::from(normalized_header_value));
                 }
-            } else {
-                req.headers.insert(
-                    HeaderOrHipStr::from_str(h.name),
-                    LocalHipStr::from(normalized_header_value),
-                );
+                SpecialHeader::Host => {
+                    host_header_count += 1;
+                    if host_header_count > 1 {
+                        anyhow::bail!("multiple Host headers are not allowed");
+                    }
+                    if normalized_header_value.is_empty() {
+                        anyhow::bail!("empty Host header");
+                    }
+                    if !validate_authority_str(normalized_header_value) {
+                        anyhow::bail!("invalid Host header");
+                    }
+                    has_valid_host = true;
+                    // 校验通过后入库：get_header_host / 反代等下游按存储取值
+                    req.headers
+                        .insert(key, LocalHipStr::from(normalized_header_value));
+                }
+                SpecialHeader::Expect => {
+                    if let Some(existing) = req.headers.get(&key) {
+                        req.headers.insert(
+                            key,
+                            LocalHipStr::from(format!(
+                                "{}, {normalized_header_value}",
+                                existing.as_str()
+                            )),
+                        );
+                    } else {
+                        req.headers
+                            .insert(key, LocalHipStr::from(normalized_header_value));
+                    }
+                }
+                SpecialHeader::Other => {
+                    req.headers.insert(key, LocalHipStr::from(normalized_header_value));
+                }
             }
         }
         if req.version >= 11 && !has_valid_host {
@@ -2601,19 +2890,62 @@ impl HttpResponseBodyStream<'_> {
 }
 
 #[derive(Debug)]
+/// 每线程 Date 头固定槽（见 `HttpResponse::default_headers`）。
+/// 线程本地泄漏一份（Box::leak，容量有界），秒切换时整体重写缓冲内容；
+/// 借用安全性依赖 UnsafeCell 内部可变性契约，详见 default_headers 注释。
+struct DateSlot {
+    ts: Cell<i64>,
+    buf: UnsafeCell<[u8; 32]>,
+    len: Cell<usize>,
+}
+// Safety: DateSlot 只经 ThreadLocal 从属线程访问（ThreadLocal 以 &'static
+// 共享故要求 Sync）；内部可变性由线程亲和保证无并发，且 DateSlot 无 Drop。
+unsafe impl Sync for DateSlot {}
+impl DateSlot {
+    fn new() -> Self {
+        Self {
+            ts: Cell::new(i64::MIN),
+            buf: UnsafeCell::new([0u8; 32]),
+            len: Cell::new(0),
+        }
+    }
+    fn timestamp(&self) -> i64 {
+        self.ts.get()
+    }
+    fn write(&self, ts: i64) {
+        let s = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let bytes = s.as_bytes();
+        assert!(bytes.len() <= 32, "HTTP date exceeds fixed date slot");
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.buf.get() as *mut u8, bytes.len());
+        }
+        self.len.set(bytes.len());
+        self.ts.set(ts);
+    }
+    /// 返回槽内容的 &'static str：指向启动期泄漏的槽内存，内容随秒切换
+    /// 原地更新（槽恒为合法 UTF-8，长度恒 ≤ 32）。
+    fn as_str(&self) -> &'static str {
+        unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                (*self.buf.get()).as_ptr(),
+                self.len.get(),
+            ))
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct HttpResponse {
     pub version: Cow<'static, str>,
     pub http_code: u16,
-    pub headers: FxHashMap<Cow<'static, str>, Cow<'static, str>>,
+    pub headers: ResponseHeaders,
     /// Extra values for repeated header fields (e.g. multiple `Set-Cookie`).
     /// The main `headers` map keeps only the first value of each field; every
     /// later occurrence is appended here and serialized after the map values.
     pub multi_headers: Vec<(Cow<'static, str>, Cow<'static, str>)>,
-    pub trailers: FxHashMap<Cow<'static, str>, Cow<'static, str>>,
+    pub trailers: ResponseHeaders,
     pub body: HttpResponseBody,
 }
-unsafe impl Send for HttpResponse {}
-unsafe impl Sync for HttpResponse {}
 impl Clone for HttpResponse {
     fn clone(&self) -> Self {
         Self {
@@ -2630,6 +2962,91 @@ impl Clone for HttpResponse {
     }
 }
 
+/// 响应内存线程本地池（depth=1 热路径）：复用响应头表（头表
+/// 一次 ~768B 分配 + 清零 + 释放）与二进制体缓冲，免去每响应的分配/
+/// 释放往返。仅 potato 自身可用——公开接口零变化：无 `Drop`（加 Drop
+/// 会禁止用户按值移出 `HttpResponse` 字段，破坏既有用法），构造器取池、
+/// 服务端序列化完成后经 `recycle_response` 显式归还（`mem::take` 换出，
+/// 原响应以空默认成员 drop）。用户构造后未发送即丢弃的响应走正常释放，
+/// 只是池不回血，无泄漏无别名。
+///
+/// 安全性：池内对象全程值语义独占传递（pop 出去 / push 回来），map 的
+/// 键值为 `Cow<'static, str>`，clear 仅释放 Owned 值（Borrowed 指向
+/// 'static 数据），无悬垂别名。tokio 工作窃取导致的跨线程取还安全：
+/// 池是纯缓冲，所有权单传，glibc malloc 天然支持跨线程释放。
+struct ResponsePool {
+    maps: Vec<ResponseHeaders>,
+    body_vecs: Vec<Vec<u8>>,
+}
+impl ResponsePool {
+    fn new() -> Self {
+        Self {
+            maps: Vec::new(),
+            body_vecs: Vec::new(),
+        }
+    }
+}
+thread_local! {
+    static RESP_POOL: std::cell::RefCell<ResponsePool> = std::cell::RefCell::new(ResponsePool::new());
+}
+/// 池深度上限（12 工作线程 × 上限成员 ≈ 百 KB 级，内存有界）
+const RESP_POOL_MAX_MAPS: usize = 16;
+const RESP_POOL_MAX_VECS: usize = 16;
+/// 超大响应体不入池（防大缓冲驻留），直接走正常释放
+const RESP_POOL_MAX_VEC_CAPACITY: usize = 256 * 1024;
+
+fn take_pooled_headers() -> ResponseHeaders {
+    RESP_POOL.with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut() {
+            if let Some(mut map) = pool.maps.pop() {
+                map.clear();
+                return map;
+            }
+        }
+        ResponseHeaders::with_capacity(8)
+    })
+}
+
+fn recycle_headers(map: ResponseHeaders) {
+    let mut map = map;
+    map.clear();
+    RESP_POOL.with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut() {
+            if pool.maps.len() < RESP_POOL_MAX_MAPS {
+                pool.maps.push(map);
+            }
+        }
+    });
+}
+
+fn take_pooled_body_vec(data: &[u8]) -> Vec<u8> {
+    RESP_POOL.with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut() {
+            if let Some(mut vec) = pool.body_vecs.pop() {
+                vec.clear();
+                vec.extend_from_slice(data);
+                return vec;
+            }
+        }
+        data.to_vec()
+    })
+}
+
+fn recycle_body_vec(vec: Vec<u8>) {
+    if vec.capacity() > RESP_POOL_MAX_VEC_CAPACITY {
+        return;
+    }
+    let mut vec = vec;
+    vec.clear();
+    RESP_POOL.with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut() {
+            if pool.body_vecs.len() < RESP_POOL_MAX_VECS {
+                pool.body_vecs.push(vec);
+            }
+        }
+    });
+}
+
 macro_rules! make_resp_by_text {
     ($fn_name:ident, $cnt_type:expr) => {
         pub fn $fn_name(body: impl Into<String>) -> Self {
@@ -2639,7 +3056,7 @@ macro_rules! make_resp_by_text {
                 http_code: 200,
                 headers: Self::default_headers($cnt_type),
                 multi_headers: Vec::new(),
-                trailers: FxHashMap::default(),
+                trailers: ResponseHeaders::new(),
                 body: HttpResponseBody::Data(body.into_bytes()),
             }
         }
@@ -2654,8 +3071,8 @@ macro_rules! make_resp_by_binary {
                 http_code: 200,
                 headers: Self::default_headers($cnt_type),
                 multi_headers: Vec::new(),
-                trailers: FxHashMap::default(),
-                body: HttpResponseBody::Data(body.to_vec()),
+                trailers: ResponseHeaders::new(),
+                body: HttpResponseBody::Data(take_pooled_body_vec(body)),
             }
         }
     };
@@ -2679,44 +3096,47 @@ impl HttpResponse {
 
     fn default_headers(
         cnt_type: impl Into<Cow<'static, str>>,
-    ) -> FxHashMap<Cow<'static, str>, Cow<'static, str>> {
+    ) -> ResponseHeaders {
         let current_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|timestamp| timestamp.as_secs() as i64)
             .unwrap_or_default();
 
-        static TL_TIMESTAMP: ThreadLocal<RefCell<(i64, Cow<'static, str>)>> = ThreadLocal::new();
-        let mut tl_timestamp = TL_TIMESTAMP.get_or_default().borrow_mut();
-        let date_str = if current_ts == tl_timestamp.0 {
-            tl_timestamp.1.clone()
-        } else {
-            let new_date: Cow<'_, str> = Utc::now()
-                .format("%a, %d %b %Y %H:%M:%S GMT")
-                .to_string()
-                .into();
-            *tl_timestamp = (current_ts, new_date.clone());
-            new_date
-        };
+        // depth=1 热路径：每响应一条 Date 头。旧实现 Cow::Owned(String).clone()
+        // 每响应一次堆分配；改为每线程一根启动期泄漏的固定槽（Box::leak，
+        // 约 48B/线程，容量有界），秒切换时原地重写内容，同秒内全部响应
+        // 零分配共享同一 &'static str。
+        // UnsafeCell 内部可变性依据：ThreadLocal 保证仅本线程访问；重写只在
+        // 秒切换发生，整体替换且恒为合法 UTF-8。持有旧借用、跨秒边界后才被
+        // 序列化的响应会读到新秒的 Date——内容陈旧但安全，语义上是把 Date
+        // 粒度从“响应构造时刻”放宽到“槽内容所属秒”。
+        static TL_DATE_SLOT: ThreadLocal<&'static DateSlot> = ThreadLocal::new();
+        let slot: &'static DateSlot = TL_DATE_SLOT.get_or(|| Box::leak(Box::new(DateSlot::new())));
+        if current_ts != slot.timestamp() {
+            slot.write(current_ts);
+        }
+        let date_str = slot.as_str();
 
-        [
-            ("Date".into(), date_str),
-            ("Server".into(), Cow::Borrowed(SERVER_STR.as_str())),
-            ("Connection".into(), "keep-alive".into()),
-            ("Content-Type".into(), cnt_type.into()),
-            ("Pragma".into(), "no-cache".into()),
-            ("Cache-Control".into(), "no-cache".into()),
-        ]
-        .into_iter()
-        .collect()
+        // 预留容量一次性建表：6 个标准头一表装下，避免 collect 途中按
+        // 增长策略多次 rehash 重分配（depth=1 每响应热路径）。
+        // 优先从线程本地响应池取回收表（零分配），池空则原地建表。
+        let mut headers = take_pooled_headers();
+        headers.insert("Date".into(), Cow::Borrowed(date_str));
+        headers.insert("Server".into(), Cow::Borrowed(SERVER_STR.as_str()));
+        headers.insert("Connection".into(), "keep-alive".into());
+        headers.insert("Content-Type".into(), cnt_type.into());
+        headers.insert("Pragma".into(), "no-cache".into());
+        headers.insert("Cache-Control".into(), "no-cache".into());
+        headers
     }
 
     pub fn new() -> Self {
         Self {
             version: Cow::Borrowed(""),
             http_code: 0,
-            headers: FxHashMap::with_capacity_and_hasher(6, Default::default()),
+            headers: take_pooled_headers(),
             multi_headers: Vec::new(),
-            trailers: FxHashMap::default(),
+            trailers: ResponseHeaders::new(),
             body: HttpResponseBody::Data(vec![]),
         }
     }
@@ -2770,7 +3190,7 @@ impl HttpResponse {
             .into_iter()
             .collect(),
             multi_headers: Vec::new(),
-            trailers: FxHashMap::default(),
+            trailers: ResponseHeaders::new(),
             body: HttpResponseBody::Stream(rx),
         }
     }
@@ -2909,7 +3329,7 @@ impl HttpResponse {
             .into_iter()
             .collect(),
             multi_headers: Vec::new(),
-            trailers: FxHashMap::default(),
+            trailers: ResponseHeaders::new(),
             body: HttpResponseBody::Data(vec![]),
         }
     }
@@ -2950,12 +3370,12 @@ impl HttpResponse {
         allowed_trailers: &HashSet<String>,
     ) -> anyhow::Result<(
         Vec<u8>,
-        FxHashMap<Cow<'static, str>, Cow<'static, str>>,
+        ResponseHeaders,
         usize,
     )> {
         let mut cursor = hdr_len;
         let mut body = Vec::new();
-        let mut trailers = FxHashMap::with_capacity_and_hasher(4, Default::default());
+        let mut trailers = ResponseHeaders::with_capacity(4);
         let mut tmp_buf = [0u8; 4096];
         // Client side: a hostile server can stream chunks forever, so bound
         // the assembled body the same way request bodies are bounded.
@@ -3084,7 +3504,12 @@ impl HttpResponse {
                 let status_str = self.http_code.http_code_to_desp();
                 let _ = write!(ret, "{} {} {status_str}\r\n", self.version, self.http_code);
                 // 6 标准头快速路径：与 write_to_stream 的固定顺序输出对齐，
-                // 保证 as_bytes 与 write_to_stream 线上字节形态一致
+                // 保证 as_bytes 与 write_to_stream 线上字节形态一致。
+                // 此路径服务 depth=8 流水线批合并（ResponseBatcher），保持
+                // write! 原实现不动（2026-11-25 ABBA 配对：write_to_stream
+                // 侧优化使 depth=1 +3.5%，as_bytes 侧同改则 depth=8 出现
+                // 全对一致的 -1.4% 微回归，按"不得影响 depth=8 基线"红线
+                // 单独还原本路径）。
                 if self.headers.len() == 6 && self.multi_headers.is_empty() {
                     if let (
                         Some(date),
@@ -3174,6 +3599,23 @@ impl HttpResponse {
         }
     }
 
+    /// 服务端热路径专用：响应序列化完成后把头表与 Data 体缓冲归还线程
+    /// 本地池（`mem::take` 换出，self 留空默认成员，后续 drop 零成本）。
+    /// 仅 Data 体回收；Stream 体生命周期不受控（泵活多久不确定）不回收。
+    /// 非 `pub`——用户侧构造的响应不经此路径，行为与直接 drop 一致。
+    pub(crate) fn recycle_into_pool(&mut self) {
+        if matches!(self.body, HttpResponseBody::Data(_)) {
+            let headers = std::mem::take(&mut self.headers);
+            recycle_headers(headers);
+            if let HttpResponseBody::Data(vec) = std::mem::replace(
+                &mut self.body,
+                HttpResponseBody::Data(Vec::new()),
+            ) {
+                recycle_body_vec(vec);
+            }
+        }
+    }
+
     /// Write response to stream, handling both Data and Stream body types
     pub async fn write_to_stream(
         &mut self,
@@ -3222,14 +3664,24 @@ impl HttpResponse {
                     payload_ref = &[];
                 }
 
-                // 单遍直写序列化：直接 write! 进目标缓冲。此前每头经
+                // 单遍直写序列化：直接写字节进目标缓冲。此前每头经
                 // ssformat! 先格式化进临时 SmallString 再 push_str 拷贝，
                 // 双重格式化在 depth=1 热路径实测比批处理 as_bytes 路径
-                // 慢约 3%（2026-11-24 ABBA 配对实锤）。
+                // 慢约 3%（2026-11-24 ABBA 配对实锤）。热路径常量前缀
+                // extend + 手写整数十进制，字节形态与 write! 版一致。
                 use std::fmt::Write as _;
                 let mut ret = smallstr::SmallString::<[u8; 4096]>::new();
                 let status_str = self.http_code.http_code_to_desp();
-                let _ = write!(ret, "{} {} {status_str}\r\n", self.version, self.http_code);
+                if self.version == "HTTP/1.1" {
+                    ret.push_str("HTTP/1.1 ");
+                    let mut tmp = [0u8; 20];
+                    ret.push_str(u64_ascii_str(self.http_code as u64, &mut tmp));
+                    ret.push_str(" ");
+                    ret.push_str(status_str);
+                    ret.push_str("\r\n");
+                } else {
+                    let _ = write!(ret, "{} {} {status_str}\r\n", self.version, self.http_code);
+                }
                 if self.headers.len() == 6 && self.multi_headers.is_empty() {
                     if let (
                         Some(date),
@@ -3246,17 +3698,12 @@ impl HttpResponse {
                         self.headers.get("Pragma"),
                         self.headers.get("Cache-Control"),
                     ) {
-                        let _ = write!(ret, "Date: {}\r\n", sanitize_header_str(date));
-                        let _ = write!(ret, "Server: {}\r\n", sanitize_header_str(server));
-                        let _ = write!(ret, "Connection: {}\r\n", sanitize_header_str(connection));
-                        let _ =
-                            write!(ret, "Content-Type: {}\r\n", sanitize_header_str(content_type));
-                        let _ = write!(ret, "Pragma: {}\r\n", sanitize_header_str(pragma));
-                        let _ = write!(
-                            ret,
-                            "Cache-Control: {}\r\n",
-                            sanitize_header_str(cache_control)
-                        );
+                        push_header_line_str!(ret, "Date: ", date);
+                        push_header_line_str!(ret, "Server: ", server);
+                        push_header_line_str!(ret, "Connection: ", connection);
+                        push_header_line_str!(ret, "Content-Type: ", content_type);
+                        push_header_line_str!(ret, "Pragma: ", pragma);
+                        push_header_line_str!(ret, "Cache-Control: ", cache_control);
                     } else {
                         for (key, value) in self.headers.iter() {
                             if key == "Content-Length"
@@ -3298,7 +3745,10 @@ impl HttpResponse {
                     );
                 }
                 if !suppress_body_by_status {
-                    let _ = write!(ret, "Content-Length: {}\r\n", payload_ref.len());
+                    ret.push_str("Content-Length: ");
+                    let mut tmp = [0u8; 20];
+                    ret.push_str(u64_ascii_str(payload_ref.len() as u64, &mut tmp));
+                    ret.push_str("\r\n");
                 }
                 if cmode == CompressMode::Gzip && !suppress_body_by_status {
                     ret.push_str("Content-Encoding: gzip\r\n");
@@ -3452,7 +3902,11 @@ impl HttpResponse {
             res.trailers = trailers;
             res.body = HttpResponseBody::Data(chunked_body);
         } else if let Some(cnt_len) = res.headers.get("Content-Length") {
-            bdy_len = cnt_len.parse::<usize>().unwrap_or(0);
+            // 非法值直接报错：按 0 处理会让剩余字节被误当下一跳响应
+            // （解析不同步向量）。
+            bdy_len = cnt_len
+                .parse::<usize>()
+                .map_err(|_| anyhow!("invalid Content-Length header"))?;
             let max_body_bytes = ServerConfig::get_max_body_bytes();
             if bdy_len > max_body_bytes {
                 anyhow::bail!(
@@ -3493,6 +3947,10 @@ impl HttpResponse {
                 if header_value.is_empty() {
                     Err(anyhow!("empty Content-Length header"))?;
                 }
+                // RFC 9112: Content-Length 值必须为纯数字，与请求侧同口径。
+                if !header_value.bytes().all(|b| b.is_ascii_digit()) {
+                    Err(anyhow!("invalid Content-Length header"))?;
+                }
                 if let Some(prev) = &content_length_seen {
                     if prev != header_value {
                         Err(anyhow!("conflicting duplicate Content-Length headers"))?;
@@ -3505,16 +3963,18 @@ impl HttpResponse {
                 continue;
             }
             if h.name.eq_ignore_ascii_case("Transfer-Encoding") {
+                // RFC 9112: a recipient MUST reject messages containing more
+                // than one Transfer-Encoding header field (request smuggling).
+                // 与请求侧同口径：重复头直接拒绝，不做逗号合并。
+                if transfer_encoding_seen {
+                    anyhow::bail!("duplicate Transfer-Encoding headers are not allowed");
+                }
                 if header_value.is_empty() {
                     Err(anyhow!("empty Transfer-Encoding header"))?;
                 }
                 transfer_encoding_seen = true;
-                if let Some(existing) = req.headers.get_mut("Transfer-Encoding") {
-                    *existing = format!("{}, {header_value}", existing.as_ref()).into();
-                } else {
-                    req.headers
-                        .insert("Transfer-Encoding".into(), header_value.to_string().into());
-                }
+                req.headers
+                    .insert("Transfer-Encoding".into(), header_value.to_string().into());
                 continue;
             }
             let name_std = h.name.http_std_case();
@@ -3701,6 +4161,32 @@ mod tests {
     }
 
     #[test]
+    fn response_parser_rejects_duplicate_transfer_encoding() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let err = HttpResponse::from_headers_part(raw).unwrap_err();
+        assert!(err.to_string().contains("duplicate Transfer-Encoding"));
+    }
+
+    #[test]
+    fn request_parser_rejects_non_numeric_content_length() {
+        // 非数字（含符号）在头解析阶段即拒绝
+        for raw in [
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: +5\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5x\r\n\r\n".as_slice(),
+        ] {
+            let err = HttpRequest::from_headers_part(raw).unwrap_err();
+            assert!(err.to_string().contains("invalid Content-Length"));
+        }
+    }
+
+    #[test]
+    fn response_parser_rejects_non_numeric_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: xyz\r\n\r\n";
+        let err = HttpResponse::from_headers_part(raw).unwrap_err();
+        assert!(err.to_string().contains("invalid Content-Length"));
+    }
+
+    #[test]
     fn response_transfer_encoding_supports_case_insensitive_lists() {
         assert!(HttpResponse::transfer_encoding_has_chunked("gzip, Chunked").unwrap());
     }
@@ -3713,5 +4199,75 @@ mod tests {
         let serialized = String::from_utf8(res.as_bytes(CompressMode::None, None)).unwrap();
         assert!(serialized.contains("Content-Length: 5\r\n"));
         assert!(!serialized.contains("Transfer-Encoding:"));
+    }
+}
+
+#[cfg(test)]
+mod authority_validator_equiv_tests {
+    use super::validate_authority_str;
+    use std::str::FromStr;
+
+    /// 校验器与 http::uri::Authority::from_str 判定逐例等价。
+    /// H 优化把 Host 校验换成本地零分配移植版，此测试钉死两套判定，
+    /// http crate 升版若改变语义会在此暴露。
+    #[test]
+    fn host_validator_matches_http_crate_authority() {
+        let named: &[&str] = &[
+            "",
+            "x",
+            "localhost",
+            "localhost:80",
+            "localhost:",
+            "127.0.0.1:18083",
+            "[::1]:443",
+            "[::1]",
+            "[fe80::1%25eth0]:80",
+            "::1",
+            "[::1",
+            "::1]",
+            "host[",
+            "host]",
+            "[[::1]]",
+            "example.com/path",
+            "example.com?q=1",
+            "example.com#frag",
+            "user:pass@example.com:8080",
+            "user:pass:extra@example.com",
+            "user@name@example.com",
+            "user@",
+            "@example.com",
+            "local%20host",
+            "localhost:8080:3030",
+            "host_name",
+            "-a-.b.c",
+            "h%!ost",
+            "h~o.s_t",
+            "exa[mple.com",
+            "a b",
+            "example.com:99999",
+            "1.2.3.4:0",
+            "very.long.subdomain.example.com",
+            "host:00000008",
+        ];
+        for case in named {
+            assert_eq!(
+                validate_authority_str(case),
+                http::uri::Authority::from_str(case).is_ok(),
+                "mismatch for {case:?}"
+            );
+        }
+
+        // 2 字符组合遍历：覆盖截断字符、括号、%、@、: 的两两组合语义
+        let alphabet: Vec<char> = "abz09:@[ ]/?#.%_-~!$&'()*+,;=".chars().collect();
+        for a in &alphabet {
+            for b in &alphabet {
+                let s: String = [*a, *b].iter().collect();
+                assert_eq!(
+                    validate_authority_str(&s),
+                    http::uri::Authority::from_str(&s).is_ok(),
+                    "mismatch for {s:?}"
+                );
+            }
+        }
     }
 }
