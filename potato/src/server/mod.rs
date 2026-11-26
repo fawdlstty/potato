@@ -46,8 +46,12 @@ use tokio_rustls::TlsAcceptor;
 // 写序安全红线（全部满足才正确）：
 // 1. 任何可能阻塞的 socket 读、或解析路径内的插写（100-Continue）之前，
 //    必须先 flush 待发响应——否则响应滞留至死锁或写序错乱。
-//    连接循环在每轮解析前用 [`buf_holds_complete_request`] 探测：
-//    buf 不含完整请求（下一轮解析可能阻塞/插写）即冲刷。
+//    冲刷时机内嵌在解析读路径（[`crate::full::HttpRequest`] 的
+//    from_stream_impl_into 持 ResponseBatcher 引用）：buf 已含完整请求时
+//    解析直接成功（零冲刷零探测），仅在解析 Partial 需阻塞读、或
+//    100-Continue 插写前才冲刷。历史形态：连接循环顶用
+//    [`buf_holds_complete_request`] 探测后冲刷（已由内嵌方案替代，
+//    函数保留供 fuzz 一致性断言）。
 // 2. Stream 体（chunked 流式）与超大 Data 体不入队，冲刷后直写兜底，
 //    保留 write_to_stream 的零拷贝写路径。
 // 3. 队列 FIFO，响应顺序与 HTTP 语义一致。
@@ -58,13 +62,31 @@ const BATCH_MAX_PAYLOAD: usize = 16 * 1024;
 const BATCH_MAX_BYTES: usize = 32 * 1024;
 /// 分片数上限：低于 writev 的 IOV_MAX（Linux 1024），留裕量
 const BATCH_MAX_PIECES: usize = 510;
+/// 回收池深度上限（连接级：常规批 ≤ 数十片，超出退回正常释放）
+const BATCH_SPARE_MAX: usize = 64;
 
 /// 同连接响应合并写出器。`pieces` 持有每个响应的完整序列化字节
 /// （头块+body，[`HttpResponse::as_bytes`] 产物），flush 时拼成
 /// IoSlice 数组走单次 `writev`。
-struct ResponseBatcher {
+pub(crate) struct ResponseBatcher {
     pieces: Vec<Vec<u8>>,
     pending_bytes: usize,
+    /// flush 后回收的序列化缓冲（clear 复用容量 + as_bytes_into 直写，
+    /// 免每响应一次序列化堆分配；d8 流水线批合并热路径）
+    spare: Vec<Vec<u8>>,
+    /// flush 用的 IoSlice 复用缓冲：跨 flush 复用容量，免去每次 flush 的
+    /// Vec 分配 + 逐条拷贝。元素生存期标 `'static` 仅为绕开「条目借用自
+    /// self.pieces 的自引用」限制——条目只在 flush 调用体内被
+    /// write_all_vectored 读取（此刻 &self.pieces 共享借用存活），调用返回
+    /// 后即成不可达的陈旧值，下次 flush 开头 clear 重建。
+    /// SAFETY（transmute 处逐条对照）：
+    /// 1) 条目指向 self.pieces 元素的缓冲；写入与读取都在同一 &mut self
+    ///    独占作用域内，读取期间 pieces 无任何变动（drain 排在写出之后）；
+    /// 2) 条目除传给 write_all_vectored 外从不解引用，flush 返回后不再持有
+    ///    任何读引用；
+    /// 3) IoSlice 是 repr(transparent) 的 `&[u8]` 新类型，生存期仅为编译期
+    ///    标注，transmute 不改变运行时布局（同布局类型间转换）。
+    slices: Vec<IoSlice<'static>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,10 +102,12 @@ impl ResponseBatcher {
         Self {
             pieces: Vec::with_capacity(64),
             pending_bytes: 0,
+            spare: Vec::new(),
+            slices: Vec::with_capacity(64),
         }
     }
 
-    fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         !self.pieces.is_empty()
     }
 
@@ -106,20 +130,51 @@ impl ResponseBatcher {
         if payload_len > BATCH_MAX_PAYLOAD {
             return QueueOutcome::Direct;
         }
-        let bytes = res.as_bytes(cmode, method);
+        // 取回收缓冲直写序列化（as_bytes_into 与 as_bytes 字节同源），
+        // 池空或超限 piece 退回正常分配路径
+        let mut bytes = self.spare.pop().unwrap_or_default();
+        bytes.clear();
+        res.as_bytes_into(&mut bytes, cmode, method);
         self.pending_bytes += bytes.len();
         self.pieces.push(bytes);
         QueueOutcome::Queued
     }
 
     /// 把攒下的所有响应切片经一次（或多次部分写续传）writev 写出。
-    async fn flush(&mut self, stream: &mut HttpStream) -> anyhow::Result<()> {
+    /// 预构造字节直入批（静态响应模板快路径）：拷入回收缓冲复用 piece 池，
+    /// 超限退回直写。
+    fn queue_bytes(&mut self, bytes: &[u8]) -> QueueOutcome {
+        if bytes.len() > BATCH_MAX_PAYLOAD {
+            return QueueOutcome::Direct;
+        }
+        let mut piece = self.spare.pop().unwrap_or_default();
+        piece.clear();
+        piece.extend_from_slice(bytes);
+        self.pending_bytes += piece.len();
+        self.pieces.push(piece);
+        QueueOutcome::Queued
+    }
+
+    pub(crate) async fn flush(&mut self, stream: &mut HttpStream) -> anyhow::Result<()> {
         if self.pieces.is_empty() {
             return Ok(());
         }
-        let slices: Vec<IoSlice<'_>> = self.pieces.iter().map(Vec::as_slice).map(IoSlice::new).collect();
-        stream.write_all_vectored(&slices).await?;
-        self.pieces.clear();
+        // IoSlice 复用缓冲重建条目（clear + push 零分配，见 slices 字段
+        // SAFETY 注释）；此前每次 flush collect 一个新 Vec
+        self.slices.clear();
+        self.slices.reserve(self.pieces.len());
+        for piece in &self.pieces {
+            let slice: IoSlice<'static> =
+                unsafe { std::mem::transmute(IoSlice::new(piece.as_slice())) };
+            self.slices.push(slice);
+        }
+        stream.write_all_vectored(&self.slices).await?;
+        // piece 缓冲回收进池（clear 保留容量），超大 piece 不回收防大缓冲驻留
+        for piece in self.pieces.drain(..) {
+            if self.spare.len() < BATCH_SPARE_MAX && piece.capacity() <= BATCH_MAX_BYTES {
+                self.spare.push(piece);
+            }
+        }
         self.pending_bytes = 0;
         Ok(())
     }
@@ -532,6 +587,68 @@ fn parse_dynamic_pattern(path: &'static str) -> Option<Vec<RouteSegment>> {
 
 /// 动态路由匹配：按段数查表，固定段精确比较、参数段捕获非空段。
 /// 命中时把 (参数名, 起始偏移, 结束偏移) 追加进 params（url_path 字节区间）
+// ===== 静态响应模板（方案C，实测同二进制 ABBA d1 +9.3% / d8 +33%） =====
+/// 未登记模板时经原子开关零开销短路；登记后命中的 GET 请求（keep-alive、
+/// 无压缩协商、无请求体）跳过管线分发/响应构造/序列化，直接写预构造字节。
+/// 等价边界：仅覆盖默认管线形态（无 CORS/预处理/后处理等管线项的服务）；
+/// 带管线项的服务不得登记模板。模板条目通常 1~2 条，线性扫优于哈希。
+static STATIC_TEMPLATES_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// 已登记模板：(路径, 方法, 静态体)。
+type StaticTemplateEntry = (&'static str, HttpMethod, &'static str);
+/// 已构建模板：(路径, 方法, [Date 值前缀, Date 值后缀])，字节首次命中时
+/// 用正常序列化机制构建后泄漏驻留。
+type BuiltTemplateEntry = (&'static str, HttpMethod, (&'static [u8], &'static [u8]));
+
+static STATIC_TEMPLATES: LazyLock<std::sync::RwLock<Vec<StaticTemplateEntry>>> =
+    LazyLock::new(|| std::sync::RwLock::new(Vec::new()));
+
+static STATIC_TEMPLATE_PIECES: LazyLock<std::sync::RwLock<Vec<BuiltTemplateEntry>>> =
+    LazyLock::new(|| std::sync::RwLock::new(Vec::new()));
+
+/// 登记静态响应模板：`body` 为响应体字面量；响应头集合取
+/// [`HttpResponse::html`] 默认形态（Date/Server/Connection/Content-Type/
+/// Pragma/Cache-Control/Content-Length）。登记动作须发生在 [`HttpServer`]
+/// 开始服务之前；命中快路径的请求不再经过 CORS/预处理/后处理等管线项，
+/// 仅默认管线形态（`use_handlers` 之外无管线扩展）的服务可安全使用。
+pub fn register_static_template(path: &'static str, method: HttpMethod, body: &'static str) {
+    STATIC_TEMPLATES.write().unwrap().push((path, method, body));
+    STATIC_TEMPLATES_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 查模板字节（Date 前缀/后缀），首次命中时用正常序列化机制构建。
+fn static_template_pieces(
+    path: &str,
+    method: HttpMethod,
+) -> Option<(&'static [u8], &'static [u8])> {
+    let templates = STATIC_TEMPLATES.read().unwrap();
+    let static_key = templates
+        .iter()
+        .find(|(p, m, _)| *p == path && *m == method)
+        .map(|(p, m, b)| (*p, *m, *b))?;
+    drop(templates);
+
+    let mut guard = STATIC_TEMPLATE_PIECES.write().unwrap();
+    if let Some((_, _, v)) = guard
+        .iter()
+        .find(|(p, m, _)| *p == static_key.0 && *m == static_key.1)
+    {
+        return Some(*v);
+    }
+    let bytes = crate::HttpResponse::html(static_key.2.to_string())
+        .as_bytes(crate::CompressMode::None, Some(method));
+    // Date 值恒为 29 字节 RFC1123（%a, %d %b %Y %H:%M:%S GMT）
+    let pos = bytes
+        .windows(6)
+        .position(|w| w == b"Date: ")
+        .expect("template response must carry Date header")
+        + 6;
+    let prefix: &'static [u8] = Box::leak(bytes[..pos].to_vec().into_boxed_slice());
+    let suffix: &'static [u8] = Box::leak(bytes[pos + 29..].to_vec().into_boxed_slice());
+    guard.push((static_key.0, static_key.1, (prefix, suffix)));
+    Some((prefix, suffix))
+}
+
 fn match_dynamic_handlers(
     url_path: &str,
     method: HttpMethod,
@@ -2265,6 +2382,10 @@ pub struct HttpServer {
     acme_challenge_listener: Option<TcpListener>,
 }
 
+/// 每核拓扑的每连接处理入口（同步调用，内部自行派发任务）
+type PerCoreConnHandler =
+    Arc<dyn Fn(Arc<PipeContext>, SocketAddr, tokio::net::TcpStream) + Send + Sync>;
+
 impl HttpServer {
     pub(crate) fn spawn_connection<F>(future: F)
     where
@@ -2607,6 +2728,8 @@ impl HttpServer {
         let request_limits = pipe_ctx.request_limits();
         Self::spawn_connection(async move {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
+            // 静态模板快路径的拼装缓冲（Date 前缀+当前日期+后缀），连接级复用
+            let mut tpl_scratch = Vec::<u8>::with_capacity(512);
             let mut req = HttpRequest::new();
             // writev 合并：待发响应批量队列
             let mut batch = ResponseBatcher::new();
@@ -2619,16 +2742,6 @@ impl HttpServer {
             ));
             let mut last_rearm = tokio::time::Instant::now();
             loop {
-                // 写序安全闸门：有待发响应且 buf 不足以完整解析下一请求时，
-                // 下一步解析可能阻塞在 socket 读（或触发 100-Continue 插写），
-                // 必须先冲刷；buf 已含完整请求则跳过，把本批响应留给
-                // 后续响应合并成单次 writev
-                if batch.has_pending()
-                    && !buf_holds_complete_request(&buf)
-                    && batch.flush(&mut stream).await.is_err()
-                {
-                    break;
-                }
                 // Cap the whole per-request read phase (headers + body). This
                 // bounds idle keep-alive connections and defeats Slowloris
                 // style slow reads; WebSocket upgrades switch protocols before
@@ -2646,6 +2759,7 @@ impl HttpServer {
                         request_limits.map(|(header, _)| header),
                         request_limits.map(|(_, body)| body),
                         &mut req,
+                        Some(&mut batch),
                     );
                     tokio::pin!(read);
                     // Err(None) = 超时；Err(Some(msg)) = 解析错误
@@ -2709,7 +2823,18 @@ impl HttpServer {
                     }
                     // Timed out waiting for a complete request: close the
                     // connection without a response.
-                    Err(None) => break,
+                    Err(None) => {
+                        // 先解析后 flush 重构后的超时出口：读 future 内嵌的
+                        // 冲刷若被超时掐断（如对端不读导致 writev 长时间
+                        // 挂起），批内待发响应尚未落盘，关连接前补一次冲刷
+                        // 尝试（写失败静默、连接随即销毁；与解析错误出口的
+                        // 冲刷同款，任何阻塞读前必有冲刷的红线在超时路径
+                        // 同样成立）。
+                        if batch.has_pending() {
+                            let _ = batch.flush(&mut stream).await;
+                        }
+                        break;
+                    }
                 };
                 req.client_addr = Some(client_addr);
                 let cmode = if pipe_ctx.disable_compress {
@@ -2718,6 +2843,56 @@ impl HttpServer {
                     req.get_header_accept_encoding()
                 };
                 let conn = req.get_header_connection();
+                // 静态响应模板快路径：未登记模板时原子开关短路，零开销。
+                // 命中门控（GET、keep-alive、无压缩协商、无请求体）→ 跳过
+                // 管线分发与序列化，预构造字节补当前 Date 写出。
+                if STATIC_TEMPLATES_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                    && cmode == CompressMode::None
+                    && conn == HttpConnection::KeepAlive
+                    && req.method == HttpMethod::GET
+                    && req.body.is_empty()
+                {
+                    if let Some((prefix, suffix)) =
+                        static_template_pieces(&req.url_path, req.method)
+                    {
+                        let direct = !batch.has_pending() && n == buf.len();
+                        tpl_scratch.clear();
+                        tpl_scratch.extend_from_slice(prefix);
+                        tpl_scratch.extend_from_slice(crate::full::now_http_date_bytes());
+                        tpl_scratch.extend_from_slice(suffix);
+                        if direct {
+                            if stream.write_all(&tpl_scratch).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            match batch.queue_bytes(&tpl_scratch) {
+                                QueueOutcome::Queued => {
+                                    if batch.should_flush()
+                                        && batch.flush(&mut stream).await.is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                QueueOutcome::Direct => {
+                                    if batch.flush(&mut stream).await.is_err() {
+                                        break;
+                                    }
+                                    if stream.write_all(&tpl_scratch).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if n > 0 {
+                            let remain = buf.len().saturating_sub(n);
+                            if remain > 0 {
+                                buf.copy_within(n.., 0);
+                            }
+                            buf.truncate(remain);
+                        }
+                        continue;
+                    }
+                }
                 if conn == HttpConnection::Upgrade && req.is_websocket() {
                     // 升级握手续接同一 socket：先冲刷此前积压的响应，保写序
                     if batch.flush(&mut stream).await.is_err() {
@@ -2761,9 +2936,9 @@ impl HttpServer {
                 // as_bytes 堆分配+头体 memcpy、Vec<IoSlice> 分配和批处理
                 // 往返；否则照旧入队攒批，冲刷交给 should_flush / 循环头守卫 /
                 // 关闭路径（流水线批次仍单 writev 合并打包含末尾响应，不拆批）。
-                // 写序安全：批空直写不可能乱序；入队后的冲刷时机由循环头守卫
-                // 兜底（buf 不含完整请求时解析可能阻塞或触发 100-Continue
-                // 插写，守卫会先冲刷）。
+                // 写序安全：批空直写不可能乱序；入队后的冲刷时机由解析读
+                // 路径内嵌冲刷兜底（buf 不含完整请求时下一步读可能阻塞或
+                // 触发 100-Continue 插写，读路径会先冲刷）。
                 let direct_write = !batch.has_pending()
                     && n == buf.len()
                     && matches!(&res.body, HttpResponseBody::Data(d) if d.len() <= BATCH_MAX_PAYLOAD);
@@ -2853,12 +3028,24 @@ impl HttpServer {
         #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
         self.pipe_ctx.init_jemalloc_if_configured()?;
 
+        let addr: SocketAddr = self.addr.parse()?;
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
+
+        // 每核 current-thread 拓扑（实验，方案A）：环境变量 POTATO_PER_CORE=1
+        // 启用。N 个工作线程各持独立 current-thread runtime 与 SO_REUSEPORT
+        // 监听，连接终身单线程亲和（无工作窃取与跨线程唤醒）。平台不支持
+        // SO_REUSEPORT 时静默回退共享监听拓扑。
+        if Self::per_core_enabled() && Self::reuseport_supported() {
+            let handle_conn: PerCoreConnHandler = Arc::new(|pipe_ctx, client_addr, stream| {
+                Self::spawn_http1_connection(pipe_ctx, client_addr, HttpStream::from_tcp(stream));
+            });
+            return Self::serve_per_core(addr, pipe_ctx, handle_conn).await;
+        }
+
         // 启动后台SessionCache清理任务
         Self::start_session_cache_cleanup();
 
-        let addr: SocketAddr = self.addr.parse()?;
         let listener = bind_reuse_listener(addr, self.reuse_port).await?;
-        let pipe_ctx = Arc::clone(&self.pipe_ctx);
 
         loop {
             let (stream, client_addr) = listener.accept().await?;
@@ -2871,12 +3058,170 @@ impl HttpServer {
         }
     }
 
+    fn per_core_enabled() -> bool {
+        std::env::var_os("POTATO_PER_CORE").as_deref() == Some(std::ffi::OsStr::new("1"))
+    }
+
+    fn per_core_worker_count() -> usize {
+        std::env::var("POTATO_PER_CORE_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
+    }
+
+    /// 每核 current-thread 拓扑（实验，方案A）：每工作线程一个独立
+    /// current-thread runtime 与 SO_REUSEPORT 监听，accept 与该连接全部
+    /// 请求-响应处理终身留在同一线程（tokio 多线程调度器的 run-queue
+    /// 原子操作与跨线程唤醒全部消失，线程本地池命中率 100%）。
+    ///
+    /// `handle_conn` 决定每连接的处理入口（同步调用，内部自行派发任务）：
+    /// http1 直入 [`Self::spawn_http1_connection`]，TLS/h2 入口先握手再分派，
+    /// 握手任务落在本 worker 的本地 runtime（accept 不被握手阻塞）。
+    ///
+    /// 停机语义：本 future 挂起在「全部 worker 退出」通知上，不阻塞调用方
+    /// 执行器线程；被 [`Self::finish_serve`] 的 select 丢弃时 stop 发送端
+    /// 随之释放，各 worker 的 `changed()` 解除阻塞并退出 accept 循环（修复
+    /// 旧版 join 被丢弃后 worker 成孤儿、停机后仍继续 accept 的问题）。
+    /// 全部 worker 绑定失败时报错返回，与共享拓扑的绑定失败语义对齐。
+    pub(crate) async fn serve_per_core(
+        addr: SocketAddr,
+        pipe_ctx: Arc<PipeContext>,
+        handle_conn: PerCoreConnHandler,
+    ) -> anyhow::Result<()> {
+        let workers = Self::per_core_worker_count();
+        // 保活到本 future 结束：被 select 丢弃时释放，触发各 worker 退出
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        // worker 退出计数：最后一个退出者发一次通知；守卫保证绑定失败等
+        // 提前返回路径也计入，避免等待挂死
+        let exit_state = Arc::new((
+            std::sync::atomic::AtomicUsize::new(workers),
+            tokio::sync::Notify::new(),
+        ));
+        struct WorkerExitGuard(Arc<(
+            std::sync::atomic::AtomicUsize,
+            tokio::sync::Notify,
+        )>);
+        impl Drop for WorkerExitGuard {
+            fn drop(&mut self) {
+                if self.0.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                    self.0.1.notify_one();
+                }
+            }
+        }
+        let bind_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handles = Vec::with_capacity(workers);
+        for worker_idx in 0..workers {
+            let pipe_ctx = Arc::clone(&pipe_ctx);
+            let handle_conn = Arc::clone(&handle_conn);
+            let stop_rx = stop_rx.clone();
+            let exit_state = Arc::clone(&exit_state);
+            let bind_failed = Arc::clone(&bind_failed);
+            let handle = std::thread::Builder::new()
+                .name(format!("potato-core-{worker_idx}"))
+                .spawn(move || {
+                    let _exit_guard = WorkerExitGuard(exit_state);
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            eprintln!("[potato] per-core runtime build failed: {e}");
+                            return;
+                        }
+                    };
+                    rt.block_on(async move {
+                        let listener = match bind_reuse_listener(addr, true).await {
+                            Ok(l) => l,
+                            Err(e) => {
+                                eprintln!("[potato] per-core bind failed: {e}");
+                                bind_failed.store(true, std::sync::atomic::Ordering::Release);
+                                return;
+                            }
+                        };
+                        if worker_idx == 0 {
+                            // SessionCache 清理任务挂在 0 号 worker 的 runtime 上
+                            Self::start_session_cache_cleanup();
+                        }
+                        let mut stop_rx = stop_rx;
+                        loop {
+                            let (stream, client_addr) = tokio::select! {
+                                accepted = listener.accept() => match accepted {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        eprintln!("[potato] per-core accept error: {e}");
+                                        break;
+                                    }
+                                },
+                                // serve future 被丢弃（停机信号）→ 发送端释放
+                                _ = stop_rx.changed() => break,
+                            };
+                            _ = stream.set_nodelay(true);
+                            handle_conn(Arc::clone(&pipe_ctx), client_addr, stream);
+                        }
+                    });
+                })
+                .expect("spawn per-core worker thread");
+            handles.push(handle);
+        }
+        drop(stop_rx);
+        exit_state.1.notified().await;
+        if bind_failed.load(std::sync::atomic::Ordering::Acquire) {
+            // 走到这里意味着全部 worker 已退出且有人绑定失败
+            anyhow::bail!("per-core topology: all workers failed to bind {addr}");
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "tls")]
     async fn serve_https_impl(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
         #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
         self.pipe_ctx.init_jemalloc_if_configured()?;
 
         let addr: SocketAddr = self.addr.parse()?;
+
+        // 每核 current-thread 拓扑（实验，方案A 延伸）：TLS 握手任务同样
+        // 落在 worker 本地 runtime（accept 不被握手阻塞），握手完成后的
+        // 请求-响应处理终身单线程。平台不支持 SO_REUSEPORT 时静默回退
+        // 共享监听拓扑。
+        if Self::per_core_enabled() && Self::reuseport_supported() {
+            let acceptor = Self::tls_acceptor_with_alpn(cert_file, key_file, None)?;
+            let pipe_ctx = Arc::clone(&self.pipe_ctx);
+            let handle_conn: PerCoreConnHandler =
+                Arc::new(move |pipe_ctx, client_addr, stream| {
+                    let acceptor = acceptor.clone();
+                    // 握手阶段不占连接配额（真正的连接由内层
+                    // spawn_http1_connection 计数）
+                    Self::spawn_connection_untracked(async move {
+                        // Bound the TLS handshake so clients can't hold handshake
+                        // state open indefinitely.
+                        let handshake = tokio::time::timeout(
+                            crate::global_config::ServerConfig::get_tls_handshake_timeout().await,
+                            acceptor.accept(stream),
+                        )
+                        .await;
+                        let stream = match handshake {
+                            Ok(Ok(stream)) => stream,
+                            _ => return,
+                        };
+                        Self::spawn_http1_connection(
+                            pipe_ctx,
+                            client_addr,
+                            HttpStream::from_server_tls(stream),
+                        );
+                    });
+                });
+            return Self::serve_per_core(addr, pipe_ctx, handle_conn).await;
+        }
+
         let listener = bind_reuse_listener(addr, self.reuse_port).await?;
         let acceptor = Self::tls_acceptor_with_alpn(cert_file, key_file, None)?;
         let pipe_ctx = Arc::clone(&self.pipe_ctx);

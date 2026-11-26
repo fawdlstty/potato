@@ -784,6 +784,34 @@ macro_rules! push_header_line_str {
     }};
 }
 
+/// 热路径头行序列化宏（`Vec<u8>` 缓冲版，键值均为 `&str`）：常量/净化后
+/// 键 + ": " + 净化后的值 + CRLF 直写，与
+/// `write!("{}: {}\r\n", sanitize_header_str(k), sanitize_header_str(v))`
+/// 字节形态一致，绕开 fmt 机制调度开销（as_bytes_into 批合并直写路径）。
+macro_rules! push_header_line_bytes {
+    ($ret:expr, $prefix:expr, $value:expr) => {{
+        $ret.extend_from_slice($prefix);
+        let __v = sanitize_header_str($value);
+        $ret.extend_from_slice(__v.as_bytes());
+        $ret.extend_from_slice(b"\r\n");
+    }};
+}
+
+/// 热路径头行序列化宏（`Vec<u8>` 缓冲版，键值均为 `&str`，动态键）：
+/// `sanitize(k) + ": " + sanitize(v) + CRLF` 直写，与
+/// `write!("{}: {}\r\n", sanitize_header_str(k), sanitize_header_str(v))`
+/// 字节形态一致。
+macro_rules! push_header_kv_bytes {
+    ($ret:expr, $key:expr, $value:expr) => {{
+        let __k = sanitize_header_str($key);
+        $ret.extend_from_slice(__k.as_bytes());
+        $ret.extend_from_slice(b": ");
+        let __v = sanitize_header_str($value);
+        $ret.extend_from_slice(__v.as_bytes());
+        $ret.extend_from_slice(b"\r\n");
+    }};
+}
+
 /// URI 合法字符表：条目为 0 表示非法，否则为字节自身。
 /// 移植自 http-1.5.0 `uri::URI_CHARS`（判定语义一致；>127 全非法，
 /// 保证合法条目段必为合法单字节 UTF-8）。
@@ -1536,6 +1564,25 @@ pub struct HttpRequest {
     pub client_addr: Option<SocketAddr>,
     pub exts: HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>>,
     stream: Option<Arc<Mutex<HttpStream>>>,
+    /// 解析期特判头缓存（仅 `from_headers_part_with_limits_into` 在解析
+    /// 头表时填充，`clear_for_reuse` / 构造器重置为 None）：d1/d8 热路径
+    /// 的 5 次特判头线性扫描降为 0 次。None = 未缓存（手动构造的请求、
+    /// 或解析遇到非精确覆盖的边界值——多段 TE/Expect、CL 溢出等），
+    /// getter 回落头表扫描，语义与原实现一致。值语义与头表同步：
+    /// 头表 insert 为同名覆盖（last-wins），缓存条目在解析循环内同样
+    /// 按最后出现的值覆盖；解析后改动头表不在缓存跟踪范围内（框架内
+    /// 解析→取值链路无中间改动）。
+    cache_accept_encoding: Option<CompressMode>,
+    cache_connection: Option<HttpConnection>,
+    /// CL 解析值（缺席=Some(0)）；溢出等无法精确复刻 parse 语义的值记
+    /// None 回落（回落路径照常产出原错误）
+    cache_content_length: Option<usize>,
+    /// TE 单段 "chunked" 判定（缺席=Some(false)）；多段/未认知值记 None
+    /// 回落完整校验（照常产出 unsupported/empty 等原错误）
+    cache_transfer_encoding: Option<bool>,
+    /// Expect 单段 "100-continue" 判定（缺席=Some(false)）；其余值记 None
+    /// 回落完整校验（照常产出原错误）
+    cache_expect: Option<bool>,
 }
 
 // SAFETY: 本类型含 LocalHipStr<'static>/LocalHipByt<'static>（hipstr Rc 后端，
@@ -1602,25 +1649,37 @@ impl HttpRequest {
         &self,
         stream: &mut HttpStream,
         has_request_body: bool,
+        batch: &mut Option<&mut crate::server::ResponseBatcher>,
     ) -> anyhow::Result<()> {
-        let Some(expect) = self.get_header_key(HeaderItem::Expect) else {
-            return Ok(());
+        // 解析期缓存命中（单段 100-continue / 缺席）；其余值回落完整校验
+        //（照常产出 empty/unsupported/版本错误，has_100_continue 判定一致）
+        let has_100_continue = match self.cache_expect {
+            Some(v) => v,
+            None => {
+                let Some(expect) = self.get_header_key(HeaderItem::Expect) else {
+                    return Ok(());
+                };
+                if self.version < 11 {
+                    anyhow::bail!("Expect header is not supported for HTTP versions below 1.1");
+                }
+                let mut has_100_continue = false;
+                for token in expect.split(',').map(|token| token.trim()) {
+                    if token.is_empty() {
+                        anyhow::bail!("empty Expect header");
+                    }
+                    if token.eq_ignore_ascii_case("100-continue") {
+                        has_100_continue = true;
+                        continue;
+                    }
+                    anyhow::bail!("unsupported Expect header: {token}");
+                }
+                has_100_continue
+            }
         };
-        if self.version < 11 {
-            anyhow::bail!("Expect header is not supported for HTTP versions below 1.1");
-        }
-        let mut has_100_continue = false;
-        for token in expect.split(',').map(|token| token.trim()) {
-            if token.is_empty() {
-                anyhow::bail!("empty Expect header");
-            }
-            if token.eq_ignore_ascii_case("100-continue") {
-                has_100_continue = true;
-                continue;
-            }
-            anyhow::bail!("unsupported Expect header: {token}");
-        }
         if has_100_continue && has_request_body {
+            // 100-Continue 插写前冲刷（插写是写操作，批内响应必须先落盘，
+            // 顺序不能乱）
+            Self::flush_pending_before_read(batch, stream).await?;
             stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
         }
         Ok(())
@@ -1649,6 +1708,11 @@ impl HttpRequest {
         self.client_addr = None;
         self.exts.clear();
         self.stream = None;
+        self.cache_accept_encoding = None;
+        self.cache_connection = None;
+        self.cache_content_length = None;
+        self.cache_transfer_encoding = None;
+        self.cache_expect = None;
     }
 
     fn with_header_capacity(header_capacity: usize) -> Self {
@@ -1671,6 +1735,11 @@ impl HttpRequest {
             client_addr: None,
             exts: HashMap::new(),
             stream: None,
+            cache_accept_encoding: None,
+            cache_connection: None,
+            cache_content_length: None,
+            cache_transfer_encoding: None,
+            cache_expect: None,
         }
     }
 
@@ -1892,6 +1961,10 @@ impl HttpRequest {
     }
 
     pub fn get_header_accept_encoding(&self) -> CompressMode {
+        // 解析期缓存命中（d1/d8 热路径）：免头表扫描 + negotiate 开销
+        if let Some(mode) = self.cache_accept_encoding {
+            return mode;
+        }
         Self::negotiate_accept_encoding(
             self.get_header_key(HeaderItem::Accept_Encoding)
                 .unwrap_or(""),
@@ -1983,6 +2056,10 @@ impl HttpRequest {
     }
 
     pub fn get_header_connection(&self) -> HttpConnection {
+        // 解析期缓存命中（d1/d8 热路径，is_websocket 亦经此）：免头表扫描
+        if let Some(conn) = self.cache_connection.clone() {
+            return conn;
+        }
         if let Some(conn) = self.get_header_key(HeaderItem::Connection) {
             HttpConnection::from_str(conn).unwrap_or(HttpConnection::Close)
         } else if self.version >= 11 {
@@ -1998,6 +2075,10 @@ impl HttpRequest {
     }
 
     fn parse_header_content_length(&self) -> anyhow::Result<Option<usize>> {
+        // 解析期缓存命中：Some(0) 表示缺席（与「存 0」下游取值同为 0 等价）
+        if let Some(cl) = self.cache_content_length {
+            return Ok(if cl == 0 { None } else { Some(cl) });
+        }
         let Some(raw_val) = self.get_header_key(HeaderItem::Content_Length) else {
             return Ok(None);
         };
@@ -2009,6 +2090,10 @@ impl HttpRequest {
     }
 
     fn has_chunked_transfer_encoding(&self) -> anyhow::Result<bool> {
+        // 解析期缓存命中（单段 chunked / 缺席）；其余值回落完整校验
+        if let Some(chunked) = self.cache_transfer_encoding {
+            return Ok(chunked);
+        }
         let Some(raw_val) = self.get_header_key(HeaderItem::Transfer_Encoding) else {
             return Ok(false);
         };
@@ -2204,29 +2289,60 @@ impl HttpRequest {
         }
     }
 
+    /// 解析读路径的冲刷点：在任何可能阻塞的 socket 读、或 100-Continue
+    /// 插写之前冲刷批内待发响应（写序安全红线：响应滞留至阻塞读之后会
+    /// 死锁——客户端发大请求体等响应先到）。无批（手动构造的解析入口
+    /// 传 None）或批空时零成本跳过。
+    async fn flush_pending_before_read(
+        batch: &mut Option<&mut crate::server::ResponseBatcher>,
+        stream: &mut HttpStream,
+    ) -> anyhow::Result<()> {
+        if let Some(batch) = batch {
+            if batch.has_pending() {
+                batch
+                    .flush(stream)
+                    .await
+                    .map_err(|e| anyhow!("flush pending responses before read: {e:#}"))?;
+            }
+        }
+        Ok(())
+    }
+
     async fn from_stream_impl_into(
         buf: &mut Vec<u8>,
         stream: &mut HttpStream,
         limits: (Option<usize>, Option<usize>),
         req: &mut HttpRequest,
+        mut batch: Option<&mut crate::server::ResponseBatcher>,
     ) -> anyhow::Result<usize> {
-        let mut tmp_buf = [0u8; 4096];
         let max_header_bytes = limits
             .0
             .map(|limit| limit.min(ServerConfig::get_max_header_bytes()))
             .unwrap_or_else(ServerConfig::get_max_header_bytes);
         let hdr_len = loop {
-            Self::ensure_header_section_size(buf, max_header_bytes)?;
-            match HttpRequest::from_headers_part_with_limits_into(&buf[..], max_header_bytes, req)?
-            {
-                Some(hdr_len) => break hdr_len,
-                None => {
-                    let n = stream.read(&mut tmp_buf).await?;
-                    if n == 0 {
-                        return Err(anyhow::Error::msg("connection closed"));
-                    }
-                    buf.extend(&tmp_buf[0..n]);
+            // 空缓冲时解析必然 Partial（httparse 对空输入不产出请求行），
+            // 跳过解析直接读一轮：省掉一次 48 槽 httparse 头数组整体初始化
+            // 与空解析调用（keep-alive 无流水线 d1 常态每请求首读即空缓冲）。
+            // 头区大小校验由 from_headers_part_with_limits_into 内部承担，
+            // 原循环顶的同款检查是对同一 buf 的重复扫描，删除。
+            if !buf.is_empty() {
+                if let Some(hdr_len) =
+                    HttpRequest::from_headers_part_with_limits_into(&buf[..], max_header_bytes, req)?
+                {
+                    break hdr_len;
                 }
+            }
+            // 阻塞读前冲刷（先解析后 flush 重构）：走到这里即 buf 不含完整
+            // 请求头、下一步 read 必阻塞，先冲掉批内待发响应。buf 已含完整
+            // 请求时解析直接成功——零冲刷零探测，取代原连接循环顶的
+            // buf_holds_complete_request 探测 + 完整 httparse 扫描。
+            Self::flush_pending_before_read(&mut batch, stream).await?;
+            // 直读 buf 备用容量（read_into_vec 零拷贝零清零）：省掉 4KB 栈
+            // 缓冲清零与请求字节的中转 memcpy；keep-alive 稳态 buf 恒有
+            // ≥3KB 备用容量，单次 read 系统调用语义不变。
+            let n = stream.read_into_vec(buf).await?;
+            if n == 0 {
+                return Err(anyhow::Error::msg("connection closed"));
             }
         };
         let has_chunked_transfer_encoding = req.has_chunked_transfer_encoding()?;
@@ -2252,9 +2368,13 @@ impl HttpRequest {
         }
 
         let has_request_body = has_chunked_transfer_encoding || content_length > 0;
-        req.process_expect_header(stream, has_request_body).await?;
+        req.process_expect_header(stream, has_request_body, &mut batch)
+            .await?;
 
         let bdy_len = if has_chunked_transfer_encoding {
+            // chunked 体/尾读取循环可能阻塞：先冲刷（Expect 插写场景上一句
+            // 已冲过，此处 has_pending=false 直接跳过）
+            Self::flush_pending_before_read(&mut batch, stream).await?;
             let allowed_trailers =
                 parse_declared_trailer_names(req.get_header_key(HeaderItem::Trailer));
             let (body, trailers, consumed_len) =
@@ -2264,12 +2384,15 @@ impl HttpRequest {
             req.trailers = trailers;
             consumed_len
         } else {
+            if hdr_len + content_length > buf.len() {
+                // body 不足需阻塞补读：先冲刷（同上，写序安全红线）
+                Self::flush_pending_before_read(&mut batch, stream).await?;
+            }
             while hdr_len + content_length > buf.len() {
-                let t = stream.read(&mut tmp_buf).await?;
+                let t = stream.read_into_vec(buf).await?;
                 if t == 0 {
                     return Err(anyhow::Error::msg("connection closed"));
                 }
-                buf.extend(&tmp_buf[0..t]);
             }
             if content_length > 0 {
                 req.body = LocalHipByt::from(&buf[hdr_len..hdr_len + content_length]);
@@ -2412,7 +2535,7 @@ impl HttpRequest {
         let mut stream = stream.lock().await;
         let mut req = Self::new();
         let consumed =
-            Self::from_stream_impl_into(buf, &mut stream, (None, None), &mut req).await?;
+            Self::from_stream_impl_into(buf, &mut stream, (None, None), &mut req, None).await?;
         Ok((req, consumed))
     }
 
@@ -2429,6 +2552,7 @@ impl HttpRequest {
             &mut stream,
             (max_header_bytes, max_body_bytes),
             &mut req,
+            None,
         )
         .await?;
         Ok((req, consumed))
@@ -2440,8 +2564,16 @@ impl HttpRequest {
         max_header_bytes: Option<usize>,
         max_body_bytes: Option<usize>,
         req: &mut HttpRequest,
+        batch: Option<&mut crate::server::ResponseBatcher>,
     ) -> anyhow::Result<usize> {
-        Self::from_stream_impl_into(buf, stream, (max_header_bytes, max_body_bytes), req).await
+        Self::from_stream_impl_into(
+            buf,
+            stream,
+            (max_header_bytes, max_body_bytes),
+            req,
+            batch,
+        )
+        .await
     }
 
     pub fn from_headers_part(buf: &[u8]) -> anyhow::Result<Option<(Self, usize)>> {
@@ -2478,7 +2610,8 @@ impl HttpRequest {
             };
             (req, n)
         };
-        let parsed_header_count = rreq.headers.iter().filter(|h| !h.name.is_empty()).count();
+        let parsed_header_count =
+            rreq.headers.iter().take_while(|h| !h.name.is_empty()).count();
         if parsed_header_count > max_header_count {
             anyhow::bail!(
                 "too many request headers: {parsed_header_count} exceeds {max_header_count}"
@@ -2519,6 +2652,18 @@ impl HttpRequest {
             .ok_or_else(|| anyhow!("Missing HTTP path in request"))?;
         req.parse_request_target(target)?;
         req.version = rreq.version.unwrap_or(1) + 10;
+        // 特判头缓存缺席默认值（version 已定，头循环内命中即按 last-wins
+        // 覆盖；见 cache_* 字段注释）。缺席结果与 getter 原语义一致：
+        // AE→negotiate("")、Connection→按 version、CL→0、TE/Expect→false
+        req.cache_accept_encoding = Some(CompressMode::None);
+        req.cache_connection = Some(if req.version >= 11 {
+            HttpConnection::KeepAlive
+        } else {
+            HttpConnection::Close
+        });
+        req.cache_content_length = Some(0);
+        req.cache_transfer_encoding = Some(false);
+        req.cache_expect = Some(false);
         for h in rreq.headers.iter() {
             if h.name.is_empty() {
                 break;
@@ -2535,6 +2680,8 @@ impl HttpRequest {
                 TransferEncoding,
                 Host,
                 Expect,
+                AcceptEncoding,
+                Connection,
                 Other,
             }
             let key = HeaderOrHipStr::from_str(h.name);
@@ -2547,6 +2694,10 @@ impl HttpRequest {
                 }
                 HeaderOrHipStr::HeaderItem(HeaderItem::Host) => SpecialHeader::Host,
                 HeaderOrHipStr::HeaderItem(HeaderItem::Expect) => SpecialHeader::Expect,
+                HeaderOrHipStr::HeaderItem(HeaderItem::Accept_Encoding) => {
+                    SpecialHeader::AcceptEncoding
+                }
+                HeaderOrHipStr::HeaderItem(HeaderItem::Connection) => SpecialHeader::Connection,
                 _ => SpecialHeader::Other,
             };
             match special {
@@ -2567,6 +2718,9 @@ impl HttpRequest {
                     } else {
                         content_length_seen = Some(cl.to_string());
                     }
+                    // 解析期缓存（值已在手上免二次扫描）；溢出值记 None 回落，
+                    // 由 parse_header_content_length 照常产出原 parse 错误
+                    req.cache_content_length = cl.parse::<usize>().ok();
                     // 校验通过后照常入库：body 读取（parse_header_content_length）
                     // 与下游业务都按存储里的 Content-Length 取值
                     req.headers.insert(key, LocalHipStr::from(cl));
@@ -2581,6 +2735,20 @@ impl HttpRequest {
                         anyhow::bail!("empty Transfer-Encoding header");
                     }
                     transfer_encoding_seen = true;
+                    // 解析期缓存：仅「单段 chunked」精确命中（与
+                    // has_chunked_transfer_encoding 的 split/trim/filter 判定
+                    // 等价）；多段/其他值记 None 回落完整校验（照常产出
+                    // unsupported/empty 等原错误）
+                    let mut codings = normalized_header_value
+                        .split(',')
+                        .map(|part| part.trim())
+                        .filter(|part| !part.is_empty());
+                    req.cache_transfer_encoding = match codings.next() {
+                        Some(c) if c.eq_ignore_ascii_case("chunked") && codings.next().is_none() => {
+                            Some(true)
+                        }
+                        _ => None,
+                    };
                     // 校验通过后入库：has_chunked_transfer_encoding 按存储取值
                     req.headers
                         .insert(key, LocalHipStr::from(normalized_header_value));
@@ -2603,6 +2771,8 @@ impl HttpRequest {
                 }
                 SpecialHeader::Expect => {
                     if let Some(existing) = req.headers.get(&key) {
+                        // 多段合并：合成值语义需完整分词校验，缓存记 None 回落
+                        req.cache_expect = None;
                         req.headers.insert(
                             key,
                             LocalHipStr::from(format!(
@@ -2611,9 +2781,35 @@ impl HttpRequest {
                             )),
                         );
                     } else {
+                        // 解析期缓存：仅「单段 100-continue」精确命中；其他值、
+                        // version<1.1 记 None 回落完整校验（照常产出
+                        // unsupported/empty/版本错误）
+                        req.cache_expect = if req.version >= 11
+                            && normalized_header_value.eq_ignore_ascii_case("100-continue")
+                        {
+                            Some(true)
+                        } else {
+                            None
+                        };
                         req.headers
                             .insert(key, LocalHipStr::from(normalized_header_value));
                     }
+                }
+                SpecialHeader::AcceptEncoding => {
+                    // 解析期缓存（negotiate 结果，缺席默认 None 模式），重复头
+                    // last-wins 与头表一致
+                    req.cache_accept_encoding =
+                        Some(Self::negotiate_accept_encoding(normalized_header_value));
+                    req.headers.insert(key, LocalHipStr::from(normalized_header_value));
+                }
+                SpecialHeader::Connection => {
+                    // 解析期缓存（from_str 判别 + Close 兜底，与 getter 一致），
+                    // 重复头 last-wins 与头表一致
+                    req.cache_connection = Some(
+                        HttpConnection::from_str(normalized_header_value)
+                            .unwrap_or(HttpConnection::Close),
+                    );
+                    req.headers.insert(key, LocalHipStr::from(normalized_header_value));
                 }
                 SpecialHeader::Other => {
                     req.headers.insert(key, LocalHipStr::from(normalized_header_value));
@@ -2934,6 +3130,25 @@ impl DateSlot {
     }
 }
 
+/// 每线程 Date 固定槽：秒切换时原地重写，同秒内全部响应共享同一 &'static str。
+fn thread_date_str(current_ts: i64) -> &'static str {
+    static TL_DATE_SLOT: ThreadLocal<&'static DateSlot> = ThreadLocal::new();
+    let slot: &'static DateSlot = TL_DATE_SLOT.get_or(|| Box::leak(Box::new(DateSlot::new())));
+    if current_ts != slot.timestamp() {
+        slot.write(current_ts);
+    }
+    slot.as_str()
+}
+
+/// 当前 HTTP 日期字节（Date 槽内容，RFC1123 恒 29 字节）——静态响应模板快路径用。
+pub(crate) fn now_http_date_bytes() -> &'static [u8] {
+    let current_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|timestamp| timestamp.as_secs() as i64)
+        .unwrap_or_default();
+    thread_date_str(current_ts).as_bytes()
+}
+
 #[derive(Debug)]
 pub struct HttpResponse {
     pub version: Cow<'static, str>,
@@ -3033,7 +3248,8 @@ fn take_pooled_body_vec(data: &[u8]) -> Vec<u8> {
 }
 
 fn recycle_body_vec(vec: Vec<u8>) {
-    if vec.capacity() > RESP_POOL_MAX_VEC_CAPACITY {
+    // 零容量缓冲无复用价值（下次 extend_from_slice 必然重分配），直接释放
+    if vec.capacity() == 0 || vec.capacity() > RESP_POOL_MAX_VEC_CAPACITY {
         return;
     }
     let mut vec = vec;
@@ -3110,12 +3326,7 @@ impl HttpResponse {
         // 秒切换发生，整体替换且恒为合法 UTF-8。持有旧借用、跨秒边界后才被
         // 序列化的响应会读到新秒的 Date——内容陈旧但安全，语义上是把 Date
         // 粒度从“响应构造时刻”放宽到“槽内容所属秒”。
-        static TL_DATE_SLOT: ThreadLocal<&'static DateSlot> = ThreadLocal::new();
-        let slot: &'static DateSlot = TL_DATE_SLOT.get_or(|| Box::leak(Box::new(DateSlot::new())));
-        if current_ts != slot.timestamp() {
-            slot.write(current_ts);
-        }
-        let date_str = slot.as_str();
+        let date_str = thread_date_str(current_ts);
 
         // 预留容量一次性建表：6 个标准头一表装下，避免 collect 途中按
         // 增长策略多次 rehash 重分配（depth=1 每响应热路径）。
@@ -3472,7 +3683,21 @@ impl HttpResponse {
         Ok((body, trailers, cursor - hdr_len))
     }
 
-    pub fn as_bytes(&self, mut cmode: CompressMode, request_method: Option<HttpMethod>) -> Vec<u8> {
+    pub fn as_bytes(&self, cmode: CompressMode, request_method: Option<HttpMethod>) -> Vec<u8> {
+        let mut ret = Vec::with_capacity(576);
+        self.as_bytes_into(&mut ret, cmode, request_method);
+        ret
+    }
+
+    /// 序列化进调用方提供的缓冲（d8 批合并 piece 池复用专用）：序列化代码
+    /// 与 [`Self::as_bytes`] 同源同序，线上字节形态完全一致，仅目标缓冲
+    /// 由调用方提供，便于 clear 后复用容量免去每响应一次序列化堆分配。
+    pub(crate) fn as_bytes_into(
+        &self,
+        ret: &mut Vec<u8>,
+        mut cmode: CompressMode,
+        request_method: Option<HttpMethod>,
+    ) {
         match &self.body {
             HttpResponseBody::Data(data) => {
                 let suppress_body = Self::status_disallows_response_body(self.http_code);
@@ -3500,16 +3725,25 @@ impl HttpResponse {
                     payload_ref = &[];
                 }
                 use std::io::Write as _;
-                let mut ret = Vec::with_capacity(payload_ref.len().saturating_add(512));
                 let status_str = self.http_code.http_code_to_desp();
-                let _ = write!(ret, "{} {} {status_str}\r\n", self.version, self.http_code);
+                // 单遍直写序列化：常量前缀 extend + 手写整数十进制，绕开
+                // write! 的 fmt 机制调度开销（d8 批合并热路径每响应约
+                // 150~300ns）。字节形态与原 write! 版逐字节一致：状态行
+                // `"{version} {code} {desp}\r\n"`、头行 `"k: v\r\n"`、
+                // CL 行 `"Content-Length: {n}\r\n"` 均无宽度/精度格式。
+                // version 非 HTTP/1.1 时保留 write! 通用分支兜底。
+                if self.version == "HTTP/1.1" {
+                    ret.extend_from_slice(b"HTTP/1.1 ");
+                    let mut tmp = [0u8; 20];
+                    ret.extend_from_slice(u64_ascii_str(self.http_code as u64, &mut tmp).as_bytes());
+                    ret.extend_from_slice(b" ");
+                    ret.extend_from_slice(status_str.as_bytes());
+                    ret.extend_from_slice(b"\r\n");
+                } else {
+                    let _ = write!(ret, "{} {} {status_str}\r\n", self.version, self.http_code);
+                }
                 // 6 标准头快速路径：与 write_to_stream 的固定顺序输出对齐，
                 // 保证 as_bytes 与 write_to_stream 线上字节形态一致。
-                // 此路径服务 depth=8 流水线批合并（ResponseBatcher），保持
-                // write! 原实现不动（2026-11-25 ABBA 配对：write_to_stream
-                // 侧优化使 depth=1 +3.5%，as_bytes 侧同改则 depth=8 出现
-                // 全对一致的 -1.4% 微回归，按"不得影响 depth=8 基线"红线
-                // 单独还原本路径）。
                 if self.headers.len() == 6 && self.multi_headers.is_empty() {
                     if let (
                         Some(date),
@@ -3526,20 +3760,12 @@ impl HttpResponse {
                         self.headers.get("Pragma"),
                         self.headers.get("Cache-Control"),
                     ) {
-                        let _ = write!(ret, "Date: {}\r\n", sanitize_header_str(date));
-                        let _ = write!(ret, "Server: {}\r\n", sanitize_header_str(server));
-                        let _ = write!(ret, "Connection: {}\r\n", sanitize_header_str(connection));
-                        let _ = write!(
-                            ret,
-                            "Content-Type: {}\r\n",
-                            sanitize_header_str(content_type)
-                        );
-                        let _ = write!(ret, "Pragma: {}\r\n", sanitize_header_str(pragma));
-                        let _ = write!(
-                            ret,
-                            "Cache-Control: {}\r\n",
-                            sanitize_header_str(cache_control)
-                        );
+                        push_header_line_bytes!(ret, b"Date: ", date);
+                        push_header_line_bytes!(ret, b"Server: ", server);
+                        push_header_line_bytes!(ret, b"Connection: ", connection);
+                        push_header_line_bytes!(ret, b"Content-Type: ", content_type);
+                        push_header_line_bytes!(ret, b"Pragma: ", pragma);
+                        push_header_line_bytes!(ret, b"Cache-Control: ", cache_control);
                     } else {
                         for (key, value) in self.headers.iter() {
                             if key == "Content-Length"
@@ -3547,12 +3773,7 @@ impl HttpResponse {
                             {
                                 continue;
                             }
-                            let _ = write!(
-                                ret,
-                                "{}: {}\r\n",
-                                sanitize_header_str(key),
-                                sanitize_header_str(value)
-                            );
+                            push_header_kv_bytes!(ret, key, value);
                         }
                     }
                 } else {
@@ -3560,27 +3781,20 @@ impl HttpResponse {
                         if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
                             continue;
                         }
-                        let _ = write!(
-                            ret,
-                            "{}: {}\r\n",
-                            sanitize_header_str(key),
-                            sanitize_header_str(value)
-                        );
+                        push_header_kv_bytes!(ret, key, value);
                     }
                 }
                 for (key, value) in self.multi_headers.iter() {
                     if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
                         continue;
                     }
-                    let _ = write!(
-                        ret,
-                        "{}: {}\r\n",
-                        sanitize_header_str(key),
-                        sanitize_header_str(value)
-                    );
+                    push_header_kv_bytes!(ret, key, value);
                 }
                 if !suppress_body {
-                    let _ = write!(ret, "Content-Length: {}\r\n", payload_ref.len());
+                    ret.extend_from_slice(b"Content-Length: ");
+                    let mut tmp = [0u8; 20];
+                    ret.extend_from_slice(u64_ascii_str(payload_ref.len() as u64, &mut tmp).as_bytes());
+                    ret.extend_from_slice(b"\r\n");
                 }
                 if cmode == CompressMode::Gzip && !suppress_body {
                     ret.extend_from_slice(b"Content-Encoding: gzip\r\n");
@@ -3593,9 +3807,8 @@ impl HttpResponse {
                 if !suppress_body_by_method && !payload_ref.is_empty() {
                     ret.extend(payload_ref);
                 }
-                ret
             }
-            HttpResponseBody::Stream(_) => vec![], // Stream responses are handled separately
+            HttpResponseBody::Stream(_) => {} // Stream responses are handled separately
         }
     }
 
@@ -4048,7 +4261,108 @@ macro_rules! webtransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompressMode, HttpMethod, HttpRequest, HttpResponse};
+    use super::{
+        CompressMode, HttpConnection, HttpMethod, HttpRequest, HttpResponse, HttpResponseBody,
+    };
+    use crate::utils::bytes::CompressExt;
+    use crate::utils::header_store::ResponseHeaders;
+
+    /// as_bytes_into 序列化字节形态回归锚：6 标准头快速路径（含 CL 手写
+    /// 十进制），期望串为逐字节精确形态。
+    #[test]
+    fn as_bytes_into_exact_bytes_six_header_fast_path() {
+        let mut headers = ResponseHeaders::new();
+        headers.insert("Date".into(), "Thu, 01 Jan 2026 00:00:00 GMT".into());
+        headers.insert("Server".into(), "srv".into());
+        headers.insert("Connection".into(), "keep-alive".into());
+        headers.insert("Content-Type".into(), "text/html".into());
+        headers.insert("Pragma".into(), "no-cache".into());
+        headers.insert("Cache-Control".into(), "no-cache".into());
+        let res = HttpResponse {
+            version: std::borrow::Cow::Borrowed("HTTP/1.1"),
+            http_code: 200,
+            headers,
+            multi_headers: Vec::new(),
+            trailers: ResponseHeaders::new(),
+            body: HttpResponseBody::Data(b"Hello, World!".to_vec()),
+        };
+        let out = res.as_bytes(CompressMode::None, None);
+        let expected = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Date: Thu, 01 Jan 2026 00:00:00 GMT\r\n",
+            "Server: srv\r\n",
+            "Connection: keep-alive\r\n",
+            "Content-Type: text/html\r\n",
+            "Pragma: no-cache\r\n",
+            "Cache-Control: no-cache\r\n",
+            "Content-Length: 13\r\n",
+            "\r\n",
+            "Hello, World!",
+        );
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    /// as_bytes_into 通用头循环路径（非 6 标准头组合）+ 头值净化
+    ///（CR/LF 剔除）字节形态回归锚。
+    #[test]
+    fn as_bytes_into_exact_bytes_generic_path_sanitized() {
+        let mut headers = ResponseHeaders::new();
+        headers.insert("Date".into(), "Thu, 01 Jan 2026 00:00:00 GMT".into());
+        headers.insert("Content-Type".into(), "text/html".into());
+        headers.insert("X-Custom".into(), "a\rb\nc d".into());
+        let res = HttpResponse {
+            version: std::borrow::Cow::Borrowed("HTTP/1.1"),
+            http_code: 200,
+            headers,
+            multi_headers: Vec::new(),
+            trailers: ResponseHeaders::new(),
+            body: HttpResponseBody::Data(b"payload".to_vec()),
+        };
+        let out = res.as_bytes(CompressMode::None, None);
+        let expected = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Date: Thu, 01 Jan 2026 00:00:00 GMT\r\n",
+            "Content-Type: text/html\r\n",
+            "X-Custom: abc d\r\n",
+            "Content-Length: 7\r\n",
+            "\r\n",
+            "payload",
+        );
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    /// as_bytes_into gzip 分支：≥32B 可压体压缩出 Content-Encoding 行 +
+    /// 压缩后 CL + 压缩字节尾；<32B 保持原样不压缩。
+    #[test]
+    fn as_bytes_into_gzip_branch_boundaries() {
+        let make = |data: Vec<u8>| {
+            let mut headers = ResponseHeaders::new();
+            headers.insert("Date".into(), "Thu, 01 Jan 2026 00:00:00 GMT".into());
+            headers.insert("Content-Type".into(), "text/plain".into());
+            HttpResponse {
+                version: std::borrow::Cow::Borrowed("HTTP/1.1"),
+                http_code: 200,
+                headers,
+                multi_headers: Vec::new(),
+                trailers: ResponseHeaders::new(),
+                body: HttpResponseBody::Data(data),
+            }
+        };
+        // ≥32B：压缩分支
+        let data = vec![b'a'; 256];
+        let out = make(data.clone()).as_bytes(CompressMode::Gzip, None);
+        let compressed = data.compress().expect("gzip compress");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("Content-Encoding: gzip\r\n"));
+        assert!(text.contains(&format!("Content-Length: {}\r\n", compressed.len())));
+        assert!(out.ends_with(&compressed));
+        // <32B：不压缩，无 Content-Encoding 行，CL 为原始长度
+        let small = b"tiny".to_vec();
+        let out = make(small).as_bytes(CompressMode::Gzip, None);
+        let text = String::from_utf8_lossy(&out);
+        assert!(!text.contains("Content-Encoding"));
+        assert!(text.contains("Content-Length: 4\r\n"));
+    }
 
     #[test]
     fn accept_encoding_supports_simple_gzip_token() {
@@ -4083,6 +4397,97 @@ mod tests {
         let mut req = HttpRequest::new();
         req.set_header("Accept-Encoding", "gzip;q=xyz");
         assert_eq!(req.get_header_accept_encoding(), CompressMode::None);
+    }
+
+    fn parse_req(raw: &[u8]) -> HttpRequest {
+        HttpRequest::from_headers_part(raw)
+            .expect("parse headers")
+            .expect("complete request")
+            .0
+    }
+
+    /// 解析期特判头缓存：AE 解析路径命中缓存（negotiate 结果一致），
+    /// 重复头 last-wins 与头表同名覆盖语义一致。
+    #[test]
+    fn parse_cache_accept_encoding_and_last_wins() {
+        let req = parse_req(b"GET / HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n");
+        assert_eq!(req.get_header_accept_encoding(), CompressMode::Gzip);
+
+        let req = parse_req(
+            b"GET / HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nAccept-Encoding: identity;q=0\r\n\r\n",
+        );
+        assert_eq!(req.get_header_accept_encoding(), CompressMode::None);
+    }
+
+    /// 解析期特判头缓存：AE/Connection 缺席默认值与 getter 原语义一致
+    ///（negotiate("")=None 模式；HTTP/1.1 默认 keep-alive、1.0 默认 close）。
+    #[test]
+    fn parse_cache_absent_defaults_match_table_semantics() {
+        let req = parse_req(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(req.get_header_accept_encoding(), CompressMode::None);
+        assert_eq!(req.get_header_connection(), HttpConnection::KeepAlive);
+
+        let req = parse_req(b"GET / HTTP/1.0\r\n\r\n");
+        assert_eq!(req.get_header_connection(), HttpConnection::Close);
+    }
+
+    /// 解析期特判头缓存：Connection 判别值（close/keep-alive/未知 token
+    /// Close 兜底）与 getter 原语义一致。
+    #[test]
+    fn parse_cache_connection_values() {
+        let req = parse_req(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert_eq!(req.get_header_connection(), HttpConnection::Close);
+
+        let req = parse_req(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+        assert_eq!(req.get_header_connection(), HttpConnection::KeepAlive);
+
+        let req = parse_req(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: whatever\r\n\r\n");
+        assert_eq!(req.get_header_connection(), HttpConnection::Close);
+    }
+
+    /// 解析期特判头缓存：TE 单段 chunked（含尾逗号变体）缓存命中；
+    /// 多段值记 None 回落，产出原 unsupported 错误。
+    #[test]
+    fn parse_cache_transfer_encoding_chunked_and_fallback() {
+        let req = parse_req(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n");
+        assert!(req.has_chunked_transfer_encoding().expect("valid TE"));
+
+        let req =
+            parse_req(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked,\r\n\r\n");
+        assert!(req.has_chunked_transfer_encoding().expect("valid TE"));
+
+        let req = parse_req(
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+        );
+        let err = req.has_chunked_transfer_encoding().unwrap_err();
+        assert!(err.to_string().contains("unsupported Transfer-Encoding"));
+    }
+
+    /// 解析期特判头缓存：CL 正常值命中；溢出值记 None 回落
+    ///（pub getter 按 unwrap_or(0) 兜底，私有 parse 路径照常产出原错误）。
+    #[test]
+    fn parse_cache_content_length_and_overflow_fallback() {
+        let req = parse_req(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 41\r\n\r\n");
+        assert_eq!(req.get_header_content_length(), 41);
+
+        let oversized = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}9999\r\n\r\n",
+            u64::MAX
+        );
+        let req = parse_req(oversized.as_bytes());
+        assert_eq!(req.get_header_content_length(), 0);
+    }
+
+    /// 解析期特判头缓存：Expect 单段 100-continue 与多段合并的表值形态。
+    #[test]
+    fn parse_cache_expect_values() {
+        let req = parse_req(b"POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n");
+        assert_eq!(req.get_header("Expect"), Some("100-continue"));
+
+        let req = parse_req(
+            b"POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nExpect: 100-continue\r\n\r\n",
+        );
+        assert_eq!(req.get_header("Expect"), Some("100-continue, 100-continue"));
     }
 
     #[test]

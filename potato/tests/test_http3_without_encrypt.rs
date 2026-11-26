@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(30000);
+static PORT_COUNTER: AtomicU16 = AtomicU16::new(35100);
 
 fn get_test_port() -> u16 {
     PORT_COUNTER.fetch_add(1, Ordering::Relaxed)

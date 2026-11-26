@@ -96,6 +96,43 @@ impl HttpStream {
         })
     }
 
+    /// 直读进 Vec 备用容量（零拷贝零清零读路径）：`Vec` 的备用容量按未
+    /// 初始化内存直写，省掉「栈缓冲 read + extend 中转拷贝」的每请求
+    /// 一次 4KB 栈清零与一次 body 级 memcpy（keep-alive d1 热路径）。
+    /// WithPreRead 预读数据优先吐出（一次性整段入 buf，长度不受调用方
+    /// 缓冲限制，语义与旧 copy+drain 等价且更完整）；RateLimited 冷路径
+    /// 走既有节奏化 read（栈缓冲中转，限速流读侧本就带 pacing 成本）。
+    pub async fn read_into_vec(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<usize> {
+        use tokio::io::AsyncReadExt as _;
+        Ok(match self {
+            HttpStream::Tcp(s) => s.read_buf(buf).await?,
+            #[cfg(feature = "tls")]
+            HttpStream::ServerTls(s) => s.read_buf(buf).await?,
+            #[cfg(feature = "tls")]
+            HttpStream::ClientTls(s) => s.read_buf(buf).await?,
+            HttpStream::DuplexStream(s) => s.read_buf(buf).await?,
+            HttpStream::WithPreRead {
+                stream,
+                pre_read_data,
+            } => {
+                if !pre_read_data.is_empty() {
+                    let len = pre_read_data.len();
+                    buf.extend_from_slice(pre_read_data);
+                    pre_read_data.drain(..len);
+                    len
+                } else {
+                    Box::pin(stream.read_into_vec(buf)).await?
+                }
+            }
+            HttpStream::RateLimited(s) => {
+                let mut tmp = [0u8; 4096];
+                let n = Box::pin(s.read(&mut tmp)).await?;
+                buf.extend_from_slice(&tmp[..n]);
+                n
+            }
+        })
+    }
+
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<usize> {
         Ok(match self {
             HttpStream::Tcp(s) => s.read_exact(buf).await?,
@@ -294,19 +331,19 @@ async fn write_all_vectored_inner<W: AsyncWrite + Unpin>(
     let mut idx = 0usize;
     let mut offset = 0usize;
     while idx < bufs.len() {
-        let mut slices = Vec::with_capacity(bufs.len() - idx);
-        if offset > 0 {
+        // 首轮（offset==0 常态）直接把调用方切片交给 write_vectored：
+        // 内容与重建版逐条一致，省去 IoSlice 数组的 Vec 分配 + 整表拷贝。
+        // 仅部分写续传（offset>0，罕见）才重建剩余切片。
+        let n = if offset == 0 {
+            writer.write_vectored(&bufs[idx..]).await?
+        } else {
+            let mut slices = Vec::with_capacity(bufs.len() - idx);
             slices.push(IoSlice::new(&bufs[idx][offset..]));
             for b in &bufs[idx + 1..] {
                 slices.push(IoSlice::new(b));
             }
-        } else {
-            for b in &bufs[idx..] {
-                slices.push(IoSlice::new(b));
-            }
-        }
-
-        let n = writer.write_vectored(&slices).await?;
+            writer.write_vectored(&slices).await?
+        };
         if n == 0 {
             return Err(anyhow::Error::msg("connection closed while writing"));
         }

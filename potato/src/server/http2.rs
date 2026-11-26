@@ -23,72 +23,103 @@ pub async fn serve_http2_impl(
     pipe_ctx.init_jemalloc_if_configured()?;
 
     let addr: SocketAddr = addr.parse()?;
-    let listener = super::bind_reuse_listener(addr, reuse_port).await?;
     let acceptor = tls_acceptor_with_alpn(
         cert_file,
         key_file,
         Some(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
     )?;
 
+    // 每核 current-thread 拓扑（实验，方案A 延伸）：TLS 握手与 h2 连接
+    // 处理均落在 worker 本地 runtime（accept 不被握手阻塞）。平台不支持
+    // SO_REUSEPORT 时静默回退共享监听拓扑。
+    if super::HttpServer::per_core_enabled() && super::HttpServer::reuseport_supported() {
+        let handle_conn: super::PerCoreConnHandler = std::sync::Arc::new(move |pipe_ctx, client_addr, stream| {
+            let acceptor = acceptor.clone();
+            super::HttpServer::spawn_connection(handle_http2_connection(
+                acceptor,
+                pipe_ctx,
+                client_addr,
+                stream,
+            ));
+        });
+        return super::HttpServer::serve_per_core(addr, pipe_ctx, handle_conn).await;
+    }
+
+    let listener = super::bind_reuse_listener(addr, reuse_port).await?;
+
     loop {
         let (stream, client_addr) = listener.accept().await?;
         _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
         let pipe_ctx2 = Arc::clone(&pipe_ctx);
-        super::HttpServer::spawn_connection(async move {
-            let handshake = tokio::time::timeout(
-                crate::global_config::ServerConfig::get_tls_handshake_timeout().await,
-                acceptor.accept(stream),
-            )
-            .await;
-            let stream = match handshake {
-                Ok(Ok(stream)) => stream,
-                _ => return,
-            };
+        super::HttpServer::spawn_connection(handle_http2_connection(
+            acceptor,
+            pipe_ctx2,
+            client_addr,
+            stream,
+        ));
+    }
+}
 
-            let negotiated_h2 = stream
-                .get_ref()
-                .1
-                .alpn_protocol()
-                .map(|p| p == b"h2")
-                .unwrap_or(false);
+/// 单连接处理：TLS 握手（限时）→ ALPN 分派（h2 / HTTP/1.1 回落）。
+/// 共享监听与每核拓扑共用此入口，保证两条路径行为一致。
+async fn handle_http2_connection(
+    acceptor: TlsAcceptor,
+    pipe_ctx: Arc<PipeContext>,
+    client_addr: SocketAddr,
+    stream: tokio::net::TcpStream,
+) {
+    let handshake = tokio::time::timeout(
+        crate::global_config::ServerConfig::get_tls_handshake_timeout().await,
+        acceptor.accept(stream),
+    )
+    .await;
+    let stream = match handshake {
+        Ok(Ok(stream)) => stream,
+        _ => return,
+    };
 
-            if !negotiated_h2 {
-                // HTTP/1.1连接，使用spawn_http1_connection处理
-                use crate::utils::tcp_stream::HttpStream;
-                super::HttpServer::spawn_http1_connection(
-                    pipe_ctx2,
-                    client_addr,
-                    HttpStream::from_server_tls(stream),
-                );
-                return;
-            }
+    let negotiated_h2 = stream
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .map(|p| p == b"h2")
+        .unwrap_or(false);
 
-            // Explicit resource limits (aligned with the HTTP/3 server):
-            // bound concurrent streams per connection and header list size so
-            // a single connection cannot amplify memory pressure.
-            let mut h2_builder = h2_server::Builder::new();
-            h2_builder
-                .max_concurrent_streams(128)
-                .max_header_list_size(16 * 1024)
-                .max_frame_size(16 * 1024);
-            let mut h2_conn = match h2_builder.handshake(stream).await {
-                Ok(conn) => conn,
-                Err(_) => return,
-            };
+    if !negotiated_h2 {
+        // HTTP/1.1连接，使用spawn_http1_connection处理
+        use crate::utils::tcp_stream::HttpStream;
+        super::HttpServer::spawn_http1_connection(
+            pipe_ctx,
+            client_addr,
+            HttpStream::from_server_tls(stream),
+        );
+        return;
+    }
 
-            while let Some(next) = h2_conn.accept().await {
-                let (req_head, respond) = match next {
-                    Ok(parts) => parts,
-                    Err(_) => break,
-                };
-                let pipe_ctx3 = Arc::clone(&pipe_ctx2);
-                // 每个请求流不占连接配额（连接本身已计数，流数量由
-                // max_concurrent_streams 限制）
-                super::HttpServer::spawn_connection_untracked(async move {
-                    let _ = handle_h2_request(req_head, respond, pipe_ctx3, client_addr).await;
-                });
-            }
+    // Explicit resource limits (aligned with the HTTP/3 server):
+    // bound concurrent streams per connection and header list size so
+    // a single connection cannot amplify memory pressure.
+    let mut h2_builder = h2_server::Builder::new();
+    h2_builder
+        .max_concurrent_streams(128)
+        .max_header_list_size(16 * 1024)
+        .max_frame_size(16 * 1024);
+    let mut h2_conn = match h2_builder.handshake(stream).await {
+        Ok(conn) => conn,
+        Err(_) => return,
+    };
+
+    while let Some(next) = h2_conn.accept().await {
+        let (req_head, respond) = match next {
+            Ok(parts) => parts,
+            Err(_) => break,
+        };
+        let pipe_ctx3 = Arc::clone(&pipe_ctx);
+        // 每个请求流不占连接配额（连接本身已计数，流数量由
+        // max_concurrent_streams 限制）
+        super::HttpServer::spawn_connection_untracked(async move {
+            let _ = handle_h2_request(req_head, respond, pipe_ctx3, client_addr).await;
         });
     }
 }
