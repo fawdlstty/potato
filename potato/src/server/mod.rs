@@ -427,17 +427,26 @@ pub mod bench_phases {
     }
 }
 
-static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-static CONNECTIONS_DRAINED: LazyLock<Notify> = LazyLock::new(Notify::new);
-static CONNECTION_TASKS: LazyLock<StdMutex<tokio::task::JoinSet<()>>> =
-    LazyLock::new(|| StdMutex::new(tokio::task::JoinSet::new()));
+/// 每 server 连接任务作用域：计数、完成通知与任务集按 PipeContext（即
+/// server 实例）隔离，停机 drain 只作用于本 server，同进程多 server 并存
+/// 时不再互相终止对方在途连接。
+#[derive(Default)]
+pub(crate) struct ConnectionScope {
+    /// 本 server 活跃连接数（配额检查与 drain 等待依据）
+    active: AtomicUsize,
+    /// active 归零时 notify，供 drain 等待
+    drained: Notify,
+    /// 本 server 的连接/握手任务集
+    tasks: StdMutex<tokio::task::JoinSet<()>>,
+}
 
-struct ConnectionGuard;
+struct ConnectionGuard(Arc<PipeContext>);
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        if ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel) == 1 {
-            CONNECTIONS_DRAINED.notify_waiters();
+        let scope = &self.0.connections;
+        if scope.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            scope.drained.notify_waiters();
         }
     }
 }
@@ -766,6 +775,8 @@ impl Clone for PipeContextItem {
 pub struct PipeContext {
     items: Vec<PipeContextItem>,
     disable_compress: bool,
+    /// 每 server 连接作用域（任务集/计数/drain 通知），随实例隔离
+    connections: ConnectionScope,
 }
 
 #[cfg(all(test, feature = "webtransport"))]
@@ -1145,6 +1156,7 @@ impl PipeContext {
         Self {
             items: vec![PipeContextItem::Handlers],
             disable_compress: false,
+            connections: ConnectionScope::default(),
         }
     }
 
@@ -1152,6 +1164,7 @@ impl PipeContext {
         Self {
             items: vec![],
             disable_compress: false,
+            connections: ConnectionScope::default(),
         }
     }
 
@@ -2387,71 +2400,80 @@ type PerCoreConnHandler =
     Arc<dyn Fn(Arc<PipeContext>, SocketAddr, tokio::net::TcpStream) + Send + Sync>;
 
 impl HttpServer {
-    pub(crate) fn spawn_connection<F>(future: F)
+    pub(crate) fn spawn_connection<F>(pipe_ctx: &Arc<PipeContext>, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
         #[cfg(feature = "bench-phases")]
         bench_phases::ensure_dumper();
+        let scope = &pipe_ctx.connections;
         // Refuse new connections beyond the configured cap so a connection
         // flood cannot exhaust memory/file descriptors (the caller drops the
         // socket, closing it).
-        if ACTIVE_CONNECTIONS.load(Ordering::Acquire)
+        if scope.active.load(Ordering::Acquire)
             >= crate::global_config::ServerConfig::get_max_connections()
         {
             return;
         }
-        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
-        let mut tasks = CONNECTION_TASKS.lock().unwrap_or_else(|e| e.into_inner());
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(async move {
-            let _connection_guard = ConnectionGuard;
+        scope.active.fetch_add(1, Ordering::AcqRel);
+        // 守卫持有独立 Arc 引用，避免任务集锁借用与任务捕获冲突
+        let guard_ctx = Arc::clone(pipe_ctx);
+        let guarded = async move {
+            let _connection_guard = ConnectionGuard(guard_ctx);
             future.await;
-        });
+        };
+        let mut tasks = scope.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(guarded);
     }
 
-    /// Spawn a task on the connection JoinSet without consuming a connection
-    /// slot. Used for intermediate phases (TLS handshake wrappers) and
-    /// h2/h3 request streams, where the carrying connection is already
+    /// Spawn a task on the per-server connection JoinSet without consuming a
+    /// connection slot. Used for intermediate phases (TLS handshake wrappers)
+    /// and h2/h3 request streams, where the carrying connection is already
     /// counted and stream counts are bounded separately. All call sites sit
     /// behind tls/http2/http3/acme, all of which enable `tls`.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
-    pub(crate) fn spawn_connection_untracked<F>(future: F)
+    pub(crate) fn spawn_connection_untracked<F>(pipe_ctx: &Arc<PipeContext>, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut tasks = CONNECTION_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tasks = pipe_ctx
+            .connections
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         while tasks.try_join_next().is_some() {}
         tasks.spawn(future);
     }
 
-    async fn drain_connections(grace: Duration) {
+    async fn drain_connections(pipe_ctx: &Arc<PipeContext>, grace: Duration) {
+        let scope = &pipe_ctx.connections;
         let deadline = tokio::time::Instant::now() + grace;
-        while ACTIVE_CONNECTIONS.load(Ordering::Acquire) > 0 {
+        while scope.active.load(Ordering::Acquire) > 0 {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {}
-                _ = CONNECTIONS_DRAINED.notified() => {}
+                _ = scope.drained.notified() => {}
             }
         }
 
         {
-            let mut tasks = CONNECTION_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut tasks = scope.tasks.lock().unwrap_or_else(|e| e.into_inner());
             tasks.abort_all();
             while tasks.try_join_next().is_some() {}
         }
-        while ACTIVE_CONNECTIONS.load(Ordering::Acquire) > 0 {
+        while scope.active.load(Ordering::Acquire) > 0 {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {}
-                _ = CONNECTIONS_DRAINED.notified() => {}
+                _ = scope.drained.notified() => {}
             }
         }
-        let mut tasks = CONNECTION_TASKS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tasks = scope.tasks.lock().unwrap_or_else(|e| e.into_inner());
         while tasks.try_join_next().is_some() {}
     }
 
@@ -2501,6 +2523,7 @@ impl HttpServer {
         serve: F,
         shutdown_signal: Option<oneshot::Receiver<()>>,
         grace: Duration,
+        pipe_ctx: &Arc<PipeContext>,
     ) -> anyhow::Result<()>
     where
         F: Future<Output = anyhow::Result<()>>,
@@ -2510,7 +2533,7 @@ impl HttpServer {
                 select! {
                     result = serve => result,
                     _ = shutdown_signal => {
-                        Self::drain_connections(grace).await;
+                        Self::drain_connections(pipe_ctx, grace).await;
                         Ok(())
                     }
                 }
@@ -2580,7 +2603,9 @@ impl HttpServer {
         self.serving = true;
         let shutdown_signal = self.shutdown_signal.take();
         let grace = self.shutdown_grace;
-        let result = Self::finish_serve(self.serve_http_impl(), shutdown_signal, grace).await;
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
+        let result =
+            Self::finish_serve(self.serve_http_impl(), shutdown_signal, grace, &pipe_ctx).await;
         self.serving = false;
         result
     }
@@ -2590,10 +2615,12 @@ impl HttpServer {
         self.serving = true;
         let shutdown_signal = self.shutdown_signal.take();
         let grace = self.shutdown_grace;
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
         let result = Self::finish_serve(
             self.serve_https_impl(cert_file, key_file),
             shutdown_signal,
             grace,
+            &pipe_ctx,
         )
         .await;
         self.serving = false;
@@ -2611,6 +2638,7 @@ impl HttpServer {
             http2::serve_http2_impl(&addr, cert_file, key_file, pipe_ctx, self.reuse_port),
             shutdown_signal,
             grace,
+            &self.pipe_ctx,
         )
         .await;
         self.serving = false;
@@ -2628,6 +2656,7 @@ impl HttpServer {
             http3::serve_http3_impl(&addr, cert_file, key_file, pipe_ctx),
             shutdown_signal,
             grace,
+            &self.pipe_ctx,
         )
         .await;
         self.serving = false;
@@ -2646,6 +2675,7 @@ impl HttpServer {
             http3::serve_http3_without_encrypt_impl(&addr, pipe_ctx),
             shutdown_signal,
             grace,
+            &self.pipe_ctx,
         )
         .await;
         self.serving = false;
@@ -2695,7 +2725,9 @@ impl HttpServer {
         self.serving = true;
         let shutdown_signal = self.shutdown_signal.take();
         let grace = self.shutdown_grace;
-        let result = Self::finish_serve(self.serve_acme_impl(), shutdown_signal, grace).await;
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
+        let result =
+            Self::finish_serve(self.serve_acme_impl(), shutdown_signal, grace, &pipe_ctx).await;
         self.serving = false;
         result
     }
@@ -2726,7 +2758,8 @@ impl HttpServer {
         };
 
         let request_limits = pipe_ctx.request_limits();
-        Self::spawn_connection(async move {
+        let conn_ctx = Arc::clone(&pipe_ctx);
+        Self::spawn_connection(&pipe_ctx, async move {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
             // 静态模板快路径的拼装缓冲（Date 前缀+当前日期+后缀），连接级复用
             let mut tpl_scratch = Vec::<u8>::with_capacity(512);
@@ -2837,7 +2870,7 @@ impl HttpServer {
                     }
                 };
                 req.client_addr = Some(client_addr);
-                let cmode = if pipe_ctx.disable_compress {
+                let cmode = if conn_ctx.disable_compress {
                     CompressMode::None
                 } else {
                     req.get_header_accept_encoding()
@@ -2900,7 +2933,7 @@ impl HttpServer {
                     }
                     let stream = Arc::new(Mutex::new(stream));
                     req.stream = Some(Arc::clone(&stream));
-                    let mut res = PipeContext::handle_request(pipe_ctx.as_ref(), &mut req, 0).await;
+                    let mut res = PipeContext::handle_request(conn_ctx.as_ref(), &mut req, 0).await;
                     if req.stream.is_none() {
                         // upgrade_websocket already took the stream and wrote
                         // the 101 handshake; the socket now speaks the
@@ -2923,7 +2956,7 @@ impl HttpServer {
                 }
                 #[cfg(feature = "bench-phases")]
                 let t_dispatch = std::time::Instant::now();
-                let mut res = PipeContext::handle_request(pipe_ctx.as_ref(), &mut req, 0).await;
+                let mut res = PipeContext::handle_request(conn_ctx.as_ref(), &mut req, 0).await;
                 #[cfg(feature = "bench-phases")]
                 bench_phases::add(&bench_phases::DISPATCH_NS, t_dispatch);
                 if conn != HttpConnection::KeepAlive {
@@ -3200,7 +3233,8 @@ impl HttpServer {
                     let acceptor = acceptor.clone();
                     // 握手阶段不占连接配额（真正的连接由内层
                     // spawn_http1_connection 计数）
-                    Self::spawn_connection_untracked(async move {
+                    let conn_ctx = Arc::clone(&pipe_ctx);
+                    Self::spawn_connection_untracked(&pipe_ctx, async move {
                         // Bound the TLS handshake so clients can't hold handshake
                         // state open indefinitely.
                         let handshake = tokio::time::timeout(
@@ -3213,7 +3247,7 @@ impl HttpServer {
                             _ => return,
                         };
                         Self::spawn_http1_connection(
-                            pipe_ctx,
+                            conn_ctx,
                             client_addr,
                             HttpStream::from_server_tls(stream),
                         );
@@ -3232,7 +3266,7 @@ impl HttpServer {
             let acceptor = acceptor.clone();
             let pipe_ctx2 = Arc::clone(&pipe_ctx);
             // 握手阶段不占连接配额（真正的连接由内层 spawn_http1_connection 计数）
-            Self::spawn_connection_untracked(async move {
+            Self::spawn_connection_untracked(&pipe_ctx, async move {
                 // Bound the TLS handshake so clients can't hold handshake
                 // state open indefinitely.
                 let handshake = tokio::time::timeout(
@@ -3281,7 +3315,7 @@ impl HttpServer {
                     let (stream, _) = accepted?;
                     _ = stream.set_nodelay(true);
                     let acme_manager2 = acme_manager_clone.clone();
-                    Self::spawn_connection(async move {
+                    Self::spawn_connection(&pipe_ctx, async move {
                         Self::handle_acme_challenge_only(acme_manager2, stream).await;
                     });
                 }
@@ -3295,7 +3329,7 @@ impl HttpServer {
 
                     // 握手阶段不占连接配额（真正的连接由内层
                     // handle_acme_or_normal → spawn_http1_connection 计数）
-                    Self::spawn_connection_untracked(async move {
+                    Self::spawn_connection_untracked(&pipe_ctx, async move {
                         let handshake = tokio::time::timeout(
                             crate::global_config::ServerConfig::get_tls_handshake_timeout().await,
                             acceptor_clone.accept(stream),

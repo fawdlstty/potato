@@ -3,17 +3,16 @@
 //! http1 / https / http2(ALPN 回落) 三入口在每核拓扑下可正常服务，
 //! 停机信号触发后 serve future 能在宽限期内返回（worker 随停机退出）。
 
-#[cfg(feature = "http2")]
 use std::sync::atomic::{AtomicU16, Ordering};
 #[cfg(feature = "tls")]
 use std::time::Duration;
 #[cfg(feature = "tls")]
 use tokio::time::sleep;
 
-#[cfg(feature = "http2")]
+// 端口计数器与 get_test_port 不做 http2 门控：默认 features（无 http2）下
+// tls 系测试同样取号，文件级 std+tls 门控已保证引用方存在
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(35500);
 
-#[cfg(feature = "http2")]
 fn get_test_port() -> u16 {
     PORT_COUNTER.fetch_add(1, Ordering::Relaxed)
 }

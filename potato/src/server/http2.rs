@@ -35,9 +35,9 @@ pub async fn serve_http2_impl(
     if super::HttpServer::per_core_enabled() && super::HttpServer::reuseport_supported() {
         let handle_conn: super::PerCoreConnHandler = std::sync::Arc::new(move |pipe_ctx, client_addr, stream| {
             let acceptor = acceptor.clone();
-            super::HttpServer::spawn_connection(handle_http2_connection(
+            super::HttpServer::spawn_connection(&pipe_ctx, handle_http2_connection(
                 acceptor,
-                pipe_ctx,
+                Arc::clone(&pipe_ctx),
                 client_addr,
                 stream,
             ));
@@ -52,7 +52,7 @@ pub async fn serve_http2_impl(
         _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
         let pipe_ctx2 = Arc::clone(&pipe_ctx);
-        super::HttpServer::spawn_connection(handle_http2_connection(
+        super::HttpServer::spawn_connection(&pipe_ctx, handle_http2_connection(
             acceptor,
             pipe_ctx2,
             client_addr,
@@ -118,7 +118,7 @@ async fn handle_http2_connection(
         let pipe_ctx3 = Arc::clone(&pipe_ctx);
         // 每个请求流不占连接配额（连接本身已计数，流数量由
         // max_concurrent_streams 限制）
-        super::HttpServer::spawn_connection_untracked(async move {
+        super::HttpServer::spawn_connection_untracked(&pipe_ctx, async move {
             let _ = handle_h2_request(req_head, respond, pipe_ctx3, client_addr).await;
         });
     }

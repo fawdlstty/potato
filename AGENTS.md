@@ -16,3 +16,8 @@
    - `cargo test --features full`
    - `cargo +nightly clippy --features full --all-targets -- -D warnings`
 2. 任一命令失败时必须修复后重跑，全部通过才算改动完成（用户要求）。
+3. 为避免"本地全过、GitHub CI 报错"，改动涉及 server/测试/features 时另需跑
+   CI 等价命令（2026-11-26 主人要求，复刻 .github/workflows/rust.yml 全部步骤）：
+   - `cargo test`（默认 features，复刻 msrv job 测试步骤；要精确复刻工具链
+     用 `cargo +1.88.0 test`，工具链未装时先 `rustup toolchain install 1.88 --profile minimal`）
+   - `cargo check -p potato --lib --no-default-features`（复刻 no_std lite 检查步骤）

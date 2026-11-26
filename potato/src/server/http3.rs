@@ -306,7 +306,7 @@ pub async fn serve_http3_impl(
 
     while let Some(new_conn) = endpoint.accept().await {
         let pipe_ctx2 = Arc::clone(&pipe_ctx);
-        super::HttpServer::spawn_connection(async move {
+        super::HttpServer::spawn_connection(&pipe_ctx, async move {
             let conn = match new_conn.await {
                 Ok(conn) => conn,
                 Err(_) => return,
@@ -330,7 +330,7 @@ pub async fn serve_http3_impl(
                 let pipe_ctx3 = Arc::clone(&pipe_ctx2);
                 #[cfg(feature = "webtransport")]
                 let wt_conn = wt_conn.clone();
-                super::HttpServer::spawn_connection_untracked(async move {
+                super::HttpServer::spawn_connection_untracked(&pipe_ctx2, async move {
                     let (req_head, mut stream) = match resolver.resolve_request().await {
                         Ok(req_stream) => req_stream,
                         Err(_) => return,
@@ -572,7 +572,7 @@ pub async fn serve_http3_without_encrypt_impl(
 
     while let Some(new_conn) = endpoint.accept().await {
         let pipe_ctx2 = Arc::clone(&pipe_ctx);
-        super::HttpServer::spawn_connection(async move {
+        super::HttpServer::spawn_connection(&pipe_ctx, async move {
             let conn = match new_conn.await {
                 Ok(conn) => conn,
                 Err(_) => return,
@@ -596,7 +596,7 @@ pub async fn serve_http3_without_encrypt_impl(
                 let pipe_ctx3 = Arc::clone(&pipe_ctx2);
                 #[cfg(feature = "webtransport")]
                 let wt_conn = wt_conn.clone();
-                super::HttpServer::spawn_connection_untracked(async move {
+                super::HttpServer::spawn_connection_untracked(&pipe_ctx2, async move {
                     let (req_head, mut stream) = match resolver.resolve_request().await {
                         Ok(req_stream) => req_stream,
                         Err(_) => return,
