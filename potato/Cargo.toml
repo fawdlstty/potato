@@ -1,6 +1,6 @@
 [package]
 name = "potato"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -49,8 +49,9 @@ futures-util = { version = "0.3.34", optional = true }
 hipstr = { version = "0.8.0", optional = true }
 thread_local = { version = "1.1.10", optional = true }
 dashmap = { version = "6.2.1", optional = true }
-# http2
+# http2 / grpc
 h2 = { version = "0.4.19", optional = true }
+futures-core = { version = "0.3.34", optional = true }
 # http3
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
@@ -79,6 +80,14 @@ tikv-jemallocator = { version = "0.7.0", features = [
     "unprefixed_malloc_on_supported_platforms",
     "background_threads",
 ], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# per-core 拓扑内核协同（sched_setaffinity / SO_INCOMING_CPU）
+libc = "0.2"
+
+[build-dependencies]
+# grpc feature 下编译期解析 proto/conformance*.proto 生成字段往返测试代码
+potato-build = { version = "0.4.9", path = "../potato-build" }
 
 [dev-dependencies]
 rcgen = "0.14.5"
@@ -123,6 +132,7 @@ std = [
 ]
 websocket = ["dep:anyhow", "dep:sha1"]
 http2 = ["std", "tls", "dep:h2", "dep:bytes"]
+grpc = ["std", "http2", "dep:futures-core"]
 http3 = ["std", "tls", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:bytes", "dep:rcgen"]
 webtransport = ["http3"]
 jemalloc = ["std", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "dep:tikv-jemallocator"]
@@ -132,10 +142,11 @@ tls = ["std", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots"]
 webdav = ["std", "dep:bytes", "dep:dav-server", "dep:futures-util", "dep:webpki-roots"]
 acme = ["std", "tls", "dep:instant-acme", "dep:x509-parser"]
 webrtc = ["std", "dep:webrtc", "dep:rtc", "dep:uuid", "dep:bytes", "tls"]
-full = ["std", "websocket", "openapi", "ssh", "tls", "http2", "http3", "webdav", "acme", "webrtc"]
+full = ["std", "websocket", "openapi", "ssh", "tls", "http2", "grpc", "http3", "webdav", "acme", "webrtc"]
 
 # cargo test --features full
 # cargo +nightly clippy --features full --all-targets -- -D warnings
 # cargo publish -p potato-macro --allow-dirty --registry crates-io
+# cargo publish -p potato-build --allow-dirty --registry crates-io
 # cargo publish -p potato --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..

@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::future::Future;
-use std::io::{IoSlice, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -36,12 +36,12 @@ use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKey
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
-// ===================== writev 合并机制（响应批量写出） =====================
+// ===================== 批合并机制（响应批量写出） =====================
 //
 // 动机：HTTP/1.1 keep-alive 连接上流水线请求（一次 read 吐出多个完整请求）
-// 此前按「解析→处理→逐响应 writev」推进，每响应一次系统调用。内核网络栈
-// 是主要瓶颈时，把同一连接上连续就绪的多个响应攒成IoSlice 队列、单次
-// writev 打包写出，可显著降低 syscall 次数提升 QPS。
+// 此前按「解析→处理→逐响应 write」推进，每响应一次系统调用。内核网络栈
+// 是主要瓶颈时，把同一连接上连续就绪的多个响应依次序列化进连续批缓冲、
+// flush 时单次 write 打包写出，可显著降低 syscall 次数提升 QPS。
 //
 // 写序安全红线（全部满足才正确）：
 // 1. 任何可能阻塞的 socket 读、或解析路径内的插写（100-Continue）之前，
@@ -60,33 +60,20 @@ use tokio_rustls::TlsAcceptor;
 const BATCH_MAX_PAYLOAD: usize = 16 * 1024;
 /// 批量总字节阈值：达到即冲刷
 const BATCH_MAX_BYTES: usize = 32 * 1024;
-/// 分片数上限：低于 writev 的 IOV_MAX（Linux 1024），留裕量
+/// 批内响应数上限：防极端小响应把批拖长（历史上对应 writev 的
+/// IOV_MAX 裕量，连续缓冲形态下仅剩防拖长意义）
 const BATCH_MAX_PIECES: usize = 510;
-/// 回收池深度上限（连接级：常规批 ≤ 数十片，超出退回正常释放）
-const BATCH_SPARE_MAX: usize = 64;
 
-/// 同连接响应合并写出器。`pieces` 持有每个响应的完整序列化字节
-/// （头块+body，[`HttpResponse::as_bytes`] 产物），flush 时拼成
-/// IoSlice 数组走单次 `writev`。
+/// 同连接响应合并写出器。批内响应依次序列化进单一连续缓冲 `buf`
+/// 尾部（[`HttpResponse::as_bytes_into`] 追加直写），flush 时一次
+/// `write_all` 写出——相比多段 writev 免去 IoSlice 组装（含 unsafe
+/// 生存期改写）与内核 iovec 逐段遍历，回收池/分片管理整套省略。
 pub(crate) struct ResponseBatcher {
-    pieces: Vec<Vec<u8>>,
-    pending_bytes: usize,
-    /// flush 后回收的序列化缓冲（clear 复用容量 + as_bytes_into 直写，
-    /// 免每响应一次序列化堆分配；d8 流水线批合并热路径）
-    spare: Vec<Vec<u8>>,
-    /// flush 用的 IoSlice 复用缓冲：跨 flush 复用容量，免去每次 flush 的
-    /// Vec 分配 + 逐条拷贝。元素生存期标 `'static` 仅为绕开「条目借用自
-    /// self.pieces 的自引用」限制——条目只在 flush 调用体内被
-    /// write_all_vectored 读取（此刻 &self.pieces 共享借用存活），调用返回
-    /// 后即成不可达的陈旧值，下次 flush 开头 clear 重建。
-    /// SAFETY（transmute 处逐条对照）：
-    /// 1) 条目指向 self.pieces 元素的缓冲；写入与读取都在同一 &mut self
-    ///    独占作用域内，读取期间 pieces 无任何变动（drain 排在写出之后）；
-    /// 2) 条目除传给 write_all_vectored 外从不解引用，flush 返回后不再持有
-    ///    任何读引用；
-    /// 3) IoSlice 是 repr(transparent) 的 `&[u8]` 新类型，生存期仅为编译期
-    ///    标注，transmute 不改变运行时布局（同布局类型间转换）。
-    slices: Vec<IoSlice<'static>>,
+    /// 批缓冲：跨 flush 复用容量（flush 后 clear 保留容量）。峰值
+    /// < BATCH_MAX_BYTES + 单响应上限（push 先于 should_flush 检查）
+    buf: Vec<u8>,
+    /// 批内响应计数：防极端小响应把批拖到片数上限之外
+    pending_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,19 +87,17 @@ enum QueueOutcome {
 impl ResponseBatcher {
     fn new() -> Self {
         Self {
-            pieces: Vec::with_capacity(64),
-            pending_bytes: 0,
-            spare: Vec::new(),
-            slices: Vec::with_capacity(64),
+            buf: Vec::with_capacity(BATCH_MAX_BYTES + BATCH_MAX_PAYLOAD),
+            pending_count: 0,
         }
     }
 
     pub(crate) fn has_pending(&self) -> bool {
-        !self.pieces.is_empty()
+        !self.buf.is_empty()
     }
 
     fn should_flush(&self) -> bool {
-        self.pending_bytes >= BATCH_MAX_BYTES || self.pieces.len() >= BATCH_MAX_PIECES
+        self.buf.len() >= BATCH_MAX_BYTES || self.pending_count >= BATCH_MAX_PIECES
     }
 
     /// 尝试把响应入队。仅接受小尺寸 Data 体响应；Stream 体与超限载荷
@@ -130,52 +115,30 @@ impl ResponseBatcher {
         if payload_len > BATCH_MAX_PAYLOAD {
             return QueueOutcome::Direct;
         }
-        // 取回收缓冲直写序列化（as_bytes_into 与 as_bytes 字节同源），
-        // 池空或超限 piece 退回正常分配路径
-        let mut bytes = self.spare.pop().unwrap_or_default();
-        bytes.clear();
-        res.as_bytes_into(&mut bytes, cmode, method);
-        self.pending_bytes += bytes.len();
-        self.pieces.push(bytes);
+        // 追加直写序列化进连续批缓冲（as_bytes_into 与 as_bytes 字节同源）
+        res.as_bytes_into(&mut self.buf, cmode, method);
+        self.pending_count += 1;
         QueueOutcome::Queued
     }
 
-    /// 把攒下的所有响应切片经一次（或多次部分写续传）writev 写出。
-    /// 预构造字节直入批（静态响应模板快路径）：拷入回收缓冲复用 piece 池，
+    /// 预构造字节直入批（静态响应模板快路径）：拷入连续批缓冲，
     /// 超限退回直写。
     fn queue_bytes(&mut self, bytes: &[u8]) -> QueueOutcome {
         if bytes.len() > BATCH_MAX_PAYLOAD {
             return QueueOutcome::Direct;
         }
-        let mut piece = self.spare.pop().unwrap_or_default();
-        piece.clear();
-        piece.extend_from_slice(bytes);
-        self.pending_bytes += piece.len();
-        self.pieces.push(piece);
+        self.buf.extend_from_slice(bytes);
+        self.pending_count += 1;
         QueueOutcome::Queued
     }
 
     pub(crate) async fn flush(&mut self, stream: &mut HttpStream) -> anyhow::Result<()> {
-        if self.pieces.is_empty() {
+        if self.buf.is_empty() {
             return Ok(());
         }
-        // IoSlice 复用缓冲重建条目（clear + push 零分配，见 slices 字段
-        // SAFETY 注释）；此前每次 flush collect 一个新 Vec
-        self.slices.clear();
-        self.slices.reserve(self.pieces.len());
-        for piece in &self.pieces {
-            let slice: IoSlice<'static> =
-                unsafe { std::mem::transmute(IoSlice::new(piece.as_slice())) };
-            self.slices.push(slice);
-        }
-        stream.write_all_vectored(&self.slices).await?;
-        // piece 缓冲回收进池（clear 保留容量），超大 piece 不回收防大缓冲驻留
-        for piece in self.pieces.drain(..) {
-            if self.spare.len() < BATCH_SPARE_MAX && piece.capacity() <= BATCH_MAX_BYTES {
-                self.spare.push(piece);
-            }
-        }
-        self.pending_bytes = 0;
+        stream.write_all(&self.buf).await?;
+        self.buf.clear();
+        self.pending_count = 0;
         Ok(())
     }
 }
@@ -226,6 +189,19 @@ pub fn buf_holds_complete_request(buf: &[u8]) -> bool {
 /// 地址端口实现平滑重启。SO_REUSEPORT 必须与 SO_REUSEADDR 配套设置：
 /// 前者负责多套接字共存（内核按四元组负载均衡），后者负责 TIME_WAIT 期重绑。
 async fn bind_reuse_listener(addr: SocketAddr, reuse_port: bool) -> anyhow::Result<TcpListener> {
+    bind_reuse_listener_pinned(addr, reuse_port, None).await
+}
+
+/// `incoming_cpu`（Linux，方案A 内核协同实验）：对该 listener 设置
+/// SO_INCOMING_CPU，内核把其接收连接的 RX 软中断处理定向到指定核——
+/// 与 per-core worker 绑核配套，消除跨核 IPI 与缓存迁移。设置失败
+/// 静默忽略（内核/虚拟网卡不支持时不影响服务）。
+async fn bind_reuse_listener_pinned(
+    addr: SocketAddr,
+    reuse_port: bool,
+    // 非 Linux 平台不消费该参数（SO_INCOMING_CPU 仅 Linux 支持），前缀下划线消警
+    _incoming_cpu: Option<u32>,
+) -> anyhow::Result<TcpListener> {
     if !reuse_port {
         return Ok(TcpListener::bind(addr).await?);
     }
@@ -245,6 +221,22 @@ async fn bind_reuse_listener(addr: SocketAddr, reuse_port: bool) -> anyhow::Resu
     ))]
     socket.set_reuseport(true)?;
     socket.bind(addr)?;
+    #[cfg(target_os = "linux")]
+    if let Some(cpu) = _incoming_cpu {
+        // SO_INCOMING_CPU=49（Linux uapi，libc crate 未暴露该常量）；
+        // tokio TcpSocket 实现 AsRawFd，bind 后 listen 前设置即可生效
+        const SO_INCOMING_CPU: std::os::raw::c_int = 49;
+        let v: std::os::raw::c_int = cpu as std::os::raw::c_int;
+        unsafe {
+            let _ = libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&socket),
+                libc::SOL_SOCKET,
+                SO_INCOMING_CPU,
+                (&v as *const std::os::raw::c_int).cast(),
+                std::mem::size_of::<std::os::raw::c_int>() as libc::socklen_t,
+            );
+        }
+    }
     Ok(socket.listen(128)?)
 }
 
@@ -304,7 +296,7 @@ impl PipeContext {
         list_contains(configured, origin).then_some(origin)
     }
 
-    fn apply_cors_headers(&self, res: &mut HttpResponse, req: &HttpRequest) {
+    pub(crate) fn apply_cors_headers(&self, res: &mut HttpResponse, req: &HttpRequest) {
         let Some(config) = self.cors_config() else {
             return;
         };
@@ -532,6 +524,14 @@ static HANDLERS_FLAT: LazyLock<FxHashMap<(&'static str, HttpMethod), &'static Re
         handlers
     });
 
+/// 普通 HTTP 精确路由表中是否存在该路径（任意方法）。gRPC 注册表在
+/// 启动期做路径冲突检测用（gRPC 路径 `/pkg.Service/Method` 与 HTTP
+/// 路由同名即报错防歧义）。
+#[cfg(feature = "grpc")]
+pub(crate) fn http_route_path_exists(path: &str) -> bool {
+    HANDLERS_FLAT.keys().any(|(p, _)| *p == path)
+}
+
 /// 动态路由模式段：固定段精确比较，参数段捕获任意非空段
 enum RouteSegment {
     Static(&'static str),
@@ -610,7 +610,18 @@ type StaticTemplateEntry = (&'static str, HttpMethod, &'static str);
 type BuiltTemplateEntry = (&'static str, HttpMethod, (&'static [u8], &'static [u8]));
 
 static STATIC_TEMPLATES: LazyLock<std::sync::RwLock<Vec<StaticTemplateEntry>>> =
-    LazyLock::new(|| std::sync::RwLock::new(Vec::new()));
+    LazyLock::new(|| {
+        // 宏自动登记条目（零参 sync `-> &'static str` GET handler 的字面量
+        // 体，路由宏展开时提交）：收集进同一模板表，非空即置位快路径开关
+        // （显式登记 API 在此之后运行时 push，各自置位）
+        let templates: Vec<StaticTemplateEntry> = inventory::iter::<StaticTemplateFlag>()
+            .map(|f| (f.path, HttpMethod::GET, f.body))
+            .collect();
+        if !templates.is_empty() {
+            STATIC_TEMPLATES_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        std::sync::RwLock::new(templates)
+    });
 
 static STATIC_TEMPLATE_PIECES: LazyLock<std::sync::RwLock<Vec<BuiltTemplateEntry>>> =
     LazyLock::new(|| std::sync::RwLock::new(Vec::new()));
@@ -619,10 +630,43 @@ static STATIC_TEMPLATE_PIECES: LazyLock<std::sync::RwLock<Vec<BuiltTemplateEntry
 /// [`HttpResponse::html`] 默认形态（Date/Server/Connection/Content-Type/
 /// Pragma/Cache-Control/Content-Length）。登记动作须发生在 [`HttpServer`]
 /// 开始服务之前；命中快路径的请求不再经过 CORS/预处理/后处理等管线项，
-/// 仅默认管线形态（`use_handlers` 之外无管线扩展）的服务可安全使用。
+/// 带附加管线项的服务登记了也不会命中（连接级守卫强制，见
+/// [`PipeContext::allows_static_templates`]）。
 pub fn register_static_template(path: &'static str, method: HttpMethod, body: &'static str) {
     STATIC_TEMPLATES.write().unwrap().push((path, method, body));
     STATIC_TEMPLATES_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 宏自动登记的静态响应模板条目（方案C 自动化）：`#[get("/path")]` 修饰
+/// 的零参同步 `-> &'static str` handler 且函数体为单一字符串字面量时，
+/// 路由宏在展开期自动提交本条目；服务开始前由
+/// [`static_templates_prepare`] 强制初始化模板表时收集。命中受连接级
+/// 默认管线形态守卫约束（见 [`PipeContext::allows_static_templates`]）。
+pub struct StaticTemplateFlag {
+    pub path: &'static str,
+    pub body: &'static str,
+}
+
+impl StaticTemplateFlag {
+    pub const fn new(path: &'static str, body: &'static str) -> Self {
+        StaticTemplateFlag { path, body }
+    }
+}
+
+inventory::collect!(StaticTemplateFlag);
+
+/// 服务开始前强制初始化模板表（含宏自动登记条目），非空时置位快路径
+/// 开关。仅显式登记的场景（登记已自行置位）调用为幂等空转。
+pub(crate) fn static_templates_prepare() {
+    let templates = STATIC_TEMPLATES.read().unwrap();
+    if !templates.is_empty() {
+        STATIC_TEMPLATES_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 当前模板表条目数（含宏自动登记与显式登记）：测试观测用。
+pub fn static_template_count() -> usize {
+    STATIC_TEMPLATES.read().unwrap().len()
 }
 
 /// 查模板字节（Date 前缀/后缀），首次命中时用正常序列化机制构建。
@@ -630,6 +674,19 @@ fn static_template_pieces(
     path: &str,
     method: HttpMethod,
 ) -> Option<(&'static [u8], &'static [u8])> {
+    // 稳态快速路径：已构建表读锁直查（每请求一次；此前每次请求都拿写锁
+    // ——稳态命中也走写锁互斥，per-core 多 worker 下逐请求写锁 CAS 是
+    // d8 热路径实打实的共享竞争点）。miss 才进模板表读锁 + 写锁回填
+    // （double-check：并发首个请求构建后其余请求经写锁内命中返回）。
+    {
+        let guard = STATIC_TEMPLATE_PIECES.read().unwrap();
+        if let Some((_, _, v)) = guard
+            .iter()
+            .find(|(p, m, _)| *p == path && *m == method)
+        {
+            return Some(*v);
+        }
+    }
     let templates = STATIC_TEMPLATES.read().unwrap();
     let static_key = templates
         .iter()
@@ -646,16 +703,20 @@ fn static_template_pieces(
     }
     let bytes = crate::HttpResponse::html(static_key.2.to_string())
         .as_bytes(crate::CompressMode::None, Some(method));
-    // Date 值恒为 29 字节 RFC1123（%a, %d %b %Y %H:%M:%S GMT）
-    let pos = bytes
-        .windows(6)
-        .position(|w| w == b"Date: ")
-        .expect("template response must carry Date header")
-        + 6;
-    let prefix: &'static [u8] = Box::leak(bytes[..pos].to_vec().into_boxed_slice());
-    let suffix: &'static [u8] = Box::leak(bytes[pos + 29..].to_vec().into_boxed_slice());
-    guard.push((static_key.0, static_key.1, (prefix, suffix)));
-    Some((prefix, suffix))
+    let pieces: (&'static [u8], &'static [u8]) =
+        match bytes.windows(6).position(|w| w == b"Date: ") {
+        // 默认形态：Date 值恒为 29 字节 RFC1123（%a, %d %b %Y %H:%M:%S GMT），
+        // 拆成「Date: 前缀 + 当前日期 + 后缀」两段，写出端补当前日期
+        Some(pos) => (
+            Box::leak(bytes[..pos + 6].to_vec().into_boxed_slice()),
+            Box::leak(bytes[pos + 35..].to_vec().into_boxed_slice()),
+        ),
+        // ultraspeed 形态无 Date 头：整段字节全静态（前缀=全字节、后缀=空段），
+        // 写出端按空后缀跳过 Date 补插
+        None => (Box::leak(bytes.into_boxed_slice()), &[] as &'static [u8]),
+    };
+    guard.push((static_key.0, static_key.1, pieces));
+    Some(pieces)
 }
 
 fn match_dynamic_handlers(
@@ -803,6 +864,16 @@ impl Default for PipeContext {
 }
 
 impl PipeContext {
+    /// 是否为默认管线形态（仅 Handlers，无 CORS/预处理/后处理/静态文件
+    /// 路由等附加管线项）。静态响应模板快路径跳过全部管线项，仅此形态
+    /// 允许命中——带附加管线项的实例命中模板会静默改变响应语义，连接
+    /// 建立时按本判定门控（每连接判定一次，请求路径零开销）。
+    pub(crate) fn allows_static_templates(&self) -> bool {
+        self.items
+            .iter()
+            .all(|i| matches!(i, PipeContextItem::Handlers))
+    }
+
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
     pub(crate) fn init_jemalloc_if_configured(&self) -> anyhow::Result<()> {
         if self
@@ -2519,6 +2590,23 @@ impl HttpServer {
         ))
     }
 
+    /// 开关 ultraspeed 模式（opt-in 极简头模式）：开启后本服务产生的响应
+    /// 不再附带任何默认附加头（Date/Server/Content-Type/Pragma/
+    /// Cache-Control），仅保留协议必需的 Connection，线上形态收敛为
+    /// 「状态行 + Connection + Content-Length + body」，用于对字节量敏感
+    /// 的极致吞吐场景。用户在 handler 里显式 `add_header`/`append_header`
+    /// 的头不受影响，照常输出。
+    ///
+    /// 设置须发生在 [`HttpServer::serve_http`] 等服务开始之前：响应构造与
+    /// 静态模板快路径按首次构建时刻的开关状态固化字节形态，运行中途翻转
+    /// 只影响此后新构建的响应。本方法作用于进程级全局开关（见
+    /// [`crate::global_config::ServerConfig::set_ultraspeed`]），多实例
+    /// 共享同一状态。
+    pub fn ultraspeed(&mut self, enabled: bool) -> &mut Self {
+        crate::global_config::ServerConfig::set_ultraspeed(enabled);
+        self
+    }
+
     async fn finish_serve<F>(
         serve: F,
         shutdown_signal: Option<oneshot::Receiver<()>>,
@@ -2645,6 +2733,29 @@ impl HttpServer {
         result
     }
 
+    /// 启动明文 HTTP/2 入口（h2 prior knowledge，跳过 TLS/ALPN）。
+    ///
+    /// 内网 gRPC 明文 h2c 是主流部署形态；本入口与 [`Self::serve_http2`]
+    /// 共用同一请求处理路径（gRPC 拦截点同源），普通 HTTP/2 请求照常
+    /// 服务。停机语义与其他 serve_* 一致。
+    #[cfg(feature = "http2")]
+    pub async fn serve_h2c(&mut self) -> anyhow::Result<()> {
+        self.serving = true;
+        let shutdown_signal = self.shutdown_signal.take();
+        let pipe_ctx = Arc::clone(&self.pipe_ctx);
+        let addr = self.addr.clone();
+        let grace = self.shutdown_grace;
+        let result = Self::finish_serve(
+            http2::serve_h2c_impl(&addr, pipe_ctx, self.reuse_port),
+            shutdown_signal,
+            grace,
+            &self.pipe_ctx,
+        )
+        .await;
+        self.serving = false;
+        result
+    }
+
     #[cfg(feature = "http3")]
     pub async fn serve_http3(&mut self, cert_file: &str, key_file: &str) -> anyhow::Result<()> {
         self.serving = true;
@@ -2761,8 +2872,19 @@ impl HttpServer {
         let conn_ctx = Arc::clone(&pipe_ctx);
         Self::spawn_connection(&pipe_ctx, async move {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
+            // 游标化消费缓冲：buf[pos..] 为未消费残留，advance 统一推进
+            // （残留耗尽 clear 零 memmove、超水位一次 drain），替代每请求
+            // copy_within（见 HttpBufCursor）
+            let mut cursor = crate::full::HttpBufCursor::new(&mut buf);
+            // httparse 头槽连接级复用：解析函数把槽按 MaybeUninit 对待
+            // （httparse 1.10 保证旧值从不被读、解析后切片收缩到本次写入数），
+            // 跨请求复用免去每请求 ~1.5KB 栈数组初始化（d8 批内逐请求一次）
+            let mut header_slots = [httparse::EMPTY_HEADER; 48];
             // 静态模板快路径的拼装缓冲（Date 前缀+当前日期+后缀），连接级复用
             let mut tpl_scratch = Vec::<u8>::with_capacity(512);
+            // 静态模板快路径的实例级守卫：仅默认管线形态（无 CORS/预处理/
+            // 后处理等附加管线项）允许命中，每连接判定一次（请求路径零开销）
+            let tpl_allowed = conn_ctx.allows_static_templates();
             let mut req = HttpRequest::new();
             // writev 合并：待发响应批量队列
             let mut batch = ResponseBatcher::new();
@@ -2787,12 +2909,13 @@ impl HttpServer {
                 let t_read = std::time::Instant::now();
                 let outcome = {
                     let read = HttpRequest::from_stream_with_limits_into(
-                        &mut buf,
+                        &mut cursor,
                         &mut stream,
                         request_limits.map(|(header, _)| header),
                         request_limits.map(|(_, body)| body),
                         &mut req,
                         Some(&mut batch),
+                        &mut header_slots,
                     );
                     tokio::pin!(read);
                     // Err(None) = 超时；Err(Some(msg)) = 解析错误
@@ -2880,6 +3003,7 @@ impl HttpServer {
                 // 命中门控（GET、keep-alive、无压缩协商、无请求体）→ 跳过
                 // 管线分发与序列化，预构造字节补当前 Date 写出。
                 if STATIC_TEMPLATES_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                    && tpl_allowed
                     && cmode == CompressMode::None
                     && conn == HttpConnection::KeepAlive
                     && req.method == HttpMethod::GET
@@ -2888,10 +3012,14 @@ impl HttpServer {
                     if let Some((prefix, suffix)) =
                         static_template_pieces(&req.url_path, req.method)
                     {
-                        let direct = !batch.has_pending() && n == buf.len();
+                        let direct = !batch.has_pending() && cursor.consumed_to_end(n);
                         tpl_scratch.clear();
                         tpl_scratch.extend_from_slice(prefix);
-                        tpl_scratch.extend_from_slice(crate::full::now_http_date_bytes());
+                        // 空后缀 = ultraspeed 形态（无 Date 头），整段静态
+                        // 直出；非空后缀补当前日期后再接尾段
+                        if !suffix.is_empty() {
+                            tpl_scratch.extend_from_slice(crate::full::now_http_date_bytes());
+                        }
                         tpl_scratch.extend_from_slice(suffix);
                         if direct {
                             if stream.write_all(&tpl_scratch).await.is_err() {
@@ -2916,13 +3044,7 @@ impl HttpServer {
                                 }
                             }
                         }
-                        if n > 0 {
-                            let remain = buf.len().saturating_sub(n);
-                            if remain > 0 {
-                                buf.copy_within(n.., 0);
-                            }
-                            buf.truncate(remain);
-                        }
+                        cursor.advance(n);
                         continue;
                     }
                 }
@@ -2956,24 +3078,33 @@ impl HttpServer {
                 }
                 #[cfg(feature = "bench-phases")]
                 let t_dispatch = std::time::Instant::now();
+                // gRPC-Web h1 拦截点：content-type 是 grpc-web 家族且路径
+                // 在 gRPC 注册表内才接管；原生 gRPC（application/grpc）在
+                // h1 上不算 gRPC 请求，与未命中路径一并回落普通管线。
+                #[cfg(feature = "grpc")]
+                let mut res = match crate::grpc::try_handle_h1(conn_ctx.as_ref(), &mut req).await {
+                    Some(res) => res,
+                    None => PipeContext::handle_request(conn_ctx.as_ref(), &mut req, 0).await,
+                };
+                #[cfg(not(feature = "grpc"))]
                 let mut res = PipeContext::handle_request(conn_ctx.as_ref(), &mut req, 0).await;
                 #[cfg(feature = "bench-phases")]
                 bench_phases::add(&bench_phases::DISPATCH_NS, t_dispatch);
                 if conn != HttpConnection::KeepAlive {
                     res.add_header("Connection".into(), "close".into());
                 }
-                // writev 合并（流水线感知直写快路径）：
+                // 批合并（流水线感知直写快路径）：
                 // 批空且 buf 已被当前请求耗尽（buf.len()==n，纯字节比较零解析
                 // 成本，depth=1 常态）→ 响应直写，退化为独立读写：
                 // write_to_stream 走栈上头块+头体两段零拷贝 writev，省掉
-                // as_bytes 堆分配+头体 memcpy、Vec<IoSlice> 分配和批处理
-                // 往返；否则照旧入队攒批，冲刷交给 should_flush / 循环头守卫 /
-                // 关闭路径（流水线批次仍单 writev 合并打包含末尾响应，不拆批）。
+                // as_bytes 堆分配+头体 memcpy 和批处理往返；否则照旧入队
+                // 攒批，冲刷交给 should_flush / 循环头守卫 /
+                // 关闭路径（流水线批次仍单 write 合并打包含末尾响应，不拆批）。
                 // 写序安全：批空直写不可能乱序；入队后的冲刷时机由解析读
                 // 路径内嵌冲刷兜底（buf 不含完整请求时下一步读可能阻塞或
                 // 触发 100-Continue 插写，读路径会先冲刷）。
                 let direct_write = !batch.has_pending()
-                    && n == buf.len()
+                    && cursor.consumed_to_end(n)
                     && matches!(&res.body, HttpResponseBody::Data(d) if d.len() <= BATCH_MAX_PAYLOAD);
                 #[cfg(feature = "bench-phases")]
                 let t_write = std::time::Instant::now();
@@ -3015,13 +3146,7 @@ impl HttpServer {
                     bench_phases::REQUESTS.fetch_add(1, Ordering::Relaxed);
                 }
                 res.recycle_into_pool();
-                if n > 0 {
-                    let remain = buf.len().saturating_sub(n);
-                    if remain > 0 {
-                        buf.copy_within(n.., 0);
-                    }
-                    buf.truncate(remain);
-                }
+                cursor.advance(n);
                 if conn != HttpConnection::KeepAlive {
                     // 连接关闭前冲刷最后的待发响应
                     if batch.flush(&mut stream).await.is_err() {
@@ -3062,12 +3187,17 @@ impl HttpServer {
         self.pipe_ctx.init_jemalloc_if_configured()?;
 
         let addr: SocketAddr = self.addr.parse()?;
+        // 静态模板表预热：强制初始化并收集宏自动登记条目（幂等）
+        static_templates_prepare();
+        // gRPC 注册表预热：收集 inventory 条目并做 gRPC/HTTP 路径冲突检测
+        #[cfg(feature = "grpc")]
+        crate::grpc::startup_prepare();
         let pipe_ctx = Arc::clone(&self.pipe_ctx);
 
-        // 每核 current-thread 拓扑（实验，方案A）：环境变量 POTATO_PER_CORE=1
-        // 启用。N 个工作线程各持独立 current-thread runtime 与 SO_REUSEPORT
-        // 监听，连接终身单线程亲和（无工作窃取与跨线程唤醒）。平台不支持
-        // SO_REUSEPORT 时静默回退共享监听拓扑。
+        // 每核 current-thread 拓扑（方案A，默认启用）：环境变量
+        // POTATO_PER_CORE=0 显式关闭。N 个工作线程各持独立 current-thread
+        // runtime 与 SO_REUSEPORT 监听，连接终身单线程亲和（无工作窃取与
+        // 跨线程唤醒）。平台不支持 SO_REUSEPORT 时静默回退共享监听拓扑。
         if Self::per_core_enabled() && Self::reuseport_supported() {
             let handle_conn: PerCoreConnHandler = Arc::new(|pipe_ctx, client_addr, stream| {
                 Self::spawn_http1_connection(pipe_ctx, client_addr, HttpStream::from_tcp(stream));
@@ -3092,7 +3222,16 @@ impl HttpServer {
     }
 
     fn per_core_enabled() -> bool {
-        std::env::var_os("POTATO_PER_CORE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        // 显式开关最高优先级：POTATO_PER_CORE=0 关闭，其余设置值（含 =1）
+        // 开启（测试套件显式开启以验证拓扑行为）。
+        if let Some(v) = std::env::var_os("POTATO_PER_CORE") {
+            return v != *std::ffi::OsStr::new("0");
+        }
+        // 默认值（方案A 默认化）按构建 profile：release 启用每核拓扑，
+        // debug 构建（含 cargo test 默认 profile）回退共享监听拓扑——测试
+        // 进程并行起几十个服务器，每服务器 N worker 线程会放大到上千线程
+        // 且就绪窗口随 N 变长，共享拓扑才是测试环境的稳定默认。
+        !cfg!(debug_assertions)
     }
 
     fn per_core_worker_count() -> usize {
@@ -3105,6 +3244,42 @@ impl HttpServer {
                     .map(|n| n.get())
                     .unwrap_or(4)
             })
+    }
+
+    /// per-core 内核协同（Linux，实验，POTATO_PER_CORE_PIN=1 启用）：
+    /// 把当前 worker 线程绑到进程可用核列表的第 `worker_idx` 核，返回
+    /// 该核号（供 listener SO_INCOMING_CPU 配套）。读取 sched_getaffinity
+    /// 掩码而非直接用 worker_idx，保证 taskset 段位（如 20-31）下映射正确。
+    /// env 未启用或系统调用失败返回 None（不绑核）。
+    #[cfg(target_os = "linux")]
+    fn pin_worker_cpu(worker_idx: usize) -> Option<u32> {
+        if std::env::var_os("POTATO_PER_CORE_PIN").as_deref() != Some(std::ffi::OsStr::new("1")) {
+            return None;
+        }
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+                return None;
+            }
+            let mut picked = None;
+            let mut seen = 0usize;
+            for cpu in 0..libc::CPU_SETSIZE as usize {
+                if libc::CPU_ISSET(cpu, &set) {
+                    if seen == worker_idx {
+                        picked = Some(cpu);
+                        break;
+                    }
+                    seen += 1;
+                }
+            }
+            let cpu = picked?;
+            let mut pin: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut pin);
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &pin) != 0 {
+                return None;
+            }
+            Some(cpu as u32)
+        }
     }
 
     /// 每核 current-thread 拓扑（实验，方案A）：每工作线程一个独立
@@ -3158,6 +3333,10 @@ impl HttpServer {
                 .name(format!("potato-core-{worker_idx}"))
                 .spawn(move || {
                     let _exit_guard = WorkerExitGuard(exit_state);
+                    // 内核协同（实验）：POTATO_PER_CORE_PIN=1 时绑核 + listener
+                    // SO_INCOMING_CPU 同核（RX 软中断与 worker 同核）
+                    #[cfg(target_os = "linux")]
+                    let pin_cpu = Self::pin_worker_cpu(worker_idx);
                     let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -3169,6 +3348,16 @@ impl HttpServer {
                         }
                     };
                     rt.block_on(async move {
+                        #[cfg(target_os = "linux")]
+                        let listener = match bind_reuse_listener_pinned(addr, true, pin_cpu).await {
+                            Ok(l) => l,
+                            Err(e) => {
+                                eprintln!("[potato] per-core bind failed: {e}");
+                                bind_failed.store(true, std::sync::atomic::Ordering::Release);
+                                return;
+                            }
+                        };
+                        #[cfg(not(target_os = "linux"))]
                         let listener = match bind_reuse_listener(addr, true).await {
                             Ok(l) => l,
                             Err(e) => {
@@ -3220,6 +3409,11 @@ impl HttpServer {
         self.pipe_ctx.init_jemalloc_if_configured()?;
 
         let addr: SocketAddr = self.addr.parse()?;
+        // 静态模板表预热：强制初始化并收集宏自动登记条目（幂等）
+        static_templates_prepare();
+        // gRPC 注册表预热（TLS h1 上的 gRPC-Web 拦截点同源）
+        #[cfg(feature = "grpc")]
+        crate::grpc::startup_prepare();
 
         // 每核 current-thread 拓扑（实验，方案A 延伸）：TLS 握手任务同样
         // 落在 worker 本地 runtime（accept 不被握手阻塞），握手完成后的
@@ -3472,5 +3666,72 @@ impl HttpServer {
         // 使用WithPreRead包装流，将initial_data作为预读取数据
         let stream_with_pre_read = HttpStream::with_pre_read(stream, initial_data.to_vec());
         Self::spawn_http1_connection(pipe_ctx, client_addr, stream_with_pre_read);
+    }
+}
+
+#[cfg(test)]
+mod ultraspeed_template_tests {
+    use super::*;
+    use crate::global_config::{ServerConfig, ULTRASPEED_TEST_LOCK};
+
+    /// ultraspeed 模式模板 pieces 形态锚：开关置位期构建的模板无 Date 头，
+    /// 整段字节进前缀、后缀为空段（写出端据此跳过 Date 补插），响应形态
+    /// 收敛为「状态行 + Connection + Content-Length + body」；开关还原后
+    /// 的构建保持默认 Date 前缀/后缀两段结构。两阶段取测试锁串行化，防
+    /// 并行翻开关测试对全局态交叉污染；唯一路径防模板缓存条目串扰。
+    #[test]
+    fn ultraspeed_then_default_template_pieces_forms() {
+        const TPL_PATH_US: &str = "/__ultraspeed_tpl_pieces_test__";
+        const TPL_PATH_DEF: &str = "/__default_tpl_pieces_test__";
+        register_static_template(TPL_PATH_US, HttpMethod::GET, "tpl-body");
+        register_static_template(TPL_PATH_DEF, HttpMethod::GET, "tpl-body");
+
+        // 阶段一：开关置位期构建 → 全静态极简形态
+        let us_pieces = std::cell::RefCell::new(None);
+        {
+            let _guard = ULTRASPEED_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ServerConfig::set_ultraspeed(true);
+            *us_pieces.borrow_mut() = static_template_pieces(TPL_PATH_US, HttpMethod::GET);
+            ServerConfig::set_ultraspeed(false);
+        }
+        let (us_prefix, us_suffix) = us_pieces
+            .into_inner()
+            .expect("registered template must resolve");
+        assert!(
+            us_suffix.is_empty(),
+            "ultraspeed template must not need Date patching"
+        );
+        let text = String::from_utf8_lossy(us_prefix);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(!text.contains("Date: "));
+        assert!(!text.contains("Server: "));
+        assert!(!text.contains("Content-Type: "));
+        assert!(!text.contains("Pragma"));
+        assert!(!text.contains("Cache-Control"));
+        assert!(text.contains("Connection: keep-alive\r\n"));
+        assert!(text.contains("Content-Length: 8\r\n"));
+        assert!(text.ends_with("\r\n\r\ntpl-body"));
+
+        // 阶段二：开关还原后构建 → 默认 Date 前缀/后缀两段结构
+        let def_pieces = std::cell::RefCell::new(None);
+        {
+            let _guard = ULTRASPEED_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *def_pieces.borrow_mut() = static_template_pieces(TPL_PATH_DEF, HttpMethod::GET);
+        }
+        let (def_prefix, def_suffix) = def_pieces
+            .into_inner()
+            .expect("registered template must resolve");
+        assert!(
+            !def_suffix.is_empty(),
+            "default template must keep Date patching suffix"
+        );
+        assert!(
+            String::from_utf8_lossy(def_prefix).ends_with("Date: "),
+            "prefix must end at Date value start"
+        );
     }
 }

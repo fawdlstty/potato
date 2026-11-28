@@ -3,6 +3,7 @@
 
 #[cfg(not(feature = "std"))]
 mod lite;
+mod grpc;
 mod utils;
 
 #[cfg(not(feature = "std"))]
@@ -201,6 +202,60 @@ fn random_ident() -> Ident {
     let mut rng = rand::rng();
     let value = format!("__potato_id_{}", rng.random::<u64>());
     Ident::new(&value, Span::call_site())
+}
+
+/// 提取 handler 函数体可作为静态模板体的单一表达式：
+/// `{ "literal" }` 字面量与 `{ CONST_ALIAS }` bare path 别名两种形态。
+/// bare path（类型 `&'static str` 的单一路径表达式）必为 const/static
+/// 项引用（safe Rust 下无其他可能），静态初始化必然合法，与字面量同等
+/// 零破坏；其余形态（调用表达式、多条语句、带分号）返回 None，静默走
+/// 正常响应路径。
+fn extract_static_str_literal(func: &syn::ItemFn) -> Option<proc_macro2::TokenStream> {
+    if func.block.stmts.len() != 1 {
+        return None;
+    }
+    if let syn::Stmt::Expr(expr, None) = &func.block.stmts[0] {
+        match expr {
+            syn::Expr::Lit(expr_lit) => {
+                if let syn::Lit::Str(_) = &expr_lit.lit {
+                    return Some(quote! { #expr_lit });
+                }
+            }
+            // const/static 别名：裸路径（单段标识符或模块限定路径）同属
+            // const 可求值形态
+            syn::Expr::Path(expr_path) if expr_path.attrs.is_empty() => {
+                return Some(quote! { #expr_path });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 静态响应模板自动登记判定（仅 http_get 走本路径）：零参、同步、
+/// 返回 `&'static str` 且函数体为单一字符串字面量或 const/static 别名
+/// 裸路径。命中时生成
+/// `StaticTemplateFlag` 的 inventory 提交（运行时收集进模板表；
+/// 命中受服务端默认管线形态守卫约束，带 CORS/预处理等管线项的
+/// 实例不会命中模板，语义无损）。
+fn static_template_flag_submit(
+    req_name: &str,
+    has_receiver: bool,
+    is_async: bool,
+    ret_type: &str,
+    final_path_expr: &proc_macro2::TokenStream,
+    root_fn: &syn::ItemFn,
+) -> Option<proc_macro2::TokenStream> {
+    if req_name != "GET"
+        || has_receiver
+        || is_async
+        || !(ret_type == "& 'static str" || ret_type == "&'static str")
+    {
+        return None;
+    }
+    extract_static_str_literal(root_fn).map(|body| {
+        quote! { potato::inventory::submit!{potato::StaticTemplateFlag::new(#final_path_expr, #body)} }
+    })
 }
 
 fn attr_last_ident(attr: &syn::Attribute) -> Option<String> {
@@ -719,6 +774,7 @@ fn postprocess_macro(attr: TokenStream, input: TokenStream) -> TokenStream {
 }
 
 fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> TokenStream {
+    let req_name_str = req_name;
     let req_name = Ident::new(req_name, Span::call_site());
 
     // 解析函数，检查是否有 receiver（&self / &mut self）
@@ -1982,6 +2038,14 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
     } else {
         quote! { potato::HttpHandler::Async(#wrap_func_name) }
     };
+    let static_template_submit = static_template_flag_submit(
+        req_name_str,
+        has_receiver,
+        is_async,
+        &ret_type,
+        &final_path_expr,
+        &root_fn,
+    );
     quote! {
         #root_fn
 
@@ -1997,6 +2061,8 @@ fn http_handler_macro(attr: TokenStream, input: TokenStream, req_name: &str) -> 
             #handler_call,
             potato::RequestHandlerFlagDoc::new(#doc_show, #doc_auth, #doc_summary, #doc_desp, #doc_args, #tag_expr)
         )}
+
+        #static_template_submit
     }
     .into()
     //}.to_string();
@@ -2075,6 +2141,12 @@ fn generate_response_handler(
         // 不支持的类型
         _ => panic!("unsupported ret type: {}", ret_type),
     }
+}
+
+#[cfg(feature = "std")]
+#[proc_macro_attribute]
+pub fn grpc(attr: TokenStream, input: TokenStream) -> TokenStream {
+    grpc::grpc(attr, input)
 }
 
 #[cfg(feature = "std")]

@@ -13,6 +13,11 @@ pub mod utils;
 #[path = "webrtc/mod.rs"]
 pub mod webrtc;
 
+/// gRPC / gRPC-Web 运行时（feature `grpc`；生成代码只依赖本模块的
+/// 运行时类型，不依赖 potato-build 本体）
+#[cfg(feature = "grpc")]
+pub mod grpc;
+
 pub use client::*;
 pub use global_config::*;
 pub use hipstr;
@@ -20,6 +25,7 @@ pub use inventory;
 pub use potato_macro::*;
 pub use regex;
 pub use rust_embed;
+pub use serde;
 pub use serde_json;
 pub use server::CorsConfig;
 pub use server::*;
@@ -769,32 +775,6 @@ fn u64_ascii_str(v: u64, tmp: &mut [u8; 20]) -> &str {
         }
     }
     std::str::from_utf8(&tmp[i..]).expect("u64 ascii digits are valid utf8")
-}
-
-/// 热路径头行序列化宏（`SmallString` 缓冲，仅接受 `&str`）：
-/// 常量前缀 + 净化后的值 + CRLF 直写，与
-/// `write!("{}: {}\r\n", sanitize_header_str(k), sanitize_header_str(v))`
-/// 字节形态一致，绕开 fmt 机制调度开销（depth=1 直写路径每响应）。
-macro_rules! push_header_line_str {
-    ($ret:expr, $prefix:expr, $value:expr) => {{
-        $ret.push_str($prefix);
-        let __v = sanitize_header_str($value);
-        $ret.push_str(&__v);
-        $ret.push_str("\r\n");
-    }};
-}
-
-/// 热路径头行序列化宏（`Vec<u8>` 缓冲版，键值均为 `&str`）：常量/净化后
-/// 键 + ": " + 净化后的值 + CRLF 直写，与
-/// `write!("{}: {}\r\n", sanitize_header_str(k), sanitize_header_str(v))`
-/// 字节形态一致，绕开 fmt 机制调度开销（as_bytes_into 批合并直写路径）。
-macro_rules! push_header_line_bytes {
-    ($ret:expr, $prefix:expr, $value:expr) => {{
-        $ret.extend_from_slice($prefix);
-        let __v = sanitize_header_str($value);
-        $ret.extend_from_slice(__v.as_bytes());
-        $ret.extend_from_slice(b"\r\n");
-    }};
 }
 
 /// 热路径头行序列化宏（`Vec<u8>` 缓冲版，键值均为 `&str`，动态键）：
@@ -2309,25 +2289,26 @@ impl HttpRequest {
     }
 
     async fn from_stream_impl_into(
-        buf: &mut Vec<u8>,
+        cursor: &mut HttpBufCursor<'_>,
         stream: &mut HttpStream,
         limits: (Option<usize>, Option<usize>),
         req: &mut HttpRequest,
         mut batch: Option<&mut crate::server::ResponseBatcher>,
+        slots: &mut [httparse::Header<'static>],
     ) -> anyhow::Result<usize> {
         let max_header_bytes = limits
             .0
             .map(|limit| limit.min(ServerConfig::get_max_header_bytes()))
             .unwrap_or_else(ServerConfig::get_max_header_bytes);
         let hdr_len = loop {
-            // 空缓冲时解析必然 Partial（httparse 对空输入不产出请求行），
-            // 跳过解析直接读一轮：省掉一次 48 槽 httparse 头数组整体初始化
-            // 与空解析调用（keep-alive 无流水线 d1 常态每请求首读即空缓冲）。
-            // 头区大小校验由 from_headers_part_with_limits_into 内部承担，
-            // 原循环顶的同款检查是对同一 buf 的重复扫描，删除。
-            if !buf.is_empty() {
+            // 游标语义：buf[read_pos..] 是未消费请求字节（d8 流水线残留），
+            // 解析与切片全部相对 read_pos；消费量以本函数返回值表达，由调用
+            // 方推进游标（水位 compact 见连接循环），免除每请求 copy_within
+            // memmove。空游标时解析必然 Partial（httparse 对空输入不产出请
+            // 求行），跳过解析直接读一轮。
+            if cursor.len() > cursor.pos() {
                 if let Some(hdr_len) =
-                    HttpRequest::from_headers_part_with_limits_into(&buf[..], max_header_bytes, req)?
+                    HttpRequest::from_headers_part_with_limits_into(cursor.slice_from_pos(), max_header_bytes, req, slots)?
                 {
                     break hdr_len;
                 }
@@ -2340,7 +2321,7 @@ impl HttpRequest {
             // 直读 buf 备用容量（read_into_vec 零拷贝零清零）：省掉 4KB 栈
             // 缓冲清零与请求字节的中转 memcpy；keep-alive 稳态 buf 恒有
             // ≥3KB 备用容量，单次 read 系统调用语义不变。
-            let n = stream.read_into_vec(buf).await?;
+            let n = stream.read_into_vec(cursor.buf_mut()).await?;
             if n == 0 {
                 return Err(anyhow::Error::msg("connection closed"));
             }
@@ -2377,25 +2358,33 @@ impl HttpRequest {
             Self::flush_pending_before_read(&mut batch, stream).await?;
             let allowed_trailers =
                 parse_declared_trailer_names(req.get_header_key(HeaderItem::Trailer));
-            let (body, trailers, consumed_len) =
-                Self::read_chunked_body(buf, stream, hdr_len, &allowed_trailers, Some(max_body_bytes))
-                    .await?;
+            let chunk_start = cursor.pos() + hdr_len;
+            let (body, trailers, consumed_len) = Self::read_chunked_body(
+                cursor.buf_mut(),
+                stream,
+                chunk_start,
+                &allowed_trailers,
+                Some(max_body_bytes),
+            )
+            .await?;
             req.body = body;
             req.trailers = trailers;
             consumed_len
         } else {
-            if hdr_len + content_length > buf.len() {
+            if cursor.pos() + hdr_len + content_length > cursor.len() {
                 // body 不足需阻塞补读：先冲刷（同上，写序安全红线）
                 Self::flush_pending_before_read(&mut batch, stream).await?;
             }
-            while hdr_len + content_length > buf.len() {
-                let t = stream.read_into_vec(buf).await?;
+            while cursor.pos() + hdr_len + content_length > cursor.len() {
+                let t = stream.read_into_vec(cursor.buf_mut()).await?;
                 if t == 0 {
                     return Err(anyhow::Error::msg("connection closed"));
                 }
             }
             if content_length > 0 {
-                req.body = LocalHipByt::from(&buf[hdr_len..hdr_len + content_length]);
+                let body_start = cursor.pos() + hdr_len;
+                req.body =
+                    LocalHipByt::from(&cursor.buf()[body_start..body_start + content_length]);
             }
             content_length
         };
@@ -2534,8 +2523,11 @@ impl HttpRequest {
     ) -> anyhow::Result<(Self, usize)> {
         let mut stream = stream.lock().await;
         let mut req = Self::new();
+        let mut slots = [httparse::EMPTY_HEADER; 48];
+        let mut cursor = HttpBufCursor::new(buf);
         let consumed =
-            Self::from_stream_impl_into(buf, &mut stream, (None, None), &mut req, None).await?;
+            Self::from_stream_impl_into(&mut cursor, &mut stream, (None, None), &mut req, None, &mut slots)
+                .await?;
         Ok((req, consumed))
     }
 
@@ -2547,31 +2539,36 @@ impl HttpRequest {
     ) -> anyhow::Result<(Self, usize)> {
         let mut stream = stream.lock().await;
         let mut req = Self::new();
+        let mut slots = [httparse::EMPTY_HEADER; 48];
+        let mut cursor = HttpBufCursor::new(buf);
         let consumed = Self::from_stream_impl_into(
-            buf,
+            &mut cursor,
             &mut stream,
             (max_header_bytes, max_body_bytes),
             &mut req,
             None,
+            &mut slots,
         )
         .await?;
         Ok((req, consumed))
     }
 
     pub(crate) async fn from_stream_with_limits_into(
-        buf: &mut Vec<u8>,
+        cursor: &mut HttpBufCursor<'_>,
         stream: &mut HttpStream,
         max_header_bytes: Option<usize>,
         max_body_bytes: Option<usize>,
         req: &mut HttpRequest,
         batch: Option<&mut crate::server::ResponseBatcher>,
+        slots: &mut [httparse::Header<'static>],
     ) -> anyhow::Result<usize> {
         Self::from_stream_impl_into(
-            buf,
+            cursor,
             stream,
             (max_header_bytes, max_body_bytes),
             req,
             batch,
+            slots,
         )
         .await
     }
@@ -2584,14 +2581,30 @@ impl HttpRequest {
         buf: &[u8],
         max_header_bytes: usize,
         req: &mut HttpRequest,
+        slots: &mut [httparse::Header<'static>],
     ) -> anyhow::Result<Option<usize>> {
         let max_header_count = ServerConfig::get_max_header_count();
         Self::ensure_header_section_size(buf, max_header_bytes)?;
 
-        let mut stack_headers = [httparse::EMPTY_HEADER; 48];
+        // 头槽复用（连接循环级）：httparse 1.10 官方保证解析内部把槽按
+        // MaybeUninit 对待——旧值从不被读、解析后切片收缩到本次写入数
+        // （ShrinkOnDrop），因此跨请求复用脏槽安全且免去每请求 ~1.5KB 栈
+        // 初始化。头计数改用收缩后的切片长度（take_while name 非空在脏槽
+        // 下会误判）。
+        // SAFETY（协变缩短）：Header<'static> 是 Header<'buf> 的子类型（生命
+        // 周期参数为纯类型级标注，值表示不变），此 transmute 只把槽元素类型
+        // 从 'static 缩短到本次 buf 借用期；解析期间槽唯一可变借用归解析器
+        // 所有（写不读），解析器归还后即不可达。与 ResponseBatcher::flush
+        // 的 IoSlice transmute 同款先例。
+        let slots: &mut [httparse::Header<'_>] = unsafe {
+            std::mem::transmute::<
+                &mut [httparse::Header<'static>],
+                &mut [httparse::Header<'_>],
+            >(slots)
+        };
         let mut heap_headers: Vec<httparse::Header<'_>>;
-        let headers: &mut [httparse::Header<'_>] = if max_header_count <= stack_headers.len() {
-            &mut stack_headers
+        let headers: &mut [httparse::Header<'_>] = if max_header_count <= slots.len() {
+            slots
         } else {
             heap_headers = vec![httparse::EMPTY_HEADER; max_header_count];
             &mut heap_headers
@@ -2610,8 +2623,7 @@ impl HttpRequest {
             };
             (req, n)
         };
-        let parsed_header_count =
-            rreq.headers.iter().take_while(|h| !h.name.is_empty()).count();
+        let parsed_header_count = rreq.headers.len();
         if parsed_header_count > max_header_count {
             anyhow::bail!(
                 "too many request headers: {parsed_header_count} exceeds {max_header_count}"
@@ -2827,7 +2839,9 @@ impl HttpRequest {
         max_header_bytes: usize,
     ) -> anyhow::Result<Option<(Self, usize)>> {
         let mut req = Self::new();
-        let consumed = Self::from_headers_part_with_limits_into(buf, max_header_bytes, &mut req)?;
+        let mut slots = [httparse::EMPTY_HEADER; 48];
+        let consumed =
+            Self::from_headers_part_with_limits_into(buf, max_header_bytes, &mut req, &mut slots)?;
         Ok(consumed.map(|consumed| (req, consumed)))
     }
 
@@ -3140,13 +3154,99 @@ fn thread_date_str(current_ts: i64) -> &'static str {
     slot.as_str()
 }
 
+/// 连接级游标缓冲：buf[pos..] 为未消费请求字节（d8 流水线残留）。
+/// `advance` 统一消费推进——残留耗尽 clear（零 memmove）、超水位 drain
+/// 一次搬移——替代旧版每请求 copy_within 的逐请求 memmove。
+pub(crate) struct HttpBufCursor<'a> {
+    buf: &'a mut Vec<u8>,
+    pos: usize,
+}
+
+/// 游标 compact 水位：未消费残留超过该值才做一次 drain 搬移
+/// （d8 深流水线残留一般 <2KB，常态零 memmove；水位同时约束 buf 尺寸上限）
+const BUF_COMPACT_WATERMARK: usize = 16 * 1024;
+
+impl<'a> HttpBufCursor<'a> {
+    pub(crate) fn new(buf: &'a mut Vec<u8>) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn pos(&self) -> usize {
+        self.pos
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// 消费 consumed 字节后是否残留耗尽（direct_write 判定）
+    fn consumed_to_end(&self, consumed: usize) -> bool {
+        self.pos + consumed >= self.len()
+    }
+
+    fn buf(&self) -> &Vec<u8> {
+        self.buf
+    }
+
+    fn buf_mut(&mut self) -> &mut Vec<u8> {
+        self.buf
+    }
+
+    fn slice_from_pos(&self) -> &[u8] {
+        &self.buf[self.pos..]
+    }
+
+    /// 推进游标（consumed=0 时零动作）；残留耗尽 clear 保容量，超水位 drain
+    fn advance(&mut self, consumed: usize) {
+        if consumed == 0 {
+            return;
+        }
+        self.pos += consumed;
+        if self.pos >= self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+        } else if self.pos >= BUF_COMPACT_WATERMARK {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+    }
+}
+
 /// 当前 HTTP 日期字节（Date 槽内容，RFC1123 恒 29 字节）——静态响应模板快路径用。
 pub(crate) fn now_http_date_bytes() -> &'static [u8] {
-    let current_ts = std::time::SystemTime::now()
+    thread_date_str(cached_date_secs()).as_bytes()
+}
+
+/// 全局 Date 秒戳缓存：后台线程每 250ms 刷新一次原子秒值，`default_headers`
+/// / 模板快路径读原子替代每响应一次 `SystemTime::now`（vDSO ~20ns/响应，
+/// d8 批内逐响应递增）。Date 是秒粒度头，缓存滞后 ≤250ms 与秒粒度语义相容
+/// （秒边界处的响应 Date 归属相邻秒，与原实现「构造时刻取整秒」仅在边界
+/// 半秒窗口内不同，actix DateService 周期刷新同款口径）。
+static DATE_TICK_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static DATE_TICKER: LazyLock<()> = LazyLock::new(|| {
+    // 初始化即同步写一次，覆盖首个 tick 前的空窗（免 1970 Date）
+    DATE_TICK_SECS.store(now_secs_u64(), std::sync::atomic::Ordering::Relaxed);
+    // std 线程而非 tokio task：default_headers 在任意线程（含非 runtime
+    // 上下文的单测/客户端路径）首次调用时触发初始化，进程级常驻一根轻线程
+    let _ = std::thread::Builder::new()
+        .name("potato-date-tick".into())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            DATE_TICK_SECS.store(now_secs_u64(), std::sync::atomic::Ordering::Relaxed);
+        });
+});
+
+fn now_secs_u64() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|timestamp| timestamp.as_secs() as i64)
-        .unwrap_or_default();
-    thread_date_str(current_ts).as_bytes()
+        .map(|t| t.as_secs())
+        .unwrap_or(0)
+}
+
+fn cached_date_secs() -> i64 {
+    LazyLock::force(&DATE_TICKER);
+    DATE_TICK_SECS.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
 #[derive(Debug)]
@@ -3313,10 +3413,18 @@ impl HttpResponse {
     fn default_headers(
         cnt_type: impl Into<Cow<'static, str>>,
     ) -> ResponseHeaders {
-        let current_ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|timestamp| timestamp.as_secs() as i64)
-            .unwrap_or_default();
+        // ultraspeed 模式（opt-in，须在服务开始前设置）：跳过全部默认附加
+        // 头，仅保留协议必需的 Connection（Content-Length 由序列化层统一
+        // 补齐）。用户显式 add_header 的头不受影响。
+        if crate::global_config::ServerConfig::get_ultraspeed() {
+            let mut headers = take_pooled_headers();
+            headers.insert("Connection".into(), "keep-alive".into());
+            return headers;
+        }
+
+        // Date 秒戳读全局缓存（后台线程 250ms 刷新），免每响应一次
+        // SystemTime::now；秒粒度语义见 cached_date_secs 注释
+        let current_ts = cached_date_secs();
 
         // depth=1 热路径：每响应一条 Date 头。旧实现 Cow::Owned(String).clone()
         // 每响应一次堆分配；改为每线程一根启动期泄漏的固定槽（Box::leak，
@@ -3744,15 +3852,9 @@ impl HttpResponse {
                 }
                 // 6 标准头快速路径：与 write_to_stream 的固定顺序输出对齐，
                 // 保证 as_bytes 与 write_to_stream 线上字节形态一致。
+                // get 内部 std_slot_of (长度,首字节) 预筛 + 槽直达，逐键取值。
                 if self.headers.len() == 6 && self.multi_headers.is_empty() {
-                    if let (
-                        Some(date),
-                        Some(server),
-                        Some(connection),
-                        Some(content_type),
-                        Some(pragma),
-                        Some(cache_control),
-                    ) = (
+                    if let (Some(date), Some(server), Some(connection), Some(content_type), Some(pragma), Some(cache_control)) = (
                         self.headers.get("Date"),
                         self.headers.get("Server"),
                         self.headers.get("Connection"),
@@ -3760,17 +3862,15 @@ impl HttpResponse {
                         self.headers.get("Pragma"),
                         self.headers.get("Cache-Control"),
                     ) {
-                        push_header_line_bytes!(ret, b"Date: ", date);
-                        push_header_line_bytes!(ret, b"Server: ", server);
-                        push_header_line_bytes!(ret, b"Connection: ", connection);
-                        push_header_line_bytes!(ret, b"Content-Type: ", content_type);
-                        push_header_line_bytes!(ret, b"Pragma: ", pragma);
-                        push_header_line_bytes!(ret, b"Cache-Control: ", cache_control);
+                        push_header_kv_bytes!(ret, "Date", date);
+                        push_header_kv_bytes!(ret, "Server", server);
+                        push_header_kv_bytes!(ret, "Connection", connection);
+                        push_header_kv_bytes!(ret, "Content-Type", content_type);
+                        push_header_kv_bytes!(ret, "Pragma", pragma);
+                        push_header_kv_bytes!(ret, "Cache-Control", cache_control);
                     } else {
                         for (key, value) in self.headers.iter() {
-                            if key == "Content-Length"
-                                || key.eq_ignore_ascii_case("Transfer-Encoding")
-                            {
+                            if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding") {
                                 continue;
                             }
                             push_header_kv_bytes!(ret, key, value);
@@ -3896,14 +3996,7 @@ impl HttpResponse {
                     let _ = write!(ret, "{} {} {status_str}\r\n", self.version, self.http_code);
                 }
                 if self.headers.len() == 6 && self.multi_headers.is_empty() {
-                    if let (
-                        Some(date),
-                        Some(server),
-                        Some(connection),
-                        Some(content_type),
-                        Some(pragma),
-                        Some(cache_control),
-                    ) = (
+                    if let (Some(date), Some(server), Some(connection), Some(content_type), Some(pragma), Some(cache_control)) = (
                         self.headers.get("Date"),
                         self.headers.get("Server"),
                         self.headers.get("Connection"),
@@ -3911,16 +4004,15 @@ impl HttpResponse {
                         self.headers.get("Pragma"),
                         self.headers.get("Cache-Control"),
                     ) {
-                        push_header_line_str!(ret, "Date: ", date);
-                        push_header_line_str!(ret, "Server: ", server);
-                        push_header_line_str!(ret, "Connection: ", connection);
-                        push_header_line_str!(ret, "Content-Type: ", content_type);
-                        push_header_line_str!(ret, "Pragma: ", pragma);
-                        push_header_line_str!(ret, "Cache-Control: ", cache_control);
+                        let _ = write!(ret, "Date: {}\r\n", sanitize_header_str(date));
+                        let _ = write!(ret, "Server: {}\r\n", sanitize_header_str(server));
+                        let _ = write!(ret, "Connection: {}\r\n", sanitize_header_str(connection));
+                        let _ = write!(ret, "Content-Type: {}\r\n", sanitize_header_str(content_type));
+                        let _ = write!(ret, "Pragma: {}\r\n", sanitize_header_str(pragma));
+                        let _ = write!(ret, "Cache-Control: {}\r\n", sanitize_header_str(cache_control));
                     } else {
                         for (key, value) in self.headers.iter() {
-                            if key == "Content-Length"
-                                || key.eq_ignore_ascii_case("Transfer-Encoding")
+                            if key == "Content-Length" || key.eq_ignore_ascii_case("Transfer-Encoding")
                             {
                                 continue;
                             }
@@ -4213,8 +4305,11 @@ impl HttpResponse {
     }
 
     pub fn get_header(&self, key: &str) -> Option<&str> {
-        let header_key = key.http_std_case();
-        self.headers.get(header_key.as_str()).map(|a| a.as_ref())
+        // 头表 get 本身大小写不敏感（标准头槽位掩码直达 + find_pos
+        // eq_ignore_ascii_case 线性扫描），此前先 http_std_case() 构造规范
+        // 键 String 纯属每次调用一次堆分配（depth=1 热路径每响应 2 次调用
+        // = 每请求 3 次 malloc/realloc，采样回溯实锤），直接传原始键。
+        self.headers.get(key).map(|a| a.as_ref())
     }
 }
 
@@ -4376,6 +4471,51 @@ mod tests {
         let mut req = HttpRequest::new();
         req.set_header("Accept-Encoding", "br;q=1, gzip;q=0.3");
         assert_eq!(req.get_header_accept_encoding(), CompressMode::Gzip);
+    }
+
+    /// 头槽复用假设钉测：httparse 1.10 把槽按 MaybeUninit 对待（旧值从不
+    /// 被读、解析后切片收缩到本次写入数），连接循环跨请求复用脏槽数组时
+    /// 解析结果必须与干净槽完全一致。若未来 httparse 行为变化（读旧值），
+    /// 本测试率先失败拦截。
+    #[test]
+    fn header_slots_reuse_parses_garbage_slots_correctly() {
+        let raw = b"GET /hello HTTP/1.1
+Host: a
+Connection: keep-alive
+
+";
+        // 干净基线
+        let mut clean_slots = [httparse::EMPTY_HEADER; 48];
+        let mut req_clean = HttpRequest::new();
+        let consumed_clean = HttpRequest::from_headers_part_with_limits_into(
+            raw,
+            usize::MAX,
+            &mut req_clean,
+            &mut clean_slots,
+        )
+        .expect("clean parse ok")
+        .expect("complete");
+        // 脏槽：全部填充非 EMPTY 的垃圾头
+        let mut dirty_slots = [httparse::Header {
+            name: "garbage-header-name",
+            value: b"garbage-value",
+        }; 48];
+        let mut req_dirty = HttpRequest::new();
+        let consumed_dirty = HttpRequest::from_headers_part_with_limits_into(
+            raw,
+            usize::MAX,
+            &mut req_dirty,
+            &mut dirty_slots,
+        )
+        .expect("dirty parse ok")
+        .expect("complete");
+        assert_eq!(consumed_clean, consumed_dirty);
+        assert_eq!(req_clean.headers.len(), req_dirty.headers.len());
+        assert_eq!(
+            req_clean.get_header("Host").map(|v| v.to_string()),
+            req_dirty.get_header("Host").map(|v| v.to_string())
+        );
+        assert_eq!(req_clean.headers.len(), 2, "expected exactly 2 headers");
     }
 
     #[test]
@@ -4604,6 +4744,35 @@ mod tests {
         let serialized = String::from_utf8(res.as_bytes(CompressMode::None, None)).unwrap();
         assert!(serialized.contains("Content-Length: 5\r\n"));
         assert!(!serialized.contains("Transfer-Encoding:"));
+    }
+
+    /// ultraspeed 模式响应形态锚：默认附加头（Date/Server/Content-Type/
+    /// Pragma/Cache-Control）全部不发，仅保留协议必需的 Connection；用户
+    /// 显式 add_header 的头照常输出，序列化按插入序收敛为极简字节形态。
+    /// 开关在响应构造后立即还原，最小化对并发测试的可见窗口（并发方依赖
+    /// 的唯一构造点断言为 contains 形式，两种形态下均成立）。
+    #[test]
+    fn ultraspeed_mode_strips_default_headers() {
+        // 翻开关窗口取测试锁串行化，防并行测试的全局态交叉污染
+        let _guard = crate::global_config::ULTRASPEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::global_config::ServerConfig::set_ultraspeed(true);
+        let mut res = HttpResponse::html("Hello, World!");
+        crate::global_config::ServerConfig::set_ultraspeed(false);
+        drop(_guard);
+        res.add_header("X-Explicit".into(), "keep".into());
+
+        let out = res.as_bytes(CompressMode::None, None);
+        let expected = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Connection: keep-alive\r\n",
+            "X-Explicit: keep\r\n",
+            "Content-Length: 13\r\n",
+            "\r\n",
+            "Hello, World!",
+        );
+        assert_eq!(out, expected.as_bytes());
     }
 }
 

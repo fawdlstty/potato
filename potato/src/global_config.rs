@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -16,6 +16,11 @@ static SERVER_WS_MAX_MESSAGE_SIZE: AtomicUsize = AtomicUsize::new(64 * 1024 * 10
 static SERVER_REQUEST_TIMEOUT_NANOS: AtomicU64 = AtomicU64::new(60 * 1_000_000_000);
 static SERVER_TLS_HANDSHAKE_TIMEOUT: LazyLock<RwLock<Duration>> =
     LazyLock::new(|| RwLock::new(Duration::from_secs(10)));
+/// ultraspeed 模式（opt-in）：响应省略全部默认附加头（Date/Server/
+/// Content-Type/Pragma/Cache-Control），只保留协议必需的 Connection，
+/// 线上形态收敛为「状态行 + Connection + Content-Length + body」。
+/// 须在服务开始前设置（静态模板等响应字节按首次构建时刻的形态固化）。
+static SERVER_ULTRASPEED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -112,7 +117,29 @@ impl ServerConfig {
     pub async fn get_tls_handshake_timeout() -> Duration {
         *SERVER_TLS_HANDSHAKE_TIMEOUT.read().await
     }
+
+    /// 开关 ultraspeed 模式：开启后响应不再附带任何默认附加头
+    /// （Date/Server/Content-Type/Pragma/Cache-Control），仅保留协议必需的
+    /// Connection，序列化形态收敛为「状态行 + Connection + Content-Length +
+    /// body」。用户显式 `add_header` 的头不受影响，照常输出。
+    ///
+    /// 设置须发生在服务开始前：静态模板快路径等预构建字节按首次构建时刻
+    /// 的形态固化，运行中途翻转只影响此后新构建的响应，已固化字节不变。
+    pub fn set_ultraspeed(enabled: bool) {
+        // 响应构造热路径每响应一次原子读，Relaxed 足够（无跨变量序依赖）
+        SERVER_ULTRASPEED.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn get_ultraspeed() -> bool {
+        SERVER_ULTRASPEED.load(Ordering::Relaxed)
+    }
 }
+
+/// 测试专用：ultraspeed 全局开关的翻转临界区互斥锁。开关是进程级全局态，
+/// 多个翻开关的测试并行运行时以此串行化「置位→构造→还原」窗口，避免
+/// 交叉污染彼此的形态断言（不翻开关的测试不受影响，无需取锁）。
+#[cfg(test)]
+pub(crate) static ULTRASPEED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub struct ServerAuth;
 impl ServerAuth {
